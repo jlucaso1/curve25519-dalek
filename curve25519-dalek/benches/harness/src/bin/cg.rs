@@ -18,8 +18,19 @@
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let which: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(3);
-    let iters: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(20);
+
+    // Defaults apply only when an argument is absent. A typo must not silently
+    // profile a different kernel, and `iters = 0` must not silently profile
+    // nothing at all.
+    let which: u32 = match args.next() {
+        Some(a) => a.parse().expect("kernel selector must be a u32"),
+        None => 3,
+    };
+    let iters: u32 = match args.next() {
+        Some(a) => a.parse().expect("iteration count must be a u32"),
+        None => 20,
+    };
+    assert!(iters > 0, "iteration count must be greater than zero");
 
     std::hint::black_box(x25519_field_harness::run_kernel(which, iters));
 }

@@ -157,7 +157,7 @@ same form on wasm32.
 | file | purpose |
 | --- | --- |
 | `benches/x25519_field.rs` | Criterion benches: `mul_clamped`, `mul_base_clamped`, and (behind `--cfg curve25519_dalek_bench_internals`) `mul`, `square`, `square2`, `add`, `sub`, `pow2k(k)` for k ∈ {1,2,4,10,50,100}, `invert`, and a synthetic "field mix of one `mul_clamped`" |
-| `benches/harness/` | standalone crate with one set of kernels compiled for **both** x86_64 and wasm32; `src/main.rs` is the native driver, `run.mjs` the Node driver. Kernels: `fe_mul`, `fe_square`, `fe_pow2k50`, `fe_mul121666`, `fe_invert`, `edwards_mul_base` (and radix-32/64 variants), `edwards_to_montgomery`, `x25519_mul_clamped`, `x25519_mul_base_clamped` |
+| `benches/harness/` | standalone crate with one set of kernels compiled for **both** x86_64 and wasm32; `src/main.rs` is the native driver, `run.mjs` the Node driver. Kernels: `fe_mul`, `fe_square`, `fe_pow2k50`, `fe_mul121666`, `fe_invert`, `edwards_mul_base` (and radix-32/64 variants), `edwards_to_montgomery`, `edwards_vartime_double_base`, `x25519_mul_clamped`, `x25519_mul_base_clamped`. `src/bin/cg.rs` is the `callgrind` entry point for §8.6. |
 | `src/bench_internals.rs` | `--cfg`-gated, `#[doc(hidden)]` hook exposing `FieldElement` and the op counts to the benches. `FieldElement` is `pub(crate)` and Criterion benches are separate crates, so without this the only way to time `mul`/`square` is through a whole scalar multiplication — the exact confound these benches exist to avoid. Absent from every ordinary build; the public API is unchanged. |
 
 Reproduce with:
@@ -298,7 +298,8 @@ This is a documentation/deployment finding for consumers, not a code change:
 ## 4. What *was* changed: `square` no longer goes through `pow2k(1)`
 
 This came out of the "`pow2k` versus repeated `square`" item in the inventory,
-and it is the only code change in this work.
+and it is the first of the three code changes in this work (§5 and §6 are the
+others).
 
 ### 4.1 The observation
 
@@ -867,49 +868,67 @@ the scan exists to feed. This is the quantitative version of §8.5: the scan, no
 the addition count, is what dominates fixed-base multiplication, which is why
 larger tables lose.
 
-### 8.7 Reordering the ladder step: fewer instructions, slower where it counts
+### 8.7 The ladder is register-pressure bound, not schedule bound
 
 §8.6 shows `differential_add_and_double`'s self cost is 966 instructions per
-step, while the arithmetic in it accounts for only about 820. The rest is
-register pressure: the step holds up to six live field elements, thirty `u64`,
-against sixteen general-purpose registers, so the allocator spills.
+step while the arithmetic in it accounts for about 820. The rest is register
+pressure: the step holds up to six live field elements — thirty `u64` — against
+sixteen general-purpose registers, so the allocator spills. And the step runs in
+181 ns against a 197 ns sum of isolated operation latencies, so only about 8% of
+the available instruction-level parallelism is being recovered.
 
-The statements in the step are pure dataflow, so any topological order computes
-the same values — reordering is semantically free and therefore risk-free, and
-`callgrind` measures it exactly. Three schedules were tried, instructions for 20
-`mul_clamped`:
+Both of those look like an invitation. Three separate attempts to take it up all
+failed, and they failed the same way, which is the useful part.
+
+**Attempt 1: reschedule the step.** Its statements are pure dataflow, so any
+topological order computes the same values — reordering is risk-free and
+`callgrind` measures it exactly. Instructions for 20 `mul_clamped`:
 
 | schedule | `differential_add_and_double` | program total |
 | --- | ---: | ---: |
-| as written (`t0..t3`, squarings, P+Q half, doubling tail) | 4 926 600 | 12 269 825 |
-| A: doubling half completed first, `t2`/`t3` still hoisted | 4 834 800 | 12 176 959 |
+| as written | 4 926 600 | 12 269 825 |
+| A: doubling half completed first | 4 834 800 | 12 176 959 |
 | **B: doubling half first *and* `t2`/`t3` sunk to their use** | **4 753 200** | **12 095 359** |
 | C: both multiplications first, doubling tail last | 4 819 500 | 12 161 659 |
 
-B is the best: **−173 400 instructions, −1.42% of the program**, or 34 fewer per
-ladder step. A is worse than B because hoisting `t2`/`t3` merely trades `t4`/`t5`'s
-live range for theirs.
+B removes **173 400 instructions, −1.42% of the program**, 34 per step. (A is
+worse than B because hoisting `t2`/`t3` only trades `t4`/`t5`'s live range for
+theirs.) On wasm32 it then measured **124 359 → 126 167 ns, +1.5%, slower in all
+five paired runs**; on x86_64 the reduction is below the 2.5% noise floor and
+unmeasurable. Reverted.
 
-**And then it loses on wasm32.** Five alternating paired runs, minimum of 13
-repetitions:
+**Attempt 2: fuse the independent pairs.** The step has three pairs of mutually
+independent operations — `t4`/`t5`, `t7`/`t8`, `t11`/`t12` — and `mul` is an
+outlined call, so each pair is separated by a call boundary that an
+out-of-order core can only see across as far as its reorder buffer reaches.
+Factoring `mul`'s body into an inlinable `mul_limbs` and adding `mul_pair` /
+`square_pair`, which inline two bodies into one function so the scheduler can
+interleave them freely, is bit-for-bit identical by construction. Result:
+**+1.0% instructions** (the fused bodies spill more), **−0.36% on x86_64** —
+inside the noise floor — and **+3.6% on wasm32, slower in all four paired
+runs**. Reverted.
 
-| | `x25519_mul_clamped`, wasm32 |
-| --- | ---: |
-| as written | **124 359 ns** |
-| schedule B | 126 167 ns (**+1.5%**) |
+**Attempt 3: inline `mul`.** Recorded in §3.3: isolated `fe_mul` −29.5%,
+`mul_clamped` −0.5%.
 
-Slower in all five pairs. On x86_64 the 1.45% instruction reduction is below the
-2.5% noise floor and unmeasurable either way, so the change would buy nothing
-there and cost 1.5% on the target where instruction count was supposed to
-matter.
+The common thread is that every one of these *adds* live values, and the step is
+already spilling. Scheduling freedom that costs register pressure is not a trade
+this loop can afford, and the effect is worst on wasm32, where `serial::u32`
+holds ten limbs per element instead of five and V8 does its own allocation on
+top. The one change in this area that did work — forwarding the conditional swap
+in §6 — went the other way: it *removed* work without adding a single live
+value, and it is the only one of the four that measured a win.
 
-Reverted. The lesson is worth keeping: **x86-64 instruction count is not a proxy
-for wasm32 time.** The two targets run different backends — `serial::u64` against
-`serial::u32` — with different liveness, and V8 does its own register allocation
-and scheduling on top. This is the same caution as §7 about `bits="64"`, arrived
-at from the opposite direction, and it is why the conditional-swap change in §6
-was accepted on a *measured* wasm32 win rather than on its instruction count
-alone.
+That also settles the ILP question from the other side. The gap between 181 ns
+and the 197 ns serial sum is not scheduling slack waiting to be claimed; it is
+what the core already recovers on its own, and there is no cheap way to get more.
+
+**A methodological note worth keeping:** x86-64 instruction count is not a proxy
+for wasm32 time. Attempt 1 removed 1.42% of instructions and lost 1.5% on
+wasm32. The targets run different backends with different liveness and different
+compilers downstream. This is the same caution as §7's `bits="64"` result,
+reached from the opposite direction, and it is why §6 was accepted on a measured
+wasm32 win rather than on its instruction count.
 
 ### 8.8 What is left, and why it was not attempted
 
@@ -1077,5 +1096,5 @@ the trade can be re-made by someone who wants it.
 | **Combined C + D + E** | Certified against `origin/main` in one alternating session (§6.4): x86_64 stock release **−9.7%**, stock + `+adx,+bmi2` **−10.0%**, fat LTO **−25.0%**, fat LTO + `+adx,+bmi2` **−25.3%**; wasm32 **−8.8%**. `mul_base_clamped` unchanged in every cell. |
 | **Vector backend for Montgomery** | Viable but not worthwhile for single exchanges; the win would require a batched multi-exchange API. Not implemented. |
 | **Bigger basepoint tables** | **Measured and rejected.** radix-32 is a wash against the default radix-16 (+0.9% x86_64, +1.4% wasm32) for twice the table size; radix-64 is +13.6% and +20.0% for four times. The constant-time window scan grows faster than the addition count falls. The crate's default is already right. |
-| **Reordering the ladder step** | **Measured and reverted.** A pure-dataflow reschedule that shortens live ranges removes 1.42% of x86-64 instructions — and is 1.5% *slower* on wasm32 across five paired runs, while being below the noise floor on x86_64. Instruction count on one target is not a proxy for time on another (§8.7). |
+| **Exploiting the ladder's spare ILP** | **Three attempts, all measured and reverted (§8.7).** Rescheduling the step removes 1.42% of x86-64 instructions but is 1.5% *slower* on wasm32; fusing the three independent operation pairs into single function bodies is +1.0% instructions, noise on x86_64 and 3.6% slower on wasm32; inlining `mul` gives −29.5% isolated and −0.5% end to end. All three add live values, and the step already spills — it is register-pressure bound, not schedule bound. |
 | **Faster field inversion (safegcd)** | **Not attempted.** The top remaining lever — the inversion is 8% of `mul_clamped` and 20% of `mul_base_clamped`, and a constant-time binary GCD would plausibly be 2–4x faster than Fermat. Deferred because its constant-time property is global to the iteration rather than local, unlike the two changes above, which are bit-for-bit verifiable against the code they replace. |

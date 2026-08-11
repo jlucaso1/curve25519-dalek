@@ -52,9 +52,15 @@ const bytes = await readFile(path);
 const { instance } = await WebAssembly.instantiate(bytes, {});
 const { bench_kernel, config_code } = instance.exports;
 
+// Bits, as set by `config_code_impl` in lib.rs: 1 = 64-bit limbs,
+// 2 = fiat backend, 4 = simd/avx512, 8 = field kernels compiled in.
 const code = config_code ? config_code() : 0;
 const hasFieldKernels = (code & 8) !== 0;
-console.log(`# config_code=${code} field_kernels=${hasFieldKernels}`);
+const backend = code & 2 ? "fiat" : code & 4 ? "simd" : "serial";
+console.log(
+  `# limb_bits=${code & 1 ? 64 : 32} backend=${backend} ` +
+    `field_kernels=${hasFieldKernels} (config_code=${code})`,
+);
 console.log("kernel\titers\treps\tmin_ns_op\tmed_ns_op\tmax_ns_op\tspread_pct");
 
 function timeOnce(which, iters) {
