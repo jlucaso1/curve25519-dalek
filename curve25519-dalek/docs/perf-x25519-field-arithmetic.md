@@ -490,16 +490,41 @@ where §4 is worth 22%. Under a stock release build LTO does neither, so §4 is
 worth only 3.5% and §5 picks up another 6%. Neither profile regresses under
 either change, and every profile is now meaningfully faster than the base:
 
-| profile | base | after §4 + §5 | total |
-| --- | ---: | ---: | ---: |
-| x86_64, cargo `--release` default | 59 447 | **53 935** | **-9.3%** |
-| x86_64, `lto=fat` | 59 841 | **46 860** | **-21.7%** |
-| x86_64, `lto=fat`, `+adx,+bmi2` | 53 930 | **40 857** | **-24.2%** |
-| wasm32, `serial::u32` | 149 607 | **139 100** | **-7.0%** |
-| wasm32, `fiat_u32` | 139 752 | **127 942** | **-8.5%** |
-
 wasm32 gains here where it gained nothing from §4, because `serial::u32`
 already had a dedicated `square` and never had the `pow2k(1)` defect.
+
+### 5.4 End-to-end certification against the base branch
+
+The per-change numbers above were each measured against the state of the tree
+immediately before that change, across several sessions. Since that is exactly
+the kind of bookkeeping that accumulates errors, the cumulative claim is also
+certified directly: `origin/main` checked out into a second worktree, the same
+harness copied into it, both trees measured **in the same session, alternating,
+on the same pinned core**. Only the end-to-end kernels are used, so the base
+tree builds unmodified and no benchmark hook is involved.
+
+`x25519_mul_clamped`, ns, minimum of 15 repetitions (fat-LTO cells are the
+minimum over four alternating runs):
+
+| profile | `origin/main` | this branch | change |
+| --- | ---: | ---: | ---: |
+| `lto=off`, `cgu=16` (cargo `--release` default) | 59 612 | **53 945** | **−9.5%** |
+| `lto=off`, `cgu=16`, `+adx,+bmi2` | 55 398 | **50 530** | **−8.8%** |
+| `lto=fat`, `cgu=1` | 62 081 | **47 081** | **−24.2%** |
+| `lto=fat`, `cgu=1`, `+adx,+bmi2` | 55 104 | **41 008** | **−25.6%** |
+
+`x25519_mul_base_clamped` over the same runs: 19 599 → 19 422, 18 359 → 18 584,
+19 223 → 18 684, 17 572 → 17 677. Every cell is inside the run-to-run spread,
+which is the expected result — neither change touches the fixed-base path — and
+is worth stating because it is also the check that nothing regressed there.
+
+Two things this pass corrected. The base branch under fat LTO measures 62.1 µs
+here, not the 59.8 µs recorded during the §4 work, so the fat-LTO improvement is
+−24.2% rather than the −21.7% assembled from separate sessions; the base figure
+was stable at 62.1–62.9 µs across four runs. And the host was substantially
+noisier during this pass than during the earlier ones (per-run spreads up to
+180%, against 2–20% earlier), which is precisely why the minimum is the reported
+statistic: it needs one clean repetition, not a clean run.
 
 ---
 
@@ -824,7 +849,7 @@ is worth.
 | **B — wasm32 `bits="64"`** | **Refused.** 2.31× slower than the current default. wasm has no 64×64→128 multiply, so `u128` products are emulated. `build.rs`'s `TODO(Wasm32)` closed with evidence; behaviour unchanged. |
 | **C — `square` via `pow2k(1)`** | **Changed.** `mul_clamped` −3.5% on a stock release build, −21.9% with fat LTO, −23.5% with fat LTO and `+adx,+bmi2`. Bit-for-bit identical output, no `unsafe`, no representation change, no API change, `serial::u32`/`fiat` untouched. |
 | **D — ladder's multiply by 121666** | **Changed.** A specialized `mul121666` (fiat's verified `carry_scmul_121666` on the fiat backends) replaces a general multiplication whose operand had four zero limbs. Isolated 2.5x cheaper on x86_64, 3.8x on wasm32. `mul_clamped` −6.0% on a stock release build and −7.0% on wasm32; nothing under fat LTO, where the inliner already folded it. Complementary to C: between them every build profile improves. |
-| **Combined C + D** | x86_64 stock release **−9.3%**, fat LTO **−21.7%**, fat LTO + `+adx,+bmi2` **−24.2%**; wasm32 **−7.0%** (`serial::u32`) and **−8.5%** (`fiat_u32`). |
+| **Combined C + D** | Certified against `origin/main` in one alternating session (§5.4): x86_64 stock release **−9.5%**, stock + `+adx,+bmi2` **−8.8%**, fat LTO **−24.2%**, fat LTO + `+adx,+bmi2` **−25.6%**; wasm32 **−7.0%** (`serial::u32`) and **−8.5%** (`fiat_u32`). `mul_base_clamped` unchanged in every cell. |
 | **Vector backend for Montgomery** | Viable but not worthwhile for single exchanges; the win would require a batched multi-exchange API. Not implemented. |
 | **Bigger basepoint tables** | **Measured and rejected.** radix-32 is a wash against the default radix-16 (+0.9% x86_64, +1.4% wasm32) for twice the table size; radix-64 is +13.6% and +20.0% for four times. The constant-time window scan grows faster than the addition count falls. The crate's default is already right. |
 | **Faster field inversion (safegcd)** | **Not attempted.** The top remaining lever — the inversion is 8% of `mul_clamped` and 20% of `mul_base_clamped`, and a constant-time binary GCD would plausibly be 2–4x faster than Fermat. Deferred because its constant-time property is global to the iteration rather than local, unlike the two changes above, which are bit-for-bit verifiable against the code they replace. |

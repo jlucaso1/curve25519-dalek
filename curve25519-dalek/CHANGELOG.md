@@ -12,9 +12,14 @@ major series.
 * Perf: `serial::u64::FieldElement51::square` no longer goes through `pow2k(1)`.
   The squaring step is factored out of `pow2k`'s loop, so a single squaring no
   longer pays for the loop and call machinery it cannot amortize. X25519
-  `mul_clamped` improves by ~3.5% in a stock release build and ~22% with fat
-  LTO; the output is bit-for-bit identical and the 5x51 limb representation and
-  its bit-excess preconditions are unchanged.
+  `mul_clamped` improves measurably in every build profile; the output is
+  bit-for-bit identical and the 5x51 limb representation and its bit-excess
+  preconditions are unchanged.
+* Perf: together, the two field-arithmetic changes below take X25519
+  `mul_clamped` down 9.5% in a stock `cargo --release` build and 24.2% with fat
+  LTO, measured against the base branch in one alternating session on the same
+  pinned core. `mul_base_clamped` is unchanged. See
+  `docs/perf-x25519-field-arithmetic.md` section 5.4.
 * Perf: the Montgomery ladder's multiplication by `(A+2)/4 = 121666` no longer
   goes through the general field multiplication, whose second operand had four
   zero limbs. Each backend gains a `mul121666`; the fiat backends use
