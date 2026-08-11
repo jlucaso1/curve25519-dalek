@@ -1409,22 +1409,36 @@ exists to prevent, and a scan that selects on a secret scalar digit is the last
 place to trade a guarantee for two percent on the strength of one compiler
 version's output.
 
-### 11.6 A revision to §12's rejection of bigger tables
+### 11.6 Bigger tables: the answer depends on the build flags
 
-§12 rejected larger basepoint tables, measuring radix-32 as a wash (+0.2% here)
-and radix-64 as clearly worse (+12.2%). §11.4 changes that arithmetic, because
-it helps bigger tables most:
+§12 rejected larger basepoint tables, measuring radix-32 as a wash and radix-64
+as clearly worse. §11.4 helps bigger tables most, which appeared to overturn
+that for radix-32. **It does not, and the first version of this section said it
+did — the claim was made without stating a build configuration, and it reverses
+under one.**
 
-| | radix-16 | radix-32 |
-| --- | ---: | ---: |
-| baseline | 170 544 | 170 917 (+0.2%) |
-| with §11.4 | 165 680 | **159 165 (−3.9%)** |
+| | radix-16 | radix-32 | |
+| --- | ---: | ---: | --- |
+| stock `--release` | 165 680 | 159 165 | **−3.93%** |
+| `-C target-feature=+avx2` | 157 670 | **161 476** | **+2.41%** |
 
-**Radix-32 goes from marginally worse to 3.9% better.** It is still twice the
-table, and `EdwardsBasepointTableRadix32` is already public under
-`precomputed-tables`, so this is a note for a consumer weighing 8 KiB against
-4%, not a change of default. Radix-64 improves by more (−10.16%) but remains
-3.7% behind radix-16, so that rejection stands.
+Both rows reproduce exactly, and they disagree. The scan grows linearly in table
+size while the additions it saves shrink only logarithmically — radix-32 does 52
+windows over 16 entries (832) against radix-16's 64 over 8 (512) — so the
+trade-off turns on how expensive a scanned entry is relative to an addition, and
+`+avx2` moves exactly that ratio. §2 already measured `+avx2` halving the
+constant-time scan; what it also does is change which table size wins.
+
+**Under the flags this document recommends for x86_64, radix-16 remains
+optimal**, so §12's rejection stands for any build that follows the advice in
+§2. Radix-32 is worth it only for a stock build that does not enable `+avx2`,
+and it costs twice the table for under 4%. Radix-64 loses in both.
+
+The lesson is the narrow one: a comparison between two implementations is only a
+result *together with the flags it was taken under*, and a one-line claim that
+omits them can be exactly backwards for the configuration a reader is actually
+using. Found by an independent audit that measured the same comparison under
+`+avx2` and got the opposite sign.
 
 ---
 
@@ -1441,7 +1455,7 @@ The hypothesis was that because wasm32 has native `i64.mul`/`i64.add`, a `u64`
 is not emulated the way it would be on a real 32-bit ARM, so `bits="64"` might
 win.
 
-### 10.1 Method
+### 12.1 Method
 
 Criterion does not run on wasm32-unknown-unknown. Rather than introduce
 `wasm-pack` and a second set of kernels, the **same** harness crate is compiled
@@ -1456,7 +1470,7 @@ Rust source, which is the point.
 
 `node v22.22.2`, `--release` with `lto=true, codegen-units=1, panic=abort`.
 
-### 10.2 Results
+### 12.2 Results
 
 ns per operation, minimum of 15 repetitions:
 
@@ -1471,7 +1485,7 @@ ns per operation, minimum of 15 repetitions:
 Run-to-run spread was 2.0% on the `bits=32` `mul_clamped` row and 16.5% on the
 `bits=64` one; the 2.3× gap is two orders of magnitude larger than the noise.
 
-### 10.3 Verdict
+### 12.3 Verdict
 
 **Refused. `curve25519_dalek_bits="64"` is 2.31× slower than the default on
 wasm32**, and the current `build.rs` behaviour is correct.
@@ -1496,7 +1510,7 @@ behaviour change: the code path it documents is the one that was already taken.
 
 ## 13. The rest of the inventory
 
-### 11.1 `pow2k` versus repeated `square`
+### 13.1 `pow2k` versus repeated `square`
 
 Answered in §4. Summary: `pow2k` is used where it should be (only the inversion
 tail needs `k > 1`), its amortization is real on this target — after the change
@@ -1509,7 +1523,7 @@ Criterion's `pow2k(k)` ladder after the change (default flags, no forced LTO):
 `pow2k(50)` 739.45 (14.79/sq), `pow2k(100)` 1478 (14.78/sq) — i.e. the
 per-squaring cost flattens by about k = 10.
 
-### 11.2 Cost of the `fiat` backend
+### 13.2 Cost of the `fiat` backend
 
 The formally verified backend was measured as the cheap control on both targets.
 `mul_clamped`, ns, minimum of 15:
@@ -1539,7 +1553,7 @@ Two things worth recording for a consumer:
 dedicated routine (15.29 ns, competitive) but its `pow2k` is repeated squaring
 with no amortization (16.65 ns/sq, worse than this crate's 14.09).
 
-### 11.3 Could the vector backend cover the Montgomery ladder?
+### 13.3 Could the vector backend cover the Montgomery ladder?
 
 **Viable, but not worth it for a single X25519, and it is a new backend rather
 than an extension of the existing one.**
@@ -1579,7 +1593,7 @@ dead backend.
 
 ---
 
-### 11.4 Where `mul_base_clamped` spends its time
+### 13.4 Where `mul_base_clamped` spends its time
 
 The other X25519 operation on a libsignal-style hot path is ephemeral key
 generation, which is `MontgomeryPoint::mul_base_clamped`. It splits cleanly in
@@ -1600,7 +1614,7 @@ The inversion is not doing anything wasteful: `invert` is Fermat, 254 squarings
 and 11 multiplications, and 254 x 14.10 + 11 x 25.36 = 3 860 ns predicts the
 measured 3 766 to within 2.5%. It is optimal *as an exponentiation*.
 
-### 11.5 Bigger basepoint tables do not help, on either target
+### 13.5 Bigger basepoint tables do not help, on either target
 
 `EdwardsPoint::mul_base` uses the 30 KB radix-16 table. The crate also exposes
 radix-32/64/128/256 tables as public API, documented as needing fewer additions
@@ -1633,7 +1647,7 @@ conditional selects to 43 × 32 = 1376, each over a three-field-element
 > once behind a `OnceLock`, outside the timing boundary. The ordering was
 > unaffected; the magnitudes were not. Thanks to CodeRabbit for catching it.
 
-### 11.6 Exact instruction profile, and what it says is left
+### 13.6 Exact instruction profile, and what it says is left
 
 Everything above is wall-clock on a shared virtual machine, which is why the
 minimum over repetitions is the reported statistic. Instruction counts have no
@@ -1684,7 +1698,7 @@ the scan exists to feed. This is the quantitative version of §13.5: the scan, n
 the addition count, is what dominates fixed-base multiplication, which is why
 larger tables lose.
 
-### 11.7 The ladder is register-pressure bound, not schedule bound
+### 13.7 The ladder is register-pressure bound, not schedule bound
 
 §13.6 shows `differential_add_and_double`'s self cost is 966 instructions per
 step while the arithmetic in it accounts for about 820. The rest is register
@@ -1746,7 +1760,7 @@ compilers downstream. This is the same caution as §10's `bits="64"` result,
 reached from the opposite direction, and it is why §6 was accepted on a measured
 wasm32 win rather than on its instruction count.
 
-### 11.8 wasm32: `simd128` is worth 4.6% on DH and 15.7% on key generation
+### 13.8 wasm32: `simd128` is worth 4.6% on DH and 15.7% on key generation
 
 `simd128` is a stable wasm feature, but it is **not** enabled by default for
 `wasm32-unknown-unknown`. Turning it on costs nothing but a flag:
@@ -1793,7 +1807,7 @@ set does not expose. `simd128` shipped in Chrome 91, Firefox 89, Safari 16.4 and
 Node 16, so for most deployments it is free; a consumer targeting older engines
 should check their floor first.
 
-### 11.9 x86_64: `+avx2` vectorizes the same scan, and is complementary to `+bmi2`
+### 13.9 x86_64: `+avx2` vectorizes the same scan, and is complementary to `+bmi2`
 
 The wasm32 result in §13.8 raises the obvious question for the other target: the
 constant-time window scan is 19.8% of key generation there too, so does x86_64
@@ -1865,7 +1879,7 @@ the rest.
 valgrind 3.22 rejects with SIGILL, so the instruction counts above use explicit
 `+avx2` rather than `native`. The timing runs are unaffected.
 
-### 11.10 `mul`'s carry chain: isolated −16%, `mul_clamped` +2%. Refused
+### 13.10 `mul`'s carry chain: isolated −16%, `mul_clamped` +2%. Refused
 
 §7 succeeded by taking a dependency chain off the critical path, so the obvious
 follow-up is the longest chain left in the hottest function. `mul`'s carry
@@ -1925,7 +1939,7 @@ number.
 
 Not implemented; the working tree was reverted to the serial chain.
 
-### 11.11 What is left, and why it was not attempted
+### 13.11 What is left, and why it was not attempted
 
 
 
@@ -2178,7 +2192,7 @@ so the trade could be re-made — and one of them since has been.
 
 ## 15. Summary
 
-### 13.1 The whole branch, certified against `origin/main`
+### 15.1 The whole branch, certified against `origin/main`
 
 §6.4 certified §4+§5+§6 when those were all there was. With §7 and §8 landed,
 the cumulative claim was re-measured the same way and end to end: `origin/main`
@@ -2208,7 +2222,7 @@ alternating pair. And the `lto=fat` rows improve far more than the `lto=off`
 rows for the reason §4 gives: only fat LTO inlines the ladder's squaring into
 the step, which is what makes §4 and §7 pay.
 
-### 13.2 Front by front
+### 15.2 Front by front
 
 | front | outcome |
 | --- | --- |
@@ -2226,7 +2240,7 @@ the step, which is what makes §4 and §7 pay.
 | **Batching verification's inversions** | **Refused: there is nothing to batch.** An Ed25519 verification performs **exactly one** field inversion, in `compress`; the vector table build and the wNAF loop perform none, and the vector backend contains no runtime `invert` at all. The profile's sixteen `as_affine` cannot be in verification, and cannot be sixteen X25519 operations either — that would be four times the whole message's cycle budget (§9.2). |
 | **safegcd, second look** | **Refused again.** Worth more here than in §13.11 — 10.0% of a verification, ~4% of the group client — but a 2–4× inversion caps the win at 2–3% of the client, while the crate's *existing* batch inversion is worth 6–10× wherever inversions co-occur. It also cannot be the variable-time kind, because `compress` is shared with secret-derived callers (§9.5). |
 | **wNAF width / vartime tables** | **Refused analytically.** §13.5's rejection does *not* transfer — `NafLookupTable5::select` is a direct index, not a constant-time scan — but width 5 is already the minimum of build-plus-loop additions (49.7 against 51.6 at width 6), and the build is only 5.0% of a verification (§9.6). |
-| **Combined C + D + E** | Superseded by the whole-branch certification in §14.1; kept because it is the only figure isolating these three. Certified against `origin/main` in one alternating session (§6.4) — F and G are *not* in it: x86_64 stock release **−9.7%**, stock + `+adx,+bmi2` **−10.0%**, fat LTO **−25.0%**, fat LTO + `+adx,+bmi2` **−25.3%**; wasm32 **−8.8%**. `mul_base_clamped` unchanged in every cell. |
+| **Combined C + D + E** | Superseded by the whole-branch certification in §15.1; kept because it is the only figure isolating these three. Certified against `origin/main` in one alternating session (§6.4) — F and G are *not* in it: x86_64 stock release **−9.7%**, stock + `+adx,+bmi2` **−10.0%**, fat LTO **−25.0%**, fat LTO + `+adx,+bmi2` **−25.3%**; wasm32 **−8.8%**. `mul_base_clamped` unchanged in every cell. |
 | **Vector backend for Montgomery** | Viable but not worthwhile for single exchanges; the win would require a batched multi-exchange API. Not implemented. |
 | **Bigger basepoint tables** | **Measured and rejected.** radix-32 is a wash against the default radix-16 (+0.9% x86_64, +1.4% wasm32) for twice the table size; radix-64 is +13.6% and +20.0% for four times. The constant-time window scan grows faster than the addition count falls. The crate's default is already right. |
 | **Exploiting the ladder's spare ILP** | **Three attempts, all measured and reverted (§13.7).** Rescheduling the step removes 1.42% of x86-64 instructions but is 1.5% *slower* on wasm32; fusing the three independent operation pairs into single function bodies is +1.0% instructions, noise on x86_64 and 3.6% slower on wasm32; inlining `mul` gives −29.5% isolated and −0.5% end to end. All three add live values, and the step already spills — it is register-pressure bound, not schedule bound. |
