@@ -1215,13 +1215,14 @@ the crate runs `serial::u64` on that path.
 
 ---
 
-## 10. Two changes inside the AVX2 backend
+## 10. Three changes inside the AVX2 backend
 
 §9 established that a verification is 87.4% AVX2 code, then spent its length on
 things that were *not* the vector backend. That was backwards, and it took five
 independent explorations of this repository — deliberately run without sight of
-this document until they had formed their own candidate lists — to say so. Both
-changes below are in the two functions §9.1's table puts at the top.
+this document until they had formed their own candidate lists — to say so. The
+first two changes below are in the two functions §9.1's table puts at the top;
+§10.5, added later, is in the multiply both of them call.
 
 ### 10.1 Seventh change: `ExtendedPoint::double` fuses its two signed blends
 
@@ -1313,6 +1314,44 @@ because that is where the previous front had been. A profile is only useful if
 you follow it to where it points.
 
 ---
+
+### 10.5 Ninth change: the multiply is tagged per call site
+
+`FieldElement2625x4`'s multiply is called three times on the verification path —
+once in `ExtendedPoint::double`, twice in `Add<&CachedPoint>` — and LLVM emits
+**one shared outlined body** for all three. Shared, it cannot specialise on the
+operand shapes each site actually has.
+
+`mul_tagged::<N>` takes an unused `const N: u8`, which is enough to give each
+site its own instantiation. The `Mul` operator remains as the untagged spelling,
+delegating to `mul_tagged::<0>`, so nothing outside the three hot sites changes.
+
+| | instructions per `ed25519_verify` | `.text` |
+| --- | ---: | ---: |
+| before | 316 280 | — |
+| tagged | **306 124** | +784 bytes |
+| | **−3.21%** | +0.2% |
+
+Wall-clock does not resolve this: the host's spread on `ed25519_verify` ran from
+−16.5% to +18.4% across seven paired rounds, which is five times the effect. The
+instruction count is the claim, and it is exact rather than statistical. The
+`.text` figure is there because executed-instruction count is precisely the
+wrong metric for a change that duplicates code — it would not show I-cache
+pressure. +784 bytes is small enough that the question does not arise.
+
+This is a compiler-behaviour workaround, and it is worth being clear about what
+that means for its lifetime: `mul_tagged::<0>` through `::<3>` all compute the
+same function, so if a future LLVM stops sharing the body the tags become inert
+rather than wrong. Nothing depends on them for correctness.
+
+**One half of this was refused.** The change arrived paired with replacing `-x`
+by `x.negate_lazy()` in `From<ExtendedPoint> for CachedPoint`. Measured alone it
+is worth **−47 instructions, −0.015%** — nothing — and it is not free: `neg`
+returns `b < 0.0002` where `negate_lazy` returns `b < 1`, so the comment two
+lines below it, "the coefficients of the output are bounded with `b < 0.007`",
+would become false, and the resulting `CachedPoint` would sit at exactly the
+`b < 1.0` the addition documents assuming. Correct today, on that reading, with
+no margin and a stale comment, in exchange for nothing measurable. Dropped.
 
 ## 11. The constant-time window scan, and what its speed actually costs
 
@@ -2258,6 +2297,7 @@ the step, which is what makes §4 and §7 pay.
 | **F — squaring's 128-bit doublings** | **Changed.** `square_limbs` doubled five 128-bit coefficients; `2*(x*y) == (2*x)*y`, so four precomputed 64-bit doublings cover all ten mirror-pair products instead — which is what `serial::u32` has always done. Isolated `fe_square` **−5.4%** (7/7 paired runs) and **−10.5%** with `+bmi2`; `mul_clamped` **−2.2%** with `+bmi2`, −0.7% stock; `fe_invert` −5.8%. The time win is several times the −1.29% instruction win because the 128-bit shift was on the dependency chain (§7). Bit-for-bit identical; wasm32 module byte-identical. |
 | **G — the ladder's subtractions** | **Changed.** `Sub` adds `16p` and must then `reduce`, because it has to accept anything at the crate-wide `b < 3`. The ladder's four subtractions all take `mul`/`square` outputs, which are far narrower, so a separate `sub_unreduced` offsets by `2p` and needs no reduction — a new operation with its own stated precondition, not a change to `Sub`'s contract. `mul_clamped` **−6.1%** on baseline `x86-64` and **−3.7%** with `+avx2,+bmi2`, 3/3 paired runs each, −6.58% instructions; `mul_base_clamped` unchanged. Not limb-for-limb identical — a different representative — so it is checked on field equality, the limb bound, debug-assertions across the whole suite, and the 1000-iteration RFC 7748 ladder vector. `serial::u32` forwards to `Sub`: the same bound closes there with only 0.167 bits of margin against a silent `u32` overflow (§8.4). |
 | **H — batching the affine table conversions** | **Changed.** `LookupTable<AffineNielsPoint>::from` converted eight multiples one at a time, one field inversion each, so `EdwardsBasepointTable::create` did **256** — 91% of its cost. The chain depends on the previous multiple's *value*, not its affine form, so it runs in extended coordinates and converts all eight at the end with Montgomery's trick. `create` **−74.8% (3.97×)**, 7/7 paired runs, −72.1% instructions. Both hot paths unchanged: the crate ships its table as a constant. Not limb-for-limb identical — the batch returns a different weakly-reduced representative — so it is checked on canonical bytes against a verbatim copy of the old code, on the identity, and against the precomputed table (§9.3). |
+| **I — tagging the AVX2 multiply per call site** | **Changed.** LLVM emitted one shared outlined body for the three `FieldElement2625x4` multiplies on the verification path; an unused `const N: u8` gives each site its own instantiation. `ed25519_verify` **−3.21% instructions** (316 280 → 306 124, callgrind, exact) for **+784 bytes** of `.text`. Wall-clock cannot resolve it — the host's spread was five times the effect — so the instruction count is the claim. The `Mul` operator stays as the untagged spelling; the tags are inert if a future LLVM stops sharing. A paired `negate_lazy` substitution was **refused** separately: −0.015%, and it would invalidate a documented `b < 0.007` bound (§10.5). |
 | **The verify kernel measured the wrong crate** | **Found and fixed (§9.7).** `ed25519-dalek` depends on `curve25519-dalek` by version, and the harness patched only `curve25519-dalek-derive`, so the binary linked two copies and `ed25519_verify` profiled the published 5.0.0 rather than this tree. It was blind to every change here — reporting "unchanged" for a regression as readily as for a win. Corrected: **354 575 → 330 457 Ir**, AVX2 87.8% → **87.4%**, the inversion 10.0% → **10.2%**. No conclusion in §9 changes, because they rest on the call graph rather than on these totals. The first attempt at the correction was itself contaminated by an uncommitted experiment and had to be re-taken in a pristine worktree; §9.7 records that too. |
 | **Batching verification's inversions** | **Refused: there is nothing to batch.** An Ed25519 verification performs **exactly one** field inversion, in `compress`; the vector table build and the wNAF loop perform none, and the vector backend contains no runtime `invert` at all. The profile's sixteen `as_affine` cannot be in verification, and cannot be sixteen X25519 operations either — that would be four times the whole message's cycle budget (§9.2). |
 | **safegcd, second look** | **Refused again.** Worth more here than in §13.11 — 10.0% of a verification, ~4% of the group client — but a 2–4× inversion caps the win at 2–3% of the client, while the crate's *existing* batch inversion is worth 6–10× wherever inversions co-occur. It also cannot be the variable-time kind, because `compress` is shared with secret-derived callers (§9.5). |

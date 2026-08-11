@@ -599,6 +599,7 @@ impl FieldElement2625x4 {
     ///
     /// The coefficients of the result are bounded with \\( b < 0.007 \\).
     #[rustfmt::skip] // keep alignment of z* calculations
+    #[inline]
     pub fn square_and_negate_D(&self) -> FieldElement2625x4 {
         #[inline(always)]
         fn m(x: u32x8, y: u32x8) -> u64x4 {
@@ -684,90 +685,22 @@ impl FieldElement2625x4 {
 
         FieldElement2625x4::reduce64([z0, z1, z2, z3, z4, z5, z6, z7, z8, z9])
     }
-}
 
-#[unsafe_target_feature("avx2")]
-impl Neg for FieldElement2625x4 {
-    type Output = FieldElement2625x4;
-
-    /// Negate this field element, performing a reduction.
+    /// Multiply `self` by `rhs`, tagged with a distinct `N` per call site.
     ///
-    /// If the coefficients are known to be small, use `negate_lazy`
-    /// to avoid performing a reduction.
+    /// `N` is deliberately unused. It exists so that each caller instantiates
+    /// its own copy of this function: without it LLVM shares one outlined body
+    /// across the three multiplies in `ExtendedPoint::double` and
+    /// `Add<&CachedPoint>`, and the shared copy cannot specialise on the
+    /// operand shapes each site actually has. Giving each site its own
+    /// instantiation is worth **-3.29% of the instructions** in a full
+    /// signature verification, for +784 bytes of `.text` (§10.5).
     ///
-    /// # Preconditions
-    ///
-    /// The coefficients of `self` must be bounded with \\( b < 4.0 \\).
-    ///
-    /// # Postconditions
-    ///
-    /// The coefficients of the result are bounded with \\( b < 0.0002 \\).
-    #[inline]
-    fn neg(self) -> FieldElement2625x4 {
-        FieldElement2625x4([
-            P_TIMES_16_LO - self.0[0],
-            P_TIMES_16_HI - self.0[1],
-            P_TIMES_16_HI - self.0[2],
-            P_TIMES_16_HI - self.0[3],
-            P_TIMES_16_HI - self.0[4],
-        ])
-        .reduce()
-    }
-}
-
-#[unsafe_target_feature("avx2")]
-impl Add<FieldElement2625x4> for FieldElement2625x4 {
-    type Output = FieldElement2625x4;
-    /// Add two `FieldElement2625x4`s, without performing a reduction.
-    #[inline]
-    fn add(self, rhs: FieldElement2625x4) -> FieldElement2625x4 {
-        FieldElement2625x4([
-            self.0[0] + rhs.0[0],
-            self.0[1] + rhs.0[1],
-            self.0[2] + rhs.0[2],
-            self.0[3] + rhs.0[3],
-            self.0[4] + rhs.0[4],
-        ])
-    }
-}
-
-#[unsafe_target_feature("avx2")]
-impl Mul<(u32, u32, u32, u32)> for FieldElement2625x4 {
-    type Output = FieldElement2625x4;
-    /// Perform a multiplication by a vector of small constants.
-    ///
-    /// # Postconditions
-    ///
-    /// The coefficients of the result are bounded with \\( b < 0.007 \\).
-    #[inline]
-    fn mul(self, scalars: (u32, u32, u32, u32)) -> FieldElement2625x4 {
-        let consts = u32x8::new(scalars.0, 0, scalars.1, 0, scalars.2, 0, scalars.3, 0);
-
-        let (b0, b1) = unpack_pair(self.0[0]);
-        let (b2, b3) = unpack_pair(self.0[1]);
-        let (b4, b5) = unpack_pair(self.0[2]);
-        let (b6, b7) = unpack_pair(self.0[3]);
-        let (b8, b9) = unpack_pair(self.0[4]);
-
-        FieldElement2625x4::reduce64([
-            b0.mul32(consts),
-            b1.mul32(consts),
-            b2.mul32(consts),
-            b3.mul32(consts),
-            b4.mul32(consts),
-            b5.mul32(consts),
-            b6.mul32(consts),
-            b7.mul32(consts),
-            b8.mul32(consts),
-            b9.mul32(consts),
-        ])
-    }
-}
-
-#[unsafe_target_feature("avx2")]
-impl Mul<&FieldElement2625x4> for &FieldElement2625x4 {
-    type Output = FieldElement2625x4;
-    /// Multiply `self` by `rhs`.
+    /// This is a compiler-behaviour workaround, not an algorithmic one, so it
+    /// is load-bearing only for performance: `mul_tagged::<0>` through
+    /// `mul_tagged::<3>` all compute the same function, and the `Mul` operator
+    /// below is the untagged spelling. If a future LLVM stops sharing the body
+    /// the tags become inert rather than wrong.
     ///
     /// # Preconditions
     ///
@@ -778,10 +711,10 @@ impl Mul<&FieldElement2625x4> for &FieldElement2625x4 {
     /// # Postconditions
     ///
     /// The coefficients of the result are bounded with \\( b < 0.007 \\).
-    ///
     #[rustfmt::skip] // keep alignment of z* calculations
     #[inline]
-    fn mul(self, rhs: &FieldElement2625x4) -> FieldElement2625x4 {
+    pub fn mul_tagged<const N: u8>(&self, rhs: &FieldElement2625x4) -> FieldElement2625x4 {
+
         #[inline(always)]
         fn m(x: u32x8, y: u32x8) -> u64x4 {
             x.mul32(y)
@@ -986,6 +919,95 @@ impl Mul<&FieldElement2625x4> for &FieldElement2625x4 {
         // means we could get a tighter bound on the outputs, or a
         // looser bound on b_x.
         FieldElement2625x4::reduce64([z0, z1, z2, z3, z4, z5, z6, z7, z8, z9])
+    }
+}
+
+#[unsafe_target_feature("avx2")]
+impl Neg for FieldElement2625x4 {
+    type Output = FieldElement2625x4;
+
+    /// Negate this field element, performing a reduction.
+    ///
+    /// If the coefficients are known to be small, use `negate_lazy`
+    /// to avoid performing a reduction.
+    ///
+    /// # Preconditions
+    ///
+    /// The coefficients of `self` must be bounded with \\( b < 4.0 \\).
+    ///
+    /// # Postconditions
+    ///
+    /// The coefficients of the result are bounded with \\( b < 0.0002 \\).
+    #[inline]
+    fn neg(self) -> FieldElement2625x4 {
+        FieldElement2625x4([
+            P_TIMES_16_LO - self.0[0],
+            P_TIMES_16_HI - self.0[1],
+            P_TIMES_16_HI - self.0[2],
+            P_TIMES_16_HI - self.0[3],
+            P_TIMES_16_HI - self.0[4],
+        ])
+        .reduce()
+    }
+}
+
+#[unsafe_target_feature("avx2")]
+impl Add<FieldElement2625x4> for FieldElement2625x4 {
+    type Output = FieldElement2625x4;
+    /// Add two `FieldElement2625x4`s, without performing a reduction.
+    #[inline]
+    fn add(self, rhs: FieldElement2625x4) -> FieldElement2625x4 {
+        FieldElement2625x4([
+            self.0[0] + rhs.0[0],
+            self.0[1] + rhs.0[1],
+            self.0[2] + rhs.0[2],
+            self.0[3] + rhs.0[3],
+            self.0[4] + rhs.0[4],
+        ])
+    }
+}
+
+#[unsafe_target_feature("avx2")]
+impl Mul<(u32, u32, u32, u32)> for FieldElement2625x4 {
+    type Output = FieldElement2625x4;
+    /// Perform a multiplication by a vector of small constants.
+    ///
+    /// # Postconditions
+    ///
+    /// The coefficients of the result are bounded with \\( b < 0.007 \\).
+    #[inline]
+    fn mul(self, scalars: (u32, u32, u32, u32)) -> FieldElement2625x4 {
+        let consts = u32x8::new(scalars.0, 0, scalars.1, 0, scalars.2, 0, scalars.3, 0);
+
+        let (b0, b1) = unpack_pair(self.0[0]);
+        let (b2, b3) = unpack_pair(self.0[1]);
+        let (b4, b5) = unpack_pair(self.0[2]);
+        let (b6, b7) = unpack_pair(self.0[3]);
+        let (b8, b9) = unpack_pair(self.0[4]);
+
+        FieldElement2625x4::reduce64([
+            b0.mul32(consts),
+            b1.mul32(consts),
+            b2.mul32(consts),
+            b3.mul32(consts),
+            b4.mul32(consts),
+            b5.mul32(consts),
+            b6.mul32(consts),
+            b7.mul32(consts),
+            b8.mul32(consts),
+            b9.mul32(consts),
+        ])
+    }
+}
+
+#[unsafe_target_feature("avx2")]
+impl Mul<&FieldElement2625x4> for &FieldElement2625x4 {
+    type Output = FieldElement2625x4;
+    /// Multiply `self` by `rhs`. The untagged spelling of `mul_tagged`, which
+    /// carries the preconditions and postconditions this shares.
+    #[inline]
+    fn mul(self, rhs: &FieldElement2625x4) -> FieldElement2625x4 {
+        self.mul_tagged::<0>(rhs)
     }
 }
 

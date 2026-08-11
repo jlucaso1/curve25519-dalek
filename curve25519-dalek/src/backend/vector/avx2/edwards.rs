@@ -171,7 +171,7 @@ impl ExtendedPoint {
         tmp0 = tmp0.shuffle(Shuffle::CACA);
 
         // Bounds on (tmp0, tmp1) are (2.33, 1.6) < (2.5, 1.75).
-        ExtendedPoint(&tmp0 * &tmp1)
+        ExtendedPoint(tmp0.mul_tagged::<1>(&tmp1))
     }
 
     pub fn mul_by_pow_2(&self, k: u32) -> ExtendedPoint {
@@ -273,7 +273,7 @@ impl Add<&CachedPoint> for &ExtendedPoint {
         // tmp = (Y1-X1 Y1+X1 Z1 T1) = (S0 S1 Z1 T1) with b < 1.6
 
         // (tmp, other) bounded with b < (1.6, 1.0) < (2.5, 1.75).
-        tmp = &tmp * &other.0;
+        tmp = tmp.mul_tagged::<2>(&other.0);
         // tmp = (S0*S2' S1*S3' Z1*Z2' T1*T2') = (S8 S9 S10 S11)
 
         tmp = tmp.shuffle(Shuffle::ABDC);
@@ -289,7 +289,7 @@ impl Add<&CachedPoint> for &ExtendedPoint {
 
         // All coefficients of t0, t1 are bounded with b < 1.6.
         // Return (S12*S14 S15*S13 S15*S14 S12*S13) = (X3 Y3 Z3 T3)
-        ExtendedPoint(&t0 * &t1)
+        ExtendedPoint(t0.mul_tagged::<3>(&t1))
     }
 }
 
