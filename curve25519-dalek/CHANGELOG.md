@@ -46,6 +46,34 @@ major series.
   `alloc`. The batch returns a different weakly-reduced representative than
   `invert` does, so the result is equal as a field element but not limb for limb;
   it is tested against the previous construction on canonical bytes.
+* Perf: the AVX2 field multiply is emitted column-major. `FieldElement2625x4`'s
+  10x10 schoolbook was written row-major, which needs all ten `y_j`, all nine
+  `y_j_19`, all ten `x_i` and all five doubled `x_i` live simultaneously —
+  roughly 44 values against 16 YMM registers — and about a quarter of the
+  function's 416 instructions were spilling and reloading them. Emitting one
+  column of `rhs` at a time drops peak liveness to about 27 and lets the
+  loop-invariant `x_i` fold into memory operands. The multiply itself improves
+  6.7% (416 to 388 instructions per call). Output is bit-identical: the same 100
+  partial products summed in a different order, and `u64` addition wraps, so it
+  is associative and commutative even outside the documented bounds; a test
+  checks all five limbs and all eight lanes against a verbatim copy of the
+  previous code.
+* Perf: AVX2 `ExtendedPoint::double` fuses its two signed blends. Adding `+S2`
+  into lanes A,D and `-S2` into lanes B,C used two blends and two adds per limb;
+  the lane sets are disjoint and the quantity is the same, so one signed blend
+  carries both. 9 operations per limb become 7. The `ifma` backend already did
+  it this way. The result is limb-identical and the documented bounds are
+  unchanged.
+* Perf: together the two AVX2 changes take an Ed25519 verification down
+  **4.23%** (330 457 to 316 477 instructions, paired measurement with setup
+  differenced out), and `vartime_double_scalar_mul_basepoint` down 4.64%. They
+  move every AVX2 point operation, not only verification.
+* Fix: the benchmark harness linked two copies of `curve25519-dalek`. Because
+  `ed25519-dalek` depends on it by version rather than by path, the harness's
+  `ed25519_verify` kernel was profiling the published crate from crates.io
+  instead of this repository, so it was blind to every change here. Harness-only;
+  no library code is affected. See `docs/perf-x25519-field-arithmetic.md`
+  section 9.7.
 * Perf: together, the five X25519 changes listed here take `mul_clamped` down
   **10.1%** in a stock `cargo --release` build, **28.7%** with fat LTO and
   **30.3%** with fat LTO plus `-C target-feature=+avx2,+bmi2`, and **9.5%** on

@@ -798,23 +798,22 @@ impl Mul<&FieldElement2625x4> for &FieldElement2625x4 {
         let (x6, x7) = unpack_pair(self.0[3]);
         let (x8, x9) = unpack_pair(self.0[4]);
 
-        let (y0, y1) = unpack_pair(rhs.0[0]);
-        let (y2, y3) = unpack_pair(rhs.0[1]);
-        let (y4, y5) = unpack_pair(rhs.0[2]);
-        let (y6, y7) = unpack_pair(rhs.0[3]);
-        let (y8, y9) = unpack_pair(rhs.0[4]);
-
+        // Emitted **column-major over `rhs`**: column `j` contributes exactly one
+        // product to each of the ten accumulators, so `y_j` and `y_j_19` are born
+        // and die inside their column and only `rhs.0[j/2]` is unpacked when the
+        // column needs it. The row-major form needs all ten `y_j`, all nine
+        // `y_j_19`, all ten `x_i` and all five `x_odd_2` live at once — about 44
+        // values against 16 YMM registers, and the shipped code spent roughly a
+        // quarter of its instructions spilling and reloading them. Column-major
+        // peaks at about 27 live values, and the `x_i`, being invariant across
+        // all ten columns, fold into `vpmuludq mem, ymm, ymm` instead.
+        //
+        // These are the same 100 partial products in a different order. `u64`
+        // wrapping addition is associative and commutative, so the result is
+        // **bit-identical** to the row-major form for every input, including
+        // inputs outside the documented bounds; `mul_matches_row_major` checks
+        // that against a verbatim copy of the old code.
         let v19 = u32x8::new(19, 0, 19, 0, 19, 0, 19, 0);
-
-        let y1_19 = m_lo(v19, y1); // This fits in a u32
-        let y2_19 = m_lo(v19, y2); // iff 26 + b + lg(19) < 32
-        let y3_19 = m_lo(v19, y3); // if  b < 32 - 26 - 4.248 = 1.752
-        let y4_19 = m_lo(v19, y4);
-        let y5_19 = m_lo(v19, y5);
-        let y6_19 = m_lo(v19, y6);
-        let y7_19 = m_lo(v19, y7);
-        let y8_19 = m_lo(v19, y8);
-        let y9_19 = m_lo(v19, y9);
 
         let x1_2 = x1 + x1; // This fits in a u32 iff 25 + b + 1 < 32
         let x3_2 = x3 + x3; //                    iff b < 6
@@ -822,16 +821,131 @@ impl Mul<&FieldElement2625x4> for &FieldElement2625x4 {
         let x7_2 = x7 + x7;
         let x9_2 = x9 + x9;
 
-        let z0 = m(x0, y0) + m(x1_2, y9_19) + m(x2, y8_19) + m(x3_2, y7_19) + m(x4, y6_19) + m(x5_2, y5_19) + m(x6, y4_19) + m(x7_2, y3_19) + m(x8, y2_19) + m(x9_2, y1_19);
-        let z1 = m(x0, y1) + m(x1,      y0) + m(x2, y9_19) + m(x3,   y8_19) + m(x4, y7_19) + m(x5,   y6_19) + m(x6, y5_19) + m(x7,   y4_19) + m(x8, y3_19) + m(x9,   y2_19);
-        let z2 = m(x0, y2) + m(x1_2,    y1) + m(x2,    y0) + m(x3_2, y9_19) + m(x4, y8_19) + m(x5_2, y7_19) + m(x6, y6_19) + m(x7_2, y5_19) + m(x8, y4_19) + m(x9_2, y3_19);
-        let z3 = m(x0, y3) + m(x1,      y2) + m(x2,    y1) + m(x3,      y0) + m(x4, y9_19) + m(x5,   y8_19) + m(x6, y7_19) + m(x7,   y6_19) + m(x8, y5_19) + m(x9,   y4_19);
-        let z4 = m(x0, y4) + m(x1_2,    y3) + m(x2,    y2) + m(x3_2,    y1) + m(x4,    y0) + m(x5_2, y9_19) + m(x6, y8_19) + m(x7_2, y7_19) + m(x8, y6_19) + m(x9_2, y5_19);
-        let z5 = m(x0, y5) + m(x1,      y4) + m(x2,    y3) + m(x3,      y2) + m(x4,    y1) + m(x5,      y0) + m(x6, y9_19) + m(x7,   y8_19) + m(x8, y7_19) + m(x9,   y6_19);
-        let z6 = m(x0, y6) + m(x1_2,    y5) + m(x2,    y4) + m(x3_2,    y3) + m(x4,    y2) + m(x5_2,    y1) + m(x6,    y0) + m(x7_2, y9_19) + m(x8, y8_19) + m(x9_2, y7_19);
-        let z7 = m(x0, y7) + m(x1,      y6) + m(x2,    y5) + m(x3,      y4) + m(x4,    y3) + m(x5,      y2) + m(x6,    y1) + m(x7,      y0) + m(x8, y9_19) + m(x9,   y8_19);
-        let z8 = m(x0, y8) + m(x1_2,    y7) + m(x2,    y6) + m(x3_2,    y5) + m(x4,    y4) + m(x5_2,    y3) + m(x6,    y2) + m(x7_2,    y1) + m(x8,    y0) + m(x9_2, y9_19);
-        let z9 = m(x0, y9) + m(x1,      y8) + m(x2,    y7) + m(x3,      y6) + m(x4,    y5) + m(x5,      y4) + m(x6,    y3) + m(x7,      y2) + m(x8,    y1) + m(x9,      y0);
+        let (y0, y1) = unpack_pair(rhs.0[0]);
+        let mut z0 = m(x0, y0);
+        let mut z1 = m(x1, y0);
+        let mut z2 = m(x2, y0);
+        let mut z3 = m(x3, y0);
+        let mut z4 = m(x4, y0);
+        let mut z5 = m(x5, y0);
+        let mut z6 = m(x6, y0);
+        let mut z7 = m(x7, y0);
+        let mut z8 = m(x8, y0);
+        let mut z9 = m(x9, y0);
+
+        // Each `y_j_19` fits in a u32 iff 26 + b + lg(19) < 32, i.e. b < 1.752,
+        // which is the documented precondition on `rhs`.
+        let y1_19 = m_lo(v19, y1);
+        z0 = z0 + m(x9_2, y1_19);
+        z1 = z1 + m(x0, y1);
+        z2 = z2 + m(x1_2, y1);
+        z3 = z3 + m(x2, y1);
+        z4 = z4 + m(x3_2, y1);
+        z5 = z5 + m(x4, y1);
+        z6 = z6 + m(x5_2, y1);
+        z7 = z7 + m(x6, y1);
+        z8 = z8 + m(x7_2, y1);
+        z9 = z9 + m(x8, y1);
+
+        let (y2, y3) = unpack_pair(rhs.0[1]);
+        let y2_19 = m_lo(v19, y2);
+        z0 = z0 + m(x8, y2_19);
+        z1 = z1 + m(x9, y2_19);
+        z2 = z2 + m(x0, y2);
+        z3 = z3 + m(x1, y2);
+        z4 = z4 + m(x2, y2);
+        z5 = z5 + m(x3, y2);
+        z6 = z6 + m(x4, y2);
+        z7 = z7 + m(x5, y2);
+        z8 = z8 + m(x6, y2);
+        z9 = z9 + m(x7, y2);
+
+        let y3_19 = m_lo(v19, y3);
+        z0 = z0 + m(x7_2, y3_19);
+        z1 = z1 + m(x8, y3_19);
+        z2 = z2 + m(x9_2, y3_19);
+        z3 = z3 + m(x0, y3);
+        z4 = z4 + m(x1_2, y3);
+        z5 = z5 + m(x2, y3);
+        z6 = z6 + m(x3_2, y3);
+        z7 = z7 + m(x4, y3);
+        z8 = z8 + m(x5_2, y3);
+        z9 = z9 + m(x6, y3);
+
+        let (y4, y5) = unpack_pair(rhs.0[2]);
+        let y4_19 = m_lo(v19, y4);
+        z0 = z0 + m(x6, y4_19);
+        z1 = z1 + m(x7, y4_19);
+        z2 = z2 + m(x8, y4_19);
+        z3 = z3 + m(x9, y4_19);
+        z4 = z4 + m(x0, y4);
+        z5 = z5 + m(x1, y4);
+        z6 = z6 + m(x2, y4);
+        z7 = z7 + m(x3, y4);
+        z8 = z8 + m(x4, y4);
+        z9 = z9 + m(x5, y4);
+
+        let y5_19 = m_lo(v19, y5);
+        z0 = z0 + m(x5_2, y5_19);
+        z1 = z1 + m(x6, y5_19);
+        z2 = z2 + m(x7_2, y5_19);
+        z3 = z3 + m(x8, y5_19);
+        z4 = z4 + m(x9_2, y5_19);
+        z5 = z5 + m(x0, y5);
+        z6 = z6 + m(x1_2, y5);
+        z7 = z7 + m(x2, y5);
+        z8 = z8 + m(x3_2, y5);
+        z9 = z9 + m(x4, y5);
+
+        let (y6, y7) = unpack_pair(rhs.0[3]);
+        let y6_19 = m_lo(v19, y6);
+        z0 = z0 + m(x4, y6_19);
+        z1 = z1 + m(x5, y6_19);
+        z2 = z2 + m(x6, y6_19);
+        z3 = z3 + m(x7, y6_19);
+        z4 = z4 + m(x8, y6_19);
+        z5 = z5 + m(x9, y6_19);
+        z6 = z6 + m(x0, y6);
+        z7 = z7 + m(x1, y6);
+        z8 = z8 + m(x2, y6);
+        z9 = z9 + m(x3, y6);
+
+        let y7_19 = m_lo(v19, y7);
+        z0 = z0 + m(x3_2, y7_19);
+        z1 = z1 + m(x4, y7_19);
+        z2 = z2 + m(x5_2, y7_19);
+        z3 = z3 + m(x6, y7_19);
+        z4 = z4 + m(x7_2, y7_19);
+        z5 = z5 + m(x8, y7_19);
+        z6 = z6 + m(x9_2, y7_19);
+        z7 = z7 + m(x0, y7);
+        z8 = z8 + m(x1_2, y7);
+        z9 = z9 + m(x2, y7);
+
+        let (y8, y9) = unpack_pair(rhs.0[4]);
+        let y8_19 = m_lo(v19, y8);
+        z0 = z0 + m(x2, y8_19);
+        z1 = z1 + m(x3, y8_19);
+        z2 = z2 + m(x4, y8_19);
+        z3 = z3 + m(x5, y8_19);
+        z4 = z4 + m(x6, y8_19);
+        z5 = z5 + m(x7, y8_19);
+        z6 = z6 + m(x8, y8_19);
+        z7 = z7 + m(x9, y8_19);
+        z8 = z8 + m(x0, y8);
+        z9 = z9 + m(x1, y8);
+
+        let y9_19 = m_lo(v19, y9);
+        z0 = z0 + m(x1_2, y9_19);
+        z1 = z1 + m(x2, y9_19);
+        z2 = z2 + m(x3_2, y9_19);
+        z3 = z3 + m(x4, y9_19);
+        z4 = z4 + m(x5_2, y9_19);
+        z5 = z5 + m(x6, y9_19);
+        z6 = z6 + m(x7_2, y9_19);
+        z7 = z7 + m(x8, y9_19);
+        z8 = z8 + m(x9_2, y9_19);
+        z9 = z9 + m(x0, y9);
 
         // The bounds on z[i] are the same as in the serial 32-bit code
         // and the comment below is copied from there:
@@ -879,6 +993,120 @@ impl Mul<&FieldElement2625x4> for &FieldElement2625x4 {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// The row-major multiply this file used before the column-major rewrite,
+    /// kept verbatim so the rewrite can be checked against it rather than
+    /// against a description of it.
+    #[rustfmt::skip]
+    fn reference_row_major_mul(
+        lhs: &FieldElement2625x4,
+        rhs: &FieldElement2625x4,
+    ) -> FieldElement2625x4 {
+        #[inline(always)]
+        fn m(x: u32x8, y: u32x8) -> u64x4 { x.mul32(y) }
+        #[inline(always)]
+        fn m_lo(x: u32x8, y: u32x8) -> u32x8 { x.mul32(y).into() }
+
+        let (x0, x1) = unpack_pair(lhs.0[0]);
+        let (x2, x3) = unpack_pair(lhs.0[1]);
+        let (x4, x5) = unpack_pair(lhs.0[2]);
+        let (x6, x7) = unpack_pair(lhs.0[3]);
+        let (x8, x9) = unpack_pair(lhs.0[4]);
+
+        let (y0, y1) = unpack_pair(rhs.0[0]);
+        let (y2, y3) = unpack_pair(rhs.0[1]);
+        let (y4, y5) = unpack_pair(rhs.0[2]);
+        let (y6, y7) = unpack_pair(rhs.0[3]);
+        let (y8, y9) = unpack_pair(rhs.0[4]);
+
+        let v19 = u32x8::new(19, 0, 19, 0, 19, 0, 19, 0);
+
+        let y1_19 = m_lo(v19, y1);
+        let y2_19 = m_lo(v19, y2);
+        let y3_19 = m_lo(v19, y3);
+        let y4_19 = m_lo(v19, y4);
+        let y5_19 = m_lo(v19, y5);
+        let y6_19 = m_lo(v19, y6);
+        let y7_19 = m_lo(v19, y7);
+        let y8_19 = m_lo(v19, y8);
+        let y9_19 = m_lo(v19, y9);
+
+        let x1_2 = x1 + x1;
+        let x3_2 = x3 + x3;
+        let x5_2 = x5 + x5;
+        let x7_2 = x7 + x7;
+        let x9_2 = x9 + x9;
+
+        let z0 = m(x0, y0) + m(x1_2, y9_19) + m(x2, y8_19) + m(x3_2, y7_19) + m(x4, y6_19) + m(x5_2, y5_19) + m(x6, y4_19) + m(x7_2, y3_19) + m(x8, y2_19) + m(x9_2, y1_19);
+        let z1 = m(x0, y1) + m(x1,      y0) + m(x2, y9_19) + m(x3,   y8_19) + m(x4, y7_19) + m(x5,   y6_19) + m(x6, y5_19) + m(x7,   y4_19) + m(x8, y3_19) + m(x9,   y2_19);
+        let z2 = m(x0, y2) + m(x1_2,    y1) + m(x2,    y0) + m(x3_2, y9_19) + m(x4, y8_19) + m(x5_2, y7_19) + m(x6, y6_19) + m(x7_2, y5_19) + m(x8, y4_19) + m(x9_2, y3_19);
+        let z3 = m(x0, y3) + m(x1,      y2) + m(x2,    y1) + m(x3,      y0) + m(x4, y9_19) + m(x5,   y8_19) + m(x6, y7_19) + m(x7,   y6_19) + m(x8, y5_19) + m(x9,   y4_19);
+        let z4 = m(x0, y4) + m(x1_2,    y3) + m(x2,    y2) + m(x3_2,    y1) + m(x4,    y0) + m(x5_2, y9_19) + m(x6, y8_19) + m(x7_2, y7_19) + m(x8, y6_19) + m(x9_2, y5_19);
+        let z5 = m(x0, y5) + m(x1,      y4) + m(x2,    y3) + m(x3,      y2) + m(x4,    y1) + m(x5,      y0) + m(x6, y9_19) + m(x7,   y8_19) + m(x8, y7_19) + m(x9,   y6_19);
+        let z6 = m(x0, y6) + m(x1_2,    y5) + m(x2,    y4) + m(x3_2,    y3) + m(x4,    y2) + m(x5_2,    y1) + m(x6,    y0) + m(x7_2, y9_19) + m(x8, y8_19) + m(x9_2, y7_19);
+        let z7 = m(x0, y7) + m(x1,      y6) + m(x2,    y5) + m(x3,      y4) + m(x4,    y3) + m(x5,      y2) + m(x6,    y1) + m(x7,      y0) + m(x8, y9_19) + m(x9,   y8_19);
+        let z8 = m(x0, y8) + m(x1_2,    y7) + m(x2,    y6) + m(x3_2,    y5) + m(x4,    y4) + m(x5_2,    y3) + m(x6,    y2) + m(x7_2,    y1) + m(x8,    y0) + m(x9_2, y9_19);
+        let z9 = m(x0, y9) + m(x1,      y8) + m(x2,    y7) + m(x3,      y6) + m(x4,    y5) + m(x5,      y4) + m(x6,    y3) + m(x7,      y2) + m(x8,    y1) + m(x9,      y0);
+
+        FieldElement2625x4::reduce64([z0, z1, z2, z3, z4, z5, z6, z7, z8, z9])
+    }
+
+    /// The column-major rewrite sums the same 100 partial products in a
+    /// different order. `u64` addition wraps, so it is associative and
+    /// commutative, and the two must therefore agree **limb for limb** on every
+    /// input — not merely as field elements, and not merely on inputs that
+    /// respect the documented bounds. That is the strongest statement available
+    /// here, so it is the one asserted.
+    #[test]
+    fn mul_matches_row_major() {
+        let mut rng_state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            // xorshift64*, so the test is deterministic and needs no dev-dep.
+            rng_state ^= rng_state >> 12;
+            rng_state ^= rng_state << 25;
+            rng_state ^= rng_state >> 27;
+            rng_state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+
+        for _ in 0..512 {
+            // Build inputs directly in the packed representation, at the top of
+            // the documented ranges (b < 2.5 for lhs, b < 1.75 for rhs) so the
+            // carry behaviour is exercised, not just small values.
+            let mut mk = |bits: u32| {
+                let mut limbs = [u32x8::splat(0); 5];
+                for limb in limbs.iter_mut() {
+                    let mut lanes = [0u32; 8];
+                    for lane in lanes.iter_mut() {
+                        *lane = (next() as u32) & ((1u32 << bits) - 1);
+                    }
+                    *limb = u32x8::new(
+                        lanes[0], lanes[1], lanes[2], lanes[3], lanes[4], lanes[5], lanes[6],
+                        lanes[7],
+                    );
+                }
+                FieldElement2625x4(limbs)
+            };
+            let a = mk(28);
+            let b = mk(27);
+
+            let got = &a * &b;
+            let want = reference_row_major_mul(&a, &b);
+
+            // Compare the packed representation lane by lane: this asserts
+            // limb equality, which is strictly stronger than field equality.
+            for i in 0..5 {
+                let (g, w) = (got.0[i], want.0[i]);
+                assert_eq!(g.extract::<0>(), w.extract::<0>(), "limb {i} lane 0");
+                assert_eq!(g.extract::<1>(), w.extract::<1>(), "limb {i} lane 1");
+                assert_eq!(g.extract::<2>(), w.extract::<2>(), "limb {i} lane 2");
+                assert_eq!(g.extract::<3>(), w.extract::<3>(), "limb {i} lane 3");
+                assert_eq!(g.extract::<4>(), w.extract::<4>(), "limb {i} lane 4");
+                assert_eq!(g.extract::<5>(), w.extract::<5>(), "limb {i} lane 5");
+                assert_eq!(g.extract::<6>(), w.extract::<6>(), "limb {i} lane 6");
+                assert_eq!(g.extract::<7>(), w.extract::<7>(), "limb {i} lane 7");
+            }
+        }
+    }
 
     #[test]
     fn scale_by_curve_constants() {
