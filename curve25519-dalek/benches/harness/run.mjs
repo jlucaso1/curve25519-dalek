@@ -54,11 +54,24 @@ const { bench_kernel, config_code } = instance.exports;
 
 // Bits, as set by `config_code_impl` in lib.rs: 1 = 64-bit limbs,
 // 2 = fiat backend, 4 = simd/avx512, 8 = field kernels compiled in.
+//
+// Bit 3 is also the validity flag for bits 0-2: they are read out of
+// `bench_internals`, so a module built without `--cfg
+// curve25519_dalek_bench_internals` reports zero for all of them and the limb
+// width and backend are unknown, not 32-bit serial. Printing a guess there
+// would put a false configuration line above a real measurement.
 const code = config_code ? config_code() : 0;
 const hasFieldKernels = (code & 8) !== 0;
-const backend = code & 2 ? "fiat" : code & 4 ? "simd" : "serial";
+const limbBits = hasFieldKernels ? (code & 1 ? 64 : 32) : "unknown";
+const backend = !hasFieldKernels
+  ? "unknown"
+  : code & 2
+    ? "fiat"
+    : code & 4
+      ? "simd"
+      : "serial";
 console.log(
-  `# limb_bits=${code & 1 ? 64 : 32} backend=${backend} ` +
+  `# limb_bits=${limbBits} backend=${backend} ` +
     `field_kernels=${hasFieldKernels} (config_code=${code})`,
 );
 console.log("kernel\titers\treps\tmin_ns_op\tmed_ns_op\tmax_ns_op\tspread_pct");

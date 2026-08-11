@@ -15,6 +15,15 @@ major series.
   `mul_clamped` improves measurably in every build profile; the output is
   bit-for-bit identical and the 5x51 limb representation and its bit-excess
   preconditions are unchanged.
+* Perf: `serial::u64` field squaring now doubles its 64-bit inputs rather than
+  its 128-bit output coefficients. Ten of the twenty-five partial products
+  appear twice, so they are computed once and doubled; since `2*(x*y)` equals
+  `(2*x)*y`, four precomputed 64-bit doublings replace five 128-bit ones, which
+  is what `serial::u32` has always done. Isolated squaring improves 5.4%, and
+  10.5% with `-C target-feature=+bmi2`; field inversion 5.8%; X25519
+  `mul_clamped` 2.2% with `+bmi2`. Output is bit-for-bit identical, the limb
+  representation and bit-excess preconditions are unchanged, and the wasm32
+  module is byte-identical since `serial::u64` is not compiled there.
 * Perf: together, the three X25519 changes below take `mul_clamped` down 9.7% in
   a stock `cargo --release` build, 25.0% with fat LTO, and 8.8% on wasm32,
   measured against the base branch in one alternating session on the same pinned

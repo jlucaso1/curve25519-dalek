@@ -245,7 +245,20 @@ fn run_field_kernel(_which: u32, _iters: u32) -> u64 {
 ///
 /// bit 0: 64-bit limbs · bit 1: fiat backend · bit 2: simd backend ·
 /// bit 3: field kernels available.
+///
+/// Bit 3 doubles as the validity flag for bits 0-2. The limb width and backend
+/// are read out of `bench_internals`, so without that hook they are not merely
+/// unavailable but *unknown*, and a driver must not decode a cleared bit 0 as
+/// "32-bit limbs". The crate's configuration cfgs are set by its own build
+/// script and are not visible to a dependent, so there is no second source to
+/// fall back on — reproducing the selection logic here would attest to what
+/// this file believes rather than to what the dependency compiled, which is
+/// the whole point of reading it out of the dependency.
 pub fn config_code_impl() -> u32 {
+    // Nothing assigns to `code` when the hook is absent, which is the whole
+    // point of the unknown encoding above; that build mode should still be
+    // warning-free.
+    #[allow(unused_mut)]
     let mut code = 0;
     #[cfg(curve25519_dalek_bench_internals)]
     {
