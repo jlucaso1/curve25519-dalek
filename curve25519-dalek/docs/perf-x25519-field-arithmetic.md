@@ -2077,6 +2077,71 @@ so the trade could be re-made — and one of them since has been.
 
 ---
 
+### 13.11 `mul_base` never reaches the vector backend. A prototype says −45.1%
+
+`edwards_mul_base` costs **153 913 instructions under `curve25519_dalek_backend
+= "serial"` and 153 913 under `= "simd"`** — not close, identical. The fixed-base
+ladder runs entirely in `serial::u64` even when AVX2 is live, because the vector
+backend has `variable_base` and `vartime_double_base` and no fixed-base path at
+all. The same pair of builds moves `vartime_double_base` by −47.3% and
+`ed25519_verify` by −43.9%, so the backend is not short of headroom here; it is
+simply not wired in.
+
+Where the 153 913 go:
+
+| | instructions | share |
+| --- | ---: | ---: |
+| `serial::u64::FieldElement51::mul` | 19 930 756 | **63.92%** |
+| `LookupTable<AffineNielsPoint>::select_or` (the constant-time scan) | 7 180 800 | 23.03% |
+| `EdwardsPoint + AffineNielsPoint` | 1 792 000 | 5.75% |
+| `mul_base` itself | 771 000 | 2.47% |
+| `ProjectivePoint::double` | 591 200 | 1.90% |
+| `subtle::black_box` | 384 606 | 1.23% |
+
+(`callgrind`, 200 iterations, AVX2 build.) About 74% is field arithmetic the
+vector types would replace and 23% is a table scan they would change the shape
+of.
+
+**The prototype.** `backend/vector/scalar_mul/fixed_base.rs` runs the same
+radix-16 ladder — 64 additions and one `mul_by_pow_2(4)`, indexed identically —
+over `ExtendedPoint`/`CachedPoint`, using the `LookupTable<CachedPoint>` and the
+constant-time `select` the vector `variable_base` already has. Nothing new was
+needed except the table itself. The kernel checks the prototype against
+`EdwardsPoint::mul_base` on eight scalars before timing anything, because a
+ladder indexed wrongly would measure the wrong thing and still look fast.
+
+| | instructions | wall clock |
+| --- | ---: | ---: |
+| `edwards_mul_base` (serial ladder) | 153 913 | 12 594 ns |
+| `vec_edwards_mul_base` (prototype) | **84 551** | **9 284 ns** |
+| | **−45.1%** | **−26.3%** |
+
+Both kernels accumulate with one Edwards addition per iteration, so that ~2% is
+on both sides and the figures are, if anything, conservative. The wall-clock gain
+is smaller than the instruction gain, which is what a shift to 256-bit lanes
+looks like: fewer instructions, lower throughput each.
+
+**What shipping it would cost, and why this stops at a prototype.** The table is
+built at construction time here. A shipped version needs it as a static
+constant — 32 sub-tables of eight `CachedPoint`s, **about 40 KB**, on top of the
+30 KB serial table, which is still needed for the public
+`EdwardsBasepointTable` API and for every non-AVX2 build. Worse, `CachedPoint`
+is a different type in the `ifma` backend, so `unsafe_target_feature_specialize`
+would want a *second* 40 KB constant with a different limb layout. Building it
+lazily instead is not obviously available: the simd backend supports `no_std`,
+where there is no `OnceLock`.
+
+So the measurement is the deliverable and the constant is the open question. The
+prototype is compiled only under `--cfg curve25519_dalek_bench_internals`, so it
+is not dead code in a shipped build, and `vec_*` kernels report `unavailable`
+wherever the AVX2 backend is not live — including wasm32, which cannot have it.
+
+Who benefits is worth stating plainly, because it is not verification:
+`mul_base` is Ed25519 key generation and **signing**, and X25519 base-point
+clamping. Verification goes through `vartime_double_scalar_mul_basepoint`, which
+is already vectorised. A workload dominated by verification would not notice
+this at all.
+
 ## 14. Validation
 
 * **A 12-cell feature x backend matrix, under `-D warnings`.** Three feature
@@ -2298,6 +2363,7 @@ the step, which is what makes §4 and §7 pay.
 | **G — the ladder's subtractions** | **Changed.** `Sub` adds `16p` and must then `reduce`, because it has to accept anything at the crate-wide `b < 3`. The ladder's four subtractions all take `mul`/`square` outputs, which are far narrower, so a separate `sub_unreduced` offsets by `2p` and needs no reduction — a new operation with its own stated precondition, not a change to `Sub`'s contract. `mul_clamped` **−6.1%** on baseline `x86-64` and **−3.7%** with `+avx2,+bmi2`, 3/3 paired runs each, −6.58% instructions; `mul_base_clamped` unchanged. Not limb-for-limb identical — a different representative — so it is checked on field equality, the limb bound, debug-assertions across the whole suite, and the 1000-iteration RFC 7748 ladder vector. `serial::u32` forwards to `Sub`: the same bound closes there with only 0.167 bits of margin against a silent `u32` overflow (§8.4). |
 | **H — batching the affine table conversions** | **Changed.** `LookupTable<AffineNielsPoint>::from` converted eight multiples one at a time, one field inversion each, so `EdwardsBasepointTable::create` did **256** — 91% of its cost. The chain depends on the previous multiple's *value*, not its affine form, so it runs in extended coordinates and converts all eight at the end with Montgomery's trick. `create` **−74.8% (3.97×)**, 7/7 paired runs, −72.1% instructions. Both hot paths unchanged: the crate ships its table as a constant. Not limb-for-limb identical — the batch returns a different weakly-reduced representative — so it is checked on canonical bytes against a verbatim copy of the old code, on the identity, and against the precomputed table (§9.3). |
 | **I — tagging the AVX2 multiply per call site** | **Changed.** LLVM emitted one shared outlined body for the three `FieldElement2625x4` multiplies on the verification path; an unused `const N: u8` gives each site its own instantiation. `ed25519_verify` **−3.21% instructions** (316 280 → 306 124, callgrind, exact) for **+784 bytes** of `.text`. Wall-clock cannot resolve it — the host's spread was five times the effect — so the instruction count is the claim. The `Mul` operator stays as the untagged spelling; the tags are inert if a future LLVM stops sharing. A paired `negate_lazy` substitution was **refused** separately: −0.015%, and it would invalidate a documented `b < 0.007` bound (§10.5). |
+| **J — vectorising `mul_base`** | **Measured, not shipped.** `edwards_mul_base` costs an identical 153 913 instructions under the serial and simd backends: the fixed-base ladder never reaches the vector backend, which has no fixed-base path. A prototype running the same radix-16 ladder over `ExtendedPoint`/`CachedPoint` — verified against `EdwardsPoint::mul_base` before timing — is **−45.1% instructions** (153 913 → 84 551) and **−26.3%** wall clock (12 594 → 9 284 ns). It stops at a prototype because shipping needs the table as a static constant: ~40 KB for AVX2, plus a second one for `ifma`'s different limb layout, and no `OnceLock` to build it lazily in `no_std`. Benefits signing and key generation, not verification (§13.11). |
 | **The verify kernel measured the wrong crate** | **Found and fixed (§9.7).** `ed25519-dalek` depends on `curve25519-dalek` by version, and the harness patched only `curve25519-dalek-derive`, so the binary linked two copies and `ed25519_verify` profiled the published 5.0.0 rather than this tree. It was blind to every change here — reporting "unchanged" for a regression as readily as for a win. Corrected: **354 575 → 330 457 Ir**, AVX2 87.8% → **87.4%**, the inversion 10.0% → **10.2%**. No conclusion in §9 changes, because they rest on the call graph rather than on these totals. The first attempt at the correction was itself contaminated by an uncommitted experiment and had to be re-taken in a pristine worktree; §9.7 records that too. |
 | **Batching verification's inversions** | **Refused: there is nothing to batch.** An Ed25519 verification performs **exactly one** field inversion, in `compress`; the vector table build and the wNAF loop perform none, and the vector backend contains no runtime `invert` at all. The profile's sixteen `as_affine` cannot be in verification, and cannot be sixteen X25519 operations either — that would be four times the whole message's cycle budget (§9.2). |
 | **safegcd, second look** | **Refused again.** Worth more here than in §13.11 — 10.0% of a verification, ~4% of the group client — but a 2–4× inversion caps the win at 2–3% of the client, while the crate's *existing* batch inversion is worth 6–10× wherever inversions co-occur. It also cannot be the variable-time kind, because `compress` is shared with secret-derived callers (§9.5). |

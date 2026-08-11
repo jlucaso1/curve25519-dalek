@@ -12,6 +12,9 @@
 //! Implementations of various multiplication algorithms for the SIMD backends.
 
 #[allow(missing_docs)]
+// Prototype, benchmark builds only; see the module docs.
+#[cfg(curve25519_dalek_bench_internals)]
+pub mod fixed_base;
 pub mod variable_base;
 
 #[allow(missing_docs)]

@@ -48,6 +48,7 @@ pub const K_FE_BATCH_INVERT_8: u32 = 14;
 pub const K_FE_INVERT_X16: u32 = 15;
 pub const K_FE_BATCH_INVERT_16: u32 = 16;
 pub const K_ED_TABLE_CREATE: u32 = 17;
+pub const K_ED_MUL_BASE_VEC: u32 = 18;
 
 pub const KERNELS: &[(u32, &str, u32)] = &[
     // (selector, name, field operations per iteration)
@@ -69,12 +70,22 @@ pub const KERNELS: &[(u32, &str, u32)] = &[
     (K_FE_INVERT_X16, "fe_invert_x16", 16),
     (K_FE_BATCH_INVERT_16, "fe_batch_invert_16", 16),
     (K_ED_TABLE_CREATE, "edwards_table_create", 1),
+    (K_ED_MUL_BASE_VEC, "vec_edwards_mul_base", 1),
 ];
 
 /// Whether the field-level kernels were compiled in. They need
 /// `--cfg curve25519_dalek_bench_internals`, because `FieldElement` is
 /// `pub(crate)`.
 pub const HAS_FIELD_KERNELS: bool = cfg!(curve25519_dalek_bench_internals);
+
+/// Whether the prototype vector fixed-base kernel was compiled in. It needs the
+/// AVX2 backend, so it is absent on wasm32 by construction. Kernels named
+/// `vec_*` are gated on this the way `fe_*` are gated on `HAS_FIELD_KERNELS`.
+pub const HAS_VECTOR_KERNELS: bool = cfg!(all(
+    curve25519_dalek_bench_internals,
+    curve25519_dalek_backend = "simd",
+    target_arch = "x86_64"
+));
 
 /// The larger basepoint tables, built once. Constructing a radix-64 table costs
 /// on the order of a thousand point operations; leaving that inside the timed
@@ -222,6 +233,38 @@ pub fn run_kernel(which: u32, iters: u32) -> u64 {
             }
             // Compressed once, outside the timed loop, only to consume `last`.
             last.compress().to_bytes()[0] as u64
+        }
+        K_ED_MUL_BASE_VEC if !HAS_VECTOR_KERNELS => 0,
+        #[cfg(all(
+            curve25519_dalek_bench_internals,
+            curve25519_dalek_backend = "simd",
+            target_arch = "x86_64"
+        ))]
+        K_ED_MUL_BASE_VEC => {
+            // Prototype vectorised fixed base (§13.11). The table is built once
+            // outside the loop, exactly as a shipped static constant would be.
+            let table = curve25519_dalek::bench_internals::VectorBasepointTable::create(
+                &EdwardsPoint::mul_base(&Scalar::ONE),
+            );
+            // A wrong ladder would measure the wrong thing, so it is checked
+            // against the serial answer before anything is timed.
+            for k in 1..8u8 {
+                let s = Scalar::from_bytes_mod_order(seed_bytes(k));
+                assert_eq!(
+                    table.mul_base(&s).compress(),
+                    EdwardsPoint::mul_base(&s).compress(),
+                    "vector fixed-base disagrees with serial"
+                );
+            }
+            // Accumulated by Edwards addition, matching `edwards_mul_base`
+            // exactly so the two kernels are comparable.
+            let mut s = Scalar::from_bytes_mod_order(seed_bytes(5));
+            let mut sum = EdwardsPoint::default();
+            for _ in 0..iters {
+                sum += table.mul_base(&s);
+                s += Scalar::ONE;
+            }
+            sum.compress().to_bytes()[0] as u64
         }
         K_ED25519_VERIFY => {
             // A full Ed25519 signature verification: SHA-512 over the message,

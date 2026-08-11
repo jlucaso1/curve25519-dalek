@@ -112,3 +112,8 @@ pub const MUL121666_PER_MUL_CLAMPED: usize = LADDER_STEPS * MUL121666_PER_LADDER
 /// Total field squarings in one `MontgomeryPoint::mul_clamped`.
 pub const SQUARES_PER_MUL_CLAMPED: usize =
     LADDER_STEPS * SQUARES_PER_LADDER_STEP + SQUARES_PER_FINAL_INVERSION;
+
+/// Prototype hook: the vectorised fixed-base ladder (§13.11). Present only on
+/// the AVX2 backend, and only under `--cfg curve25519_dalek_bench_internals`.
+#[cfg(all(curve25519_dalek_backend = "simd", target_arch = "x86_64"))]
+pub use crate::backend::vector::scalar_mul::fixed_base::spec_avx2::VectorBasepointTable;
