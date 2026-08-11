@@ -930,7 +930,47 @@ compilers downstream. This is the same caution as §7's `bits="64"` result,
 reached from the opposite direction, and it is why §6 was accepted on a measured
 wasm32 win rather than on its instruction count.
 
-### 8.8 What is left, and why it was not attempted
+### 8.8 wasm32: `simd128` is worth 4.6% on DH and 15.7% on key generation
+
+`simd128` is a stable wasm feature, but it is **not** enabled by default for
+`wasm32-unknown-unknown`. Turning it on costs nothing but a flag:
+
+```sh
+RUSTFLAGS='-C target-feature=+simd128'
+```
+
+Six alternating paired runs, minimum of 11-13 repetitions, ns:
+
+| kernel | default | `+simd128` | change |
+| --- | ---: | ---: | ---: |
+| `fe_mul` | 50.55 | 50.94 | none |
+| `fe_square` | 36.90 | 38.13 | none |
+| `fe_invert` | 8 941 | 8 909 | none |
+| **`x25519_mul_clamped`** | 126 265 | **120 446** | **-4.6%** |
+| **`x25519_mul_base_clamped`** | 49 777 | **41 965** | **-15.7%** |
+
+Faster in every paired run for both X25519 operations. The module also gets
+*smaller*, 118 754 to 110 732 bytes.
+
+**The field arithmetic does not move at all**, which is what makes this
+interesting. `fe_mul`, `fe_square` and `fe_invert` are unchanged — LLVM does not
+vectorize the radix-2^25.5 schoolbook, and that is where one might have expected
+a SIMD flag to pay. The gain is entirely in the **constant-time selection
+code**, and §8.6 says exactly why: `AffineNielsPoint::conditional_assign` is 15%
+of key generation and `LookupTable::select` another 4.8%, and a masked select
+over ten 32-bit limbs is the most vectorizable thing in the crate — four lanes
+to a `v128`. That the gain is 15.7% on key generation, which is scan-dominated,
+and 4.6% on the ladder, which does 256 conditional swaps but is otherwise
+multiplication-bound, follows directly from that split.
+
+So this is the wasm32 counterpart of the `+bmi2` result in §3.5: a consumer-side
+build flag worth more than any source change measured here, and for the same
+reason — the target has a capability the code can use that the default feature
+set does not expose. `simd128` shipped in Chrome 91, Firefox 89, Safari 16.4 and
+Node 16, so for most deployments it is free; a consumer targeting older engines
+should check their floor first.
+
+### 8.9 What is left, and why it was not attempted
 
 
 
@@ -1088,6 +1128,7 @@ the trade can be re-made by someone who wants it.
 | front | outcome |
 | --- | --- |
 | **A — ADX/BMI2 asm on x86_64** | **Refused.** LLVM emits all 25/25 and 15/15 available `mulx` under `+bmi2`; `adcx`/`adox` have no second carry chain to run in a 5×51 two-word accumulator, and their payoff belongs to a 4×64 saturated layout that is out of scope. Calibration: an intervention giving isolated `mul` −30% moved `mul_clamped` by 0.5%. |
+| **wasm32 `+simd128` (no code)** | `-C target-feature=+simd128` is worth **−4.6%** on `mul_clamped` and **−15.7%** on `mul_base_clamped`, and shrinks the module. Not on by default for `wasm32-unknown-unknown`. The field arithmetic does not vectorize; the whole gain is in the constant-time selection code (§8.8). |
 | **A′ — build flags (no code)** | `-C target-feature=+adx,+bmi2` is worth −10% to −12% on `mul_clamped`. Deployment finding for consumers. |
 | **B — wasm32 `bits="64"`** | **Refused.** 2.31× slower than the current default. wasm has no 64×64→128 multiply, so `u128` products are emulated. `build.rs`'s `TODO(Wasm32)` closed with evidence; behaviour unchanged. |
 | **C — `square` via `pow2k(1)`** | **Changed.** `mul_clamped` −3.5% on a stock release build, −21.9% with fat LTO, −23.5% with fat LTO and `+adx,+bmi2`. Bit-for-bit identical output, no `unsafe`, no representation change, no API change, `serial::u32`/`fiat` untouched. |

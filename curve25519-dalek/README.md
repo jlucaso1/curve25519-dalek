@@ -285,6 +285,19 @@ cover Edwards and Ristretto variable-base and multiscalar multiplication, while
 backend. A binary with the vector backend compiled in that spends its time in
 `backend::serial` on an X25519 workload is behaving as expected.
 
+On **wasm32**, the equivalent free win is `simd128`, which is stable but not
+enabled by default:
+
+```sh
+RUSTFLAGS='-C target-feature=+simd128'
+```
+
+That is worth about 4.6% on `mul_clamped` and 15.7% on `mul_base_clamped`, and
+it makes the module smaller. Note that the field arithmetic itself does not
+vectorize — the entire gain is in the constant-time table lookups and
+conditional swaps, which is why key generation benefits most. `simd128` has
+shipped in Chrome 91, Firefox 89, Safari 16.4 and Node 16.
+
 `docs/perf-x25519-field-arithmetic.md` has the full measurements, the
 reproduction instructions, and the analysis behind these numbers, including
 wasm32.

@@ -33,6 +33,12 @@ major series.
   scalar bit; the ladder driver drops from 324 to 294 instructions per
   iteration, worth ~2.2% of X25519 on wasm32 and below the noise floor on
   x86_64.
+* Docs: the README now records the build settings that matter for X25519-heavy
+  workloads, which are worth more than any source change measured here: fat LTO
+  plus `-C target-feature=+adx,+bmi2` takes `mul_clamped` from 58.8 us to
+  40.8 us on x86_64, and `-C target-feature=+simd128` — stable but off by
+  default on `wasm32-unknown-unknown` — is worth 4.6% on `mul_clamped` and
+  15.7% on `mul_base_clamped`.
 * Docs: `docs/perf-x25519-field-arithmetic.md` records a measurement pass over
   the X25519 field arithmetic on x86_64 (ADX/BMI2) and wasm32, including why an
   ADX assembly path was not added and why wasm32 keeps the 32-bit backend. This
