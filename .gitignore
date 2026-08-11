@@ -1,8 +1,12 @@
 */target/*
 target
 # Stray build directories from `cargo --target-dir <name>`; plain `target`
-# does not match them, and 1778 of their files once reached a commit.
-target*/
+# does not match them, and 1778 of their files once reached a commit. Anchored
+# to the repository root, and the two conventional names for custom target
+# definitions are re-included, so this cannot silently swallow them.
+/target*/
+!/targets/
+!/target-specs/
 build*.txt
 *~
 \#*

@@ -309,11 +309,23 @@ step, and only fat LTO chooses to do it. The `+bmi2` half is what lets LLVM emit
 `mulx` instead of `mulq`; without it the baseline `x86-64` target has no BMI2
 and the field multiplication pays for it.
 
-Note that neither the AVX2 nor the AVX-512 backend accelerates X25519 — they
-cover Edwards and Ristretto variable-base and multiscalar multiplication, while
-`MontgomeryPoint` arithmetic and `EdwardsPoint::mul_base` are serial in every
-backend. A binary with the vector backend compiled in that spends its time in
-`backend::serial` on an X25519 workload is behaving as expected.
+The two halves of X25519 are served differently, and it is worth knowing which
+is which before reading a profile:
+
+* **Diffie-Hellman** (`x25519`, `MontgomeryPoint::mul_clamped`) is **serial in
+  every backend.** No branch of the `cfg_if!` in `src/field.rs` resolves
+  `FieldElement` to a vector type, so the Montgomery ladder cannot reach AVX2 or
+  AVX-512 by construction. A binary with the vector backend compiled in that
+  spends its DH time in `backend::serial` is behaving as expected.
+* **Key generation** (`EdwardsPoint::mul_base`, and so
+  `MontgomeryPoint::mul_base_clamped`) **does use AVX2**, when the `simd`
+  backend is compiled in and the CPU supports it — worth about **24%**. This
+  changed recently: the fixed-base ladder used to be serial in every backend
+  too. AVX-512 hosts keep the serial fixed-base ladder, so they see the AVX2
+  gain only if they fall back to the AVX2 backend.
+
+Dispatch is on a runtime CPU check, so a machine without AVX2 keeps the serial
+path either way; nothing here requires the `-C target-feature` flags above.
 
 On **wasm32**, the equivalent free win is `simd128`, which is stable but not
 enabled by default:
