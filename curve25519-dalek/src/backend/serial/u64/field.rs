@@ -140,12 +140,51 @@ impl<'a> Mul<&'a FieldElement51> for &FieldElement51 {
         let b3_19 = b[3] * 19;
         let b4_19 = b[4] * 19;
 
-        // Multiply to get 128-bit coefficients of output
-        let     c0: u128 = m(a[0], b[0]) + m(a[4], b1_19) + m(a[3], b2_19) + m(a[2], b3_19) + m(a[1], b4_19);
-        let mut c1: u128 = m(a[1], b[0]) + m(a[0],  b[1]) + m(a[4], b2_19) + m(a[3], b3_19) + m(a[2], b4_19);
-        let mut c2: u128 = m(a[2], b[0]) + m(a[1],  b[1]) + m(a[0],  b[2]) + m(a[4], b3_19) + m(a[3], b4_19);
-        let mut c3: u128 = m(a[3], b[0]) + m(a[2],  b[1]) + m(a[1],  b[2]) + m(a[0],  b[3]) + m(a[4], b4_19);
-        let mut c4: u128 = m(a[4], b[0]) + m(a[3],  b[1]) + m(a[2],  b[2]) + m(a[1],  b[3]) + m(a[0] , b[4]);
+        // Multiply to get 128-bit coefficients of output.
+        //
+        // Emitted by **operand scanning**: grouped by the `a` limb rather than
+        // by the output coefficient. These are the same 25 partial products
+        // summed into the same five accumulators — `u128` addition is
+        // associative and cannot overflow here, since each coefficient stays
+        // under 2^108.27 as the comment below derives — but the issue order
+        // decides how many of them have to be in flight at once.
+        //
+        // Grouping by output coefficient asks for all 25 products before any
+        // accumulator can retire. `mul` on x86-64 without BMI2 writes
+        // `rdx:rax`, so the register allocator runs out and spills: the shipped
+        // form was 234 instructions with 89 touching `%rsp`. Streaming one
+        // `a[i]` across five long-lived accumulators instead gives 212 and 45.
+        let mut c0: u128 = m(a[0], b[0]);
+        let mut c1: u128 = m(a[0], b[1]);
+        let mut c2: u128 = m(a[0], b[2]);
+        let mut c3: u128 = m(a[0], b[3]);
+        let mut c4: u128 = m(a[0], b[4]);
+
+        c0 += m(a[1], b4_19);
+        c1 += m(a[1], b[0]);
+        c2 += m(a[1], b[1]);
+        c3 += m(a[1], b[2]);
+        c4 += m(a[1], b[3]);
+
+        c0 += m(a[2], b3_19);
+        c1 += m(a[2], b4_19);
+        c2 += m(a[2], b[0]);
+        c3 += m(a[2], b[1]);
+        c4 += m(a[2], b[2]);
+
+        c0 += m(a[3], b2_19);
+        c1 += m(a[3], b3_19);
+        c2 += m(a[3], b4_19);
+        c3 += m(a[3], b[0]);
+        c4 += m(a[3], b[1]);
+
+        c0 += m(a[4], b1_19);
+        c1 += m(a[4], b2_19);
+        c2 += m(a[4], b3_19);
+        c3 += m(a[4], b4_19);
+        c4 += m(a[4], b[0]);
+
+        let c0 = c0;
 
         // How big are the c[i]? We have
         //
