@@ -144,7 +144,7 @@ same form on wasm32.
 | file | purpose |
 | --- | --- |
 | `benches/x25519_field.rs` | Criterion benches: `mul_clamped`, `mul_base_clamped`, and (behind `--cfg curve25519_dalek_bench_internals`) `mul`, `square`, `square2`, `add`, `sub`, `pow2k(k)` for k ∈ {1,2,4,10,50,100}, `invert`, and a synthetic "field mix of one `mul_clamped`" |
-| `benches/harness/` | standalone crate with one set of kernels compiled for **both** x86_64 and wasm32; `src/main.rs` is the native driver, `run.mjs` the Node driver |
+| `benches/harness/` | standalone crate with one set of kernels compiled for **both** x86_64 and wasm32; `src/main.rs` is the native driver, `run.mjs` the Node driver. Kernels: `fe_mul`, `fe_square`, `fe_pow2k50`, `fe_mul121666`, `fe_invert`, `edwards_mul_base` (and radix-32/64 variants), `edwards_to_montgomery`, `x25519_mul_clamped`, `x25519_mul_base_clamped` |
 | `src/bench_internals.rs` | `--cfg`-gated, `#[doc(hidden)]` hook exposing `FieldElement` and the op counts to the benches. `FieldElement` is `pub(crate)` and Criterion benches are separate crates, so without this the only way to time `mul`/`square` is through a whole scalar multiplication — the exact confound these benches exist to avoid. Absent from every ordinary build; the public API is unchanged. |
 
 Reproduce with:
@@ -503,7 +503,7 @@ The hypothesis was that because wasm32 has native `i64.mul`/`i64.add`, a `u64`
 is not emulated the way it would be on a real 32-bit ARM, so `bits="64"` might
 win.
 
-### 5.1 Method
+### 6.1 Method
 
 Criterion does not run on wasm32-unknown-unknown. Rather than introduce
 `wasm-pack` and a second set of kernels, the **same** harness crate is compiled
@@ -518,7 +518,7 @@ Rust source, which is the point.
 
 `node v22.22.2`, `--release` with `lto=true, codegen-units=1, panic=abort`.
 
-### 5.2 Results
+### 6.2 Results
 
 ns per operation, minimum of 15 repetitions:
 
@@ -533,7 +533,7 @@ ns per operation, minimum of 15 repetitions:
 Run-to-run spread was 2.0% on the `bits=32` `mul_clamped` row and 16.5% on the
 `bits=64` one; the 2.3× gap is two orders of magnitude larger than the noise.
 
-### 5.3 Verdict
+### 6.3 Verdict
 
 **Refused. `curve25519_dalek_bits="64"` is 2.31× slower than the default on
 wasm32**, and the current `build.rs` behaviour is correct.
@@ -558,7 +558,7 @@ behaviour change: the code path it documents is the one that was already taken.
 
 ## 7. The rest of the inventory
 
-### 6.1 `pow2k` versus repeated `square`
+### 7.1 `pow2k` versus repeated `square`
 
 Answered in §4. Summary: `pow2k` is used where it should be (only the inversion
 tail needs `k > 1`), its amortization is real on this target — after the change
@@ -571,7 +571,7 @@ Criterion's `pow2k(k)` ladder after the change (default flags, no forced LTO):
 `pow2k(50)` 739.45 (14.79/sq), `pow2k(100)` 1478 (14.78/sq) — i.e. the
 per-squaring cost flattens by about k = 10.
 
-### 6.2 Cost of the `fiat` backend
+### 7.2 Cost of the `fiat` backend
 
 The formally verified backend was measured as the cheap control on both targets.
 `mul_clamped`, ns, minimum of 15:
@@ -601,7 +601,7 @@ Two things worth recording for a consumer:
 dedicated routine (15.29 ns, competitive) but its `pow2k` is repeated squaring
 with no amortization (16.65 ns/sq, worse than this crate's 14.09).
 
-### 6.3 Could the vector backend cover the Montgomery ladder?
+### 7.3 Could the vector backend cover the Montgomery ladder?
 
 **Viable, but not worth it for a single X25519, and it is a new backend rather
 than an extension of the existing one.**
@@ -623,6 +623,80 @@ constant-time swap over packed lanes, its own test vectors, and a public API
 addition for the batched form — comparable in size to `docs/parallel-formulas.md`'s
 Edwards work, and it would not speed up the single-exchange case this work is
 about.
+
+---
+
+### 7.4 Where `mul_base_clamped` spends its time
+
+The other X25519 operation on a libsignal-style hot path is ephemeral key
+generation, which is `MontgomeryPoint::mul_base_clamped`. It splits cleanly in
+two, and the parts add up to the whole (min of 15, ns):
+
+| | x86_64 | wasm32 |
+| --- | ---: | ---: |
+| `EdwardsPoint::mul_base` (fixed-base, radix-16 table) | 15 012 | 44 080 |
+| `EdwardsPoint::to_montgomery` (the conversion) | 4 038 | 9 990 |
+| — of which `FieldElement::invert` | 3 766 (93%) | 9 280 (93%) |
+| sum of the parts | 19 050 | 54 070 |
+| measured `mul_base_clamped` | **18 789** | **52 811** |
+
+So ~80% is the fixed-base Edwards multiplication and ~21% is a single field
+inversion, `to_montgomery` being `(Z+Y) * (Z-Y).invert()`.
+
+The inversion is not doing anything wasteful: `invert` is Fermat, 254 squarings
+and 11 multiplications, and 254 x 14.10 + 11 x 25.36 = 3 860 ns predicts the
+measured 3 766 to within 2.5%. It is optimal *as an exponentiation*.
+
+### 7.5 Bigger basepoint tables are slower, on both targets
+
+`EdwardsPoint::mul_base` uses the 30 KB radix-16 table. The crate also exposes
+radix-32/64/128/256 tables as public API, documented as needing fewer additions
+(64 → 47 → 43), so a consumer chasing fixed-base throughput would reasonably try
+one. **On both targets that makes it slower**, monotonically:
+
+| table | size | additions | x86_64 | wasm32 |
+| --- | ---: | ---: | ---: | ---: |
+| radix-16 (what `mul_base` uses) | 30 KB | 64 | **15 153** | **44 080** |
+| radix-32 | 60 KB | 47 | 16 416 (+8.3%) | 60 554 (+37%) |
+| radix-64 | 120 KB | 43 | 19 800 (+30.7%) | 94 636 (+115%) |
+
+The addition count is the wrong thing to optimize, because the lookup has to be
+constant time: selecting one of the entries in a window is a linear scan over
+all of them. Going from radix-16 to radix-64 cuts additions by a third but
+takes the scan from 64 x 8 = 512 conditional selects to 43 x 32 = 1376, each
+over a three-field-element `AffineNielsPoint`. The scan wins the trade, and the
+120 KB working set does not help either.
+
+Recorded because this is a plausible-sounding "optimization" that a downstream
+consumer might reach for; the crate's default is already the right choice, and
+on wasm32 the wrong choice costs 2.1x.
+
+### 7.6 What is left, and why it was not attempted
+
+After §4 and §5, the serial field operations are essentially at the floor for
+this representation. `mul` is 25.36 ns for 25 partial products and `square` is
+15.03 ns for 15; the ratio 1.687 is within 1.2% of the 25/15 = 1.667 the product
+counts predict, so neither has meaningful slack left short of changing the limb
+layout.
+
+The one substantial remaining lever is the **field inversion**, which is 3 766 ns
+on x86_64 and 9 280 ns on wasm32 — 8% of a `mul_clamped` and 20% of a
+`mul_base_clamped`. Fermat's little theorem is optimal as an exponentiation, but
+it is not the only algorithm: a constant-time binary GCD in the style of
+Bernstein–Yang "safegcd" typically runs 2–4x faster than Fermat for a 255-bit
+field. At 2.5x that would be worth roughly −5% on `mul_clamped` and −12% on
+`mul_base_clamped`, or about −6% of the per-message X25519 cost.
+
+**Not attempted here.** safegcd is subtle, its constant-time property is a
+property of the divstep bound and the whole iteration count rather than of any
+line in isolation, and getting it wrong in a way tests do not catch is exactly
+the failure mode this kind of code cannot afford. It would need its own
+correctness argument, its own differential testing against Fermat across the
+full input range, and its own constant-time review — a change of a different
+character from the two in §4 and §5, both of which move existing arithmetic and
+are bit-for-bit verifiable against what they replace. Recorded as the top
+candidate for anyone who wants to take it on, with the numbers that say what it
+is worth.
 
 ---
 
@@ -715,3 +789,5 @@ about.
 | **D — ladder's multiply by 121666** | **Changed.** A specialized `mul121666` (fiat's verified `carry_scmul_121666` on the fiat backends) replaces a general multiplication whose operand had four zero limbs. Isolated 2.5x cheaper on x86_64, 3.8x on wasm32. `mul_clamped` −6.0% on a stock release build and −7.0% on wasm32; nothing under fat LTO, where the inliner already folded it. Complementary to C: between them every build profile improves. |
 | **Combined C + D** | x86_64 stock release **−9.3%**, fat LTO **−21.7%**, fat LTO + `+adx,+bmi2` **−24.2%**; wasm32 **−7.0%** (`serial::u32`) and **−8.5%** (`fiat_u32`). |
 | **Vector backend for Montgomery** | Viable but not worthwhile for single exchanges; the win would require a batched multi-exchange API. Not implemented. |
+| **Bigger basepoint tables** | **Measured and rejected.** radix-32 is 8% slower than the default radix-16 on x86_64 and 37% slower on wasm32; radix-64 is 31% and 115% slower. The constant-time window scan grows faster than the addition count falls. The crate's default is already right. |
+| **Faster field inversion (safegcd)** | **Not attempted.** The top remaining lever — the inversion is 8% of `mul_clamped` and 20% of `mul_base_clamped`, and a constant-time binary GCD would plausibly be 2–4x faster than Fermat. Deferred because its constant-time property is global to the iteration rather than local, unlike the two changes above, which are bit-for-bit verifiable against the code they replace. |

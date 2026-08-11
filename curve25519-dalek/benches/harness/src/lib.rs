@@ -13,7 +13,12 @@
 //! uniformly available across targets.
 
 use curve25519_dalek::constants;
+use curve25519_dalek::edwards::{
+    EdwardsBasepointTableRadix32, EdwardsBasepointTableRadix64, EdwardsPoint,
+};
 use curve25519_dalek::montgomery::MontgomeryPoint;
+use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::traits::BasepointTable;
 
 #[cfg(curve25519_dalek_bench_internals)]
 use curve25519_dalek::bench_internals::FieldElement;
@@ -26,6 +31,11 @@ pub const K_FE_POW2K50: u32 = 2;
 pub const K_MUL_CLAMPED: u32 = 3;
 pub const K_MUL_BASE_CLAMPED: u32 = 4;
 pub const K_FE_MUL121666: u32 = 5;
+pub const K_ED_MUL_BASE: u32 = 6;
+pub const K_TO_MONTGOMERY: u32 = 7;
+pub const K_FE_INVERT: u32 = 8;
+pub const K_ED_MUL_BASE_R64: u32 = 9;
+pub const K_ED_MUL_BASE_R32: u32 = 10;
 
 pub const KERNELS: &[(u32, &str, u32)] = &[
     // (selector, name, field operations per iteration)
@@ -33,6 +43,11 @@ pub const KERNELS: &[(u32, &str, u32)] = &[
     (K_FE_SQUARE, "fe_square", 1),
     (K_FE_POW2K50, "fe_pow2k50", 50),
     (K_FE_MUL121666, "fe_mul121666", 1),
+    (K_FE_INVERT, "fe_invert", 1),
+    (K_ED_MUL_BASE, "edwards_mul_base", 1),
+    (K_ED_MUL_BASE_R32, "edwards_mul_base_radix32", 1),
+    (K_ED_MUL_BASE_R64, "edwards_mul_base_radix64", 1),
+    (K_TO_MONTGOMERY, "edwards_to_montgomery", 1),
     (K_MUL_CLAMPED, "x25519_mul_clamped", 1),
     (K_MUL_BASE_CLAMPED, "x25519_mul_base_clamped", 1),
 ];
@@ -84,6 +99,58 @@ pub fn run_kernel(which: u32, iters: u32) -> u64 {
             }
             acc
         }
+        K_ED_MUL_BASE => {
+            // The fixed-base half of `mul_base_clamped`, without the
+            // Edwards-to-Montgomery conversion. The points are accumulated with
+            // Edwards addition rather than compressed, because `compress`
+            // performs a field inversion and would dominate what is being
+            // measured; one addition is a few field multiplications, under 2%
+            // here.
+            let mut s = Scalar::from_bytes_mod_order(seed_bytes(5));
+            let mut sum = EdwardsPoint::default();
+            for _ in 0..iters {
+                sum += EdwardsPoint::mul_base(&s);
+                s += Scalar::ONE;
+            }
+            sum.compress().to_bytes()[0] as u64
+        }
+        K_ED_MUL_BASE_R32 => {
+            let table = EdwardsBasepointTableRadix32::create(&EdwardsPoint::mul_base(&Scalar::ONE));
+            let mut s = Scalar::from_bytes_mod_order(seed_bytes(5));
+            let mut sum = EdwardsPoint::default();
+            for _ in 0..iters {
+                sum += table.mul_base(&s);
+                s += Scalar::ONE;
+            }
+            sum.compress().to_bytes()[0] as u64
+        }
+        K_ED_MUL_BASE_R64 => {
+            // Same as K_ED_MUL_BASE, but against a radix-64 table (120 KB, 43
+            // additions) instead of the 30 KB radix-16 table `mul_base` uses.
+            // The table is built once, outside the timed loop, the way a
+            // consumer holding one in a static would.
+            let table = EdwardsBasepointTableRadix64::create(&EdwardsPoint::mul_base(&Scalar::ONE));
+            let mut s = Scalar::from_bytes_mod_order(seed_bytes(5));
+            let mut sum = EdwardsPoint::default();
+            for _ in 0..iters {
+                sum += table.mul_base(&s);
+                s += Scalar::ONE;
+            }
+            sum.compress().to_bytes()[0] as u64
+        }
+        K_TO_MONTGOMERY => {
+            // The conversion half: one field inversion plus a multiplication.
+            // The point is perturbed by a cheap Edwards addition each iteration
+            // so the conversion cannot be hoisted out of the loop.
+            let mut p = EdwardsPoint::mul_base(&Scalar::from_bytes_mod_order(seed_bytes(6)));
+            let basepoint = EdwardsPoint::mul_base(&Scalar::ONE);
+            let mut acc = 0u64;
+            for _ in 0..iters {
+                acc = acc.wrapping_add(p.to_montgomery().to_bytes()[0] as u64);
+                p += basepoint;
+            }
+            acc
+        }
         _ => run_field_kernel(which, iters),
     }
 }
@@ -116,6 +183,11 @@ fn run_field_kernel(which: u32, iters: u32) -> u64 {
         K_FE_MUL121666 => {
             for _ in 0..iters {
                 x = x.mul121666();
+            }
+        }
+        K_FE_INVERT => {
+            for _ in 0..iters {
+                x = curve25519_dalek::bench_internals::invert(&x);
             }
         }
         _ => return 0,

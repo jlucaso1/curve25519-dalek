@@ -20,6 +20,11 @@ const KERNELS = [
   [1, "fe_square", 1],
   [2, "fe_pow2k50", 50],
   [5, "fe_mul121666", 1],
+  [8, "fe_invert", 1],
+  [6, "edwards_mul_base", 1],
+  [10, "edwards_mul_base_radix32", 1],
+  [9, "edwards_mul_base_radix64", 1],
+  [7, "edwards_to_montgomery", 1],
   [3, "x25519_mul_clamped", 1],
   [4, "x25519_mul_base_clamped", 1],
 ];
