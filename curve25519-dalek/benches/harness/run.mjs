@@ -13,22 +13,44 @@
 //   node run.mjs <module.wasm> [reps]
 
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
-const KERNELS = [
-  // [selector, name, field operations per iteration]
-  [0, "fe_mul", 1],
-  [1, "fe_square", 1],
-  [2, "fe_pow2k50", 50],
-  [5, "fe_mul121666", 1],
-  [8, "fe_invert", 1],
-  [6, "edwards_mul_base", 1],
-  [10, "edwards_mul_base_radix32", 1],
-  [9, "edwards_mul_base_radix64", 1],
-  [7, "edwards_to_montgomery", 1],
-  [11, "edwards_vartime_double_base", 1],
-  [3, "x25519_mul_clamped", 1],
-  [4, "x25519_mul_base_clamped", 1],
-];
+// The kernel list is *derived from* `src/lib.rs`, not copied from it.
+//
+// It used to be a hand-maintained array here, and it silently fell behind:
+// kernels 12-17 (`ed25519_verify`, the batch-inversion comparisons and
+// `edwards_table_create`) were added on the Rust side and never mirrored, so
+// every wasm run quietly measured twelve of eighteen kernels while the module
+// docs claim one set of kernels for both targets. Parsing the Rust table makes
+// that drift impossible rather than merely fixed once, and a parse that finds
+// nothing is a hard error — silently running a subset is the failure being
+// removed.
+async function loadKernels() {
+  const libPath = join(dirname(fileURLToPath(import.meta.url)), "src", "lib.rs");
+  const src = await readFile(libPath, "utf8");
+
+  const consts = new Map();
+  for (const m of src.matchAll(/pub const (K_[A-Z0-9_]+): u32 = (\d+);/g)) {
+    consts.set(m[1], Number(m[2]));
+  }
+
+  const table = src.match(
+    /pub const KERNELS: &\[\(u32, &str, u32\)\] = &\[([\s\S]*?)\n\];/,
+  );
+  if (!table) throw new Error(`could not find KERNELS in ${libPath}`);
+
+  const kernels = [];
+  for (const m of table[1].matchAll(/\(\s*(K_[A-Z0-9_]+),\s*"([^"]+)",\s*(\d+)\s*\)/g)) {
+    const which = consts.get(m[1]);
+    if (which === undefined) throw new Error(`unresolved selector ${m[1]}`);
+    kernels.push([which, m[2], Number(m[3])]);
+  }
+  if (kernels.length === 0) throw new Error(`parsed no kernels from ${libPath}`);
+  return kernels;
+}
+
+const KERNELS = await loadKernels();
 
 const TARGET_NS = 20_000_000n;
 

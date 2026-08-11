@@ -1022,6 +1022,13 @@ would have been worth elsewhere. Per element, minimum of 5 repetitions:
 | 8 | 3 534 ns/element | **578 ns/element** | **6.1×** |
 | 16 | 3 535 ns/element | **355 ns/element** | **9.9×** |
 
+The same comparison on wasm32 (32-bit limbs, serial backend) gives **5.6×** at
+n = 8 (9 138 → 1 634 ns/element) and **8.5×** at n = 16 (9 062 → 1 065). The
+ratio survives a target with no 64x64→128 multiply and no vector backend, which
+is what makes it a property of the algorithm rather than of one machine. These
+numbers only exist because the wasm driver&#39;s kernel list stopped being a
+hand-maintained copy — see §14.
+
 Montgomery's trick replaces \\(n\\) inversions with one inversion and
 \\(3(n-1)\\) multiplications, so the ratio grows with \\(n\\) and is bounded by
 the ratio of an inversion to three multiplications. These kernels ship even
