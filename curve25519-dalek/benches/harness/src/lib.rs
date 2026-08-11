@@ -12,6 +12,7 @@
 //! `mul_clamped` sees. It also removes the need for `black_box`, which is not
 //! uniformly available across targets.
 
+use core::hint::black_box;
 use curve25519_dalek::constants;
 use std::sync::OnceLock;
 
@@ -199,6 +200,18 @@ pub fn run_kernel(which: u32, iters: u32) -> u64 {
             for _ in 0..iters {
                 let p = EdwardsPoint::mul_base(&s);
                 let table = curve25519_dalek::edwards::EdwardsBasepointTable::create(&p);
+                // `basepoint()` reads only the first of the 32 sub-tables, so
+                // without a barrier the optimizer would be entitled to discard
+                // the construction of the other 31 — most of what this kernel
+                // exists to measure. (It demonstrably does not: the marginal
+                // cost per `create` is ~33 field inversions, which is the 32
+                // sub-tables plus `compress`. The barrier makes that a
+                // guarantee rather than an observation.)
+                // A *reference* barrier: it forces the whole table to be
+                // materialised without copying its 30 KiB, which a by-value
+                // `black_box` would do — and that copy costs one instruction per
+                // byte under callgrind, inflating this kernel by 1%.
+                let table = black_box(&table);
                 acc = acc.wrapping_add(table.basepoint().compress().to_bytes()[0] as u64);
                 s += Scalar::ONE;
             }
@@ -220,9 +233,19 @@ pub fn run_kernel(which: u32, iters: u32) -> u64 {
             let message = seed_bytes(10);
             let signature: Signature = signing.sign(&message);
 
+            // The verification is loop-invariant, so under this crate's fat LTO
+            // the optimizer would be entitled to perform it once and turn the
+            // loop into repeated additions. (It demonstrably does not: the
+            // marginal cost of an iteration is ~316k instructions, the right
+            // order for a verification, and it moved when the AVX2 backend
+            // changed. The barriers make that a guarantee rather than an
+            // observation.)
             let mut acc = 0u64;
             for _ in 0..iters {
-                acc = acc.wrapping_add(verifying.verify(&message, &signature).is_ok() as u64);
+                let ok = black_box(&verifying)
+                    .verify(black_box(&message), black_box(&signature))
+                    .is_ok();
+                acc = acc.wrapping_add(black_box(ok) as u64);
             }
             // Fail loudly rather than silently timing a rejected signature.
             assert_eq!(acc, iters as u64, "verification failed");
