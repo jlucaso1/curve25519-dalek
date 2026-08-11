@@ -52,6 +52,13 @@ enum BackendKind {
 }
 
 #[inline]
+// `cpufeatures::new!` expands to `u8::max_value()`, which rustc 1.99-nightly
+// deprecates in favour of `u8::MAX`. The deprecation is attributed to this call
+// site, so with the CI's `-D warnings` it fails the build even though nothing
+// here is ours to change: `cpufeatures = "0.3"` resolves to 0.3.0, which is the
+// newest release, so there is no version to bump to. Remove this once
+// `cpufeatures` ships a fix.
+#[allow(deprecated)]
 fn get_selected_backend() -> BackendKind {
     #[cfg(curve25519_dalek_backend = "avx512")]
     {

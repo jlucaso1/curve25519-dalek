@@ -39,7 +39,7 @@ if (!path) {
 }
 
 // Mirror the native driver's parsing (src/main.rs): a u32, falling back to 15
-// on anything unparseable, and never fewer than 3 repetitions. Without the
+// on anything unparsable, and never fewer than 3 repetitions. Without the
 // floor, `reps < 1` would leave `samples` empty and the reporting below would
 // read `undefined`.
 const repsArg = process.argv[3] ?? "15";
