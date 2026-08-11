@@ -977,7 +977,53 @@ set does not expose. `simd128` shipped in Chrome 91, Firefox 89, Safari 16.4 and
 Node 16, so for most deployments it is free; a consumer targeting older engines
 should check their floor first.
 
-### 8.9 What is left, and why it was not attempted
+### 8.9 x86_64: `+avx2` vectorizes the same scan, and is complementary to `+bmi2`
+
+The wasm32 result in §8.8 raises the obvious question for the other target: the
+constant-time window scan is 19.8% of key generation there too, so does x86_64
+already vectorize it?
+
+Not on the baseline ISA. `callgrind` on `mul_base_clamped`, 20 calls:
+
+| | `AffineNielsPoint::conditional_assign` | program total |
+| --- | ---: | ---: |
+| baseline `x86-64` | 679 680 (15.0%) | 4 520 254 |
+| `-C target-feature=+avx2` | **322 560 (8.1%)** | **3 996 414 (−11.6%)** |
+
+AVX2 halves the scan. Baseline `x86-64` already has SSE2 and its two `u64`
+lanes, but LLVM does not vectorize there and does at four lanes.
+
+In time, best of three alternating runs, fat LTO, minimum of 15 repetitions:
+
+| flags | `mul_clamped` | `mul_base_clamped` |
+| --- | ---: | ---: |
+| baseline `x86-64` | 43 595 | 16 729 |
+| `+avx2` | 43 942 (none) | **15 996 (−4.4%)** |
+| `+avx2,+adx,+bmi2` | **39 594 (−9.2%)** | **15 729 (−6.0%)** |
+
+**The two flags help different operations, and neither substitutes for the
+other.** `+bmi2` is what gets `mulx` into the field multiplication, so it moves
+the ladder; `+avx2` is what vectorizes the constant-time lookup, so it moves key
+generation. `+avx2` alone does nothing for `mul_clamped` — the ladder's swap is
+two field elements, too little to vectorize profitably — and `+bmi2` alone does
+comparatively little for key generation, which is scan-bound.
+
+Note that the −11.6% instruction reduction becomes −4.4% in time. That is the
+expected direction: the scan streams 30 KB of table and is not purely
+instruction-bound. It is also another instance of the §8.7 caution against
+reading instruction counts as time.
+
+One caveat that is a deployment decision rather than a measurement: `+avx2`
+raises the binary's CPU floor to Haswell (2013). This is unlike the crate's own
+vector backend, which detects AVX2 at runtime and falls back. A consumer who
+cannot raise the floor keeps the runtime-detected backend for Edwards work and
+simply does not get this.
+
+**Reproduction note:** `-C target-cpu=native` on this host emits AVX-512 that
+valgrind 3.22 rejects with SIGILL, so the instruction counts above use explicit
+`+avx2` rather than `native`. The timing runs are unaffected.
+
+### 8.10 What is left, and why it was not attempted
 
 
 
@@ -1136,7 +1182,7 @@ the trade can be re-made by someone who wants it.
 | --- | --- |
 | **A — ADX/BMI2 asm on x86_64** | **Refused.** LLVM emits all 25/25 and 15/15 available `mulx` under `+bmi2`; `adcx`/`adox` have no second carry chain to run in a 5×51 two-word accumulator, and their payoff belongs to a 4×64 saturated layout that is out of scope. Calibration: an intervention giving isolated `mul` −30% moved `mul_clamped` by 0.5%. |
 | **wasm32 `+simd128` (no code)** | `-C target-feature=+simd128` is worth **−4.6%** on `mul_clamped` and **−15.7%** on `mul_base_clamped`, and shrinks the module. Not on by default for `wasm32-unknown-unknown`. The field arithmetic does not vectorize; the whole gain is in the constant-time selection code (§8.8). |
-| **A′ — build flags (no code)** | `-C target-feature=+adx,+bmi2` is worth −10% to −12% on `mul_clamped`. Deployment finding for consumers. |
+| **A′ — build flags (no code)** | `+adx,+bmi2` moves the ladder (`mulx`), `+avx2` moves key generation (it halves the constant-time scan); together **−9.2%** on `mul_clamped` and **−6.0%** on `mul_base_clamped`, and with fat LTO ~−31% against stock `main`. Deployment findings for consumers (§8.9). |
 | **B — wasm32 `bits="64"`** | **Refused.** 2.31× slower than the current default. wasm has no 64×64→128 multiply, so `u128` products are emulated. `build.rs`'s `TODO(Wasm32)` closed with evidence; behaviour unchanged. |
 | **C — `square` via `pow2k(1)`** | **Changed.** `mul_clamped` −3.5% on a stock release build, −21.9% with fat LTO, −23.5% with fat LTO and `+adx,+bmi2`. Bit-for-bit identical output, no `unsafe`, no representation change, no API change, `serial::u32`/`fiat` untouched. |
 | **D — ladder's multiply by 121666** | **Changed.** A specialized `mul121666` (fiat's verified `carry_scmul_121666` on the fiat backends) replaces a general multiplication whose operand had four zero limbs. Isolated 2.5x cheaper on x86_64, 3.8x on wasm32. `mul_clamped` −6.0% on a stock release build and −7.0% on wasm32; nothing under fat LTO, where the inliner already folded it. Complementary to C: between them every build profile improves. |

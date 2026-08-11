@@ -268,16 +268,25 @@ lto = "fat"
 ```
 
 ```sh
-# and, on x86_64, let the compiler use BMI2
-RUSTFLAGS='-C target-feature=+adx,+bmi2'   # or -C target-cpu=native
+# and, on x86_64:
+RUSTFLAGS='-C target-feature=+avx2,+adx,+bmi2'   # or -C target-cpu=native
 ```
+
+The two halves of that flag do different jobs: `+adx,+bmi2` lets LLVM emit
+`mulx` in the field multiplication, which is what moves the Montgomery ladder,
+while `+avx2` vectorizes the constant-time table lookup, which is what moves
+key generation — it halves the instruction count of that lookup. Neither
+substitutes for the other. Note that `+avx2` raises the binary's CPU floor to
+Haswell; the crate's own vector backend detects AVX2 at runtime instead and
+needs no such promise.
 
 Measured on an Intel Cascade Lake, `MontgomeryPoint::mul_clamped` goes from
 58.8 µs on a stock `cargo build --release` to 40.8 µs with both — **about a
-third faster**. LTO is the larger half: the Montgomery ladder's squaring is
-worth inlining into the ladder step, and only fat LTO chooses to do it. The
-`+bmi2` half is what lets LLVM emit `mulx` instead of `mulq`; without it the
-baseline `x86-64` target has no BMI2 and the field multiplication pays for it.
+third faster** — and `mul_base_clamped` gains a further 6% on top. LTO is the
+larger half: the Montgomery ladder's squaring is worth inlining into the ladder
+step, and only fat LTO chooses to do it. The `+bmi2` half is what lets LLVM emit
+`mulx` instead of `mulq`; without it the baseline `x86-64` target has no BMI2
+and the field multiplication pays for it.
 
 Note that neither the AVX2 nor the AVX-512 backend accelerates X25519 — they
 cover Edwards and Ristretto variable-base and multiscalar multiplication, while
