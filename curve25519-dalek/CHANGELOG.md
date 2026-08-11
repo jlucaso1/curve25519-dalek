@@ -26,7 +26,7 @@ major series.
   module is byte-identical since `serial::u64` is not compiled there.
 * Perf: the Montgomery ladder's four subtractions no longer pay for a reduction.
   The general `Sub` must accept any input at the crate-wide bit excess, so it
-  offsets by `16p` and has to reduce afterwards; the ladder's subtractions all
+  offsets by `16p` and has to reduce afterward; the ladder's subtractions all
   take `mul`/`square` outputs, which are narrow enough that an offset of `2p`
   leaves the result already in range. `serial::u64` gains a `sub_unreduced` with
   its own documented, stricter precondition — `Sub`'s contract is unchanged, and

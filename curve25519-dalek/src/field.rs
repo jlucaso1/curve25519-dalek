@@ -245,7 +245,11 @@ impl FieldElement {
         // Genelle, Prouff and Quisquater
         // Section 3.2
 
-        debug_assert_eq!(inputs.len(), scratch.len());
+        // Not `debug_assert_eq!`: the doc comment promises a panic, and in
+        // release the `zip`s below would silently process only the shorter
+        // slice and leave the remaining inputs un-inverted. One length compare
+        // against an n-element batch is not a cost worth that.
+        assert_eq!(inputs.len(), scratch.len());
 
         // Keep an accumulator of all of the previous products
         let mut acc = FieldElement::ONE;

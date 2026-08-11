@@ -805,7 +805,8 @@ different in kind:
 - `sub_unreduced_agrees_with_sub` builds operands the way the ladder does — by
   actually multiplying and squaring random elements rather than assuming what
   those outputs look like — and asserts both that `to_bytes()` matches the
-  general subtraction and that every limb stays under `2^54`. 1024 pairs, plus
+  general subtraction and that every limb stays under `2^53`, the documented
+  postcondition rather than the looser `2^54` the module allows. 1024 pairs, plus
   the worst case the precondition permits and the degenerate inputs.
 - The `debug_assert!`s on the precondition were exercised by the entire test
   suite in a debug build, which includes the ladder. A violation anywhere would
@@ -1596,9 +1597,10 @@ Not implemented; the working tree was reverted to the serial chain.
 
 
 
-After §4, §5 and §6, both hot loops are at their published operation counts and
+After §4 through §8, both hot loops are at their published operation counts and
 the field operations are at the floor for this representation. Three separate
-checks say so:
+checks say so (the isolated `mul`/`square` timings quoted below predate §7, so
+the *ratio* is the claim here, not the absolute figures):
 
 * **The field operations themselves.** `mul` is 25.36 ns for 25 partial products
   and `square` is 15.03 ns for 15; the ratio 1.687 is within 1.2% of the
@@ -1652,18 +1654,19 @@ measured and left alone rather than merely skipped:
   reinstate the identity when the window digit is zero, and it is shared
   constant-time code on every scalar multiplication in the crate, not just the
   X25519 path. Poor trade.
-* **An unreduced subtraction.** `sub` adds 16p before subtracting and therefore
-  has to run a full carry chain, roughly 35 instructions against `add`'s 10, and
-  the ladder does four per step. Inputs there are always freshly reduced, so
-  adding 2p would suffice and the reduction could be dropped — worth about 3% of
-  `mul_clamped`'s instructions, which matters on wasm32 where instructions track
-  time. Left alone because it would mean a second subtraction with a different,
-  narrower documented precondition on the bit excess, and the bit-excess
-  contract is a correctness invariant of this backend rather than a detail. Not
-  worth 3% on one target.
+* **An unreduced subtraction.** ~~Left alone~~ — **this was subsequently done,
+  in §8.** The estimate here was that dropping the reduction was worth about 3%
+  of `mul_clamped`'s instructions; it measured **−6.58%**, and −6.1% of the time
+  on a baseline `x86-64` build. The reason for leaving it alone was that it
+  needs a narrower bit-excess precondition, and that contract is a correctness
+  invariant rather than a detail. That objection was answered by *adding* an
+  operation with its own stated precondition instead of narrowing `Sub`'s, which
+  leaves the existing contract untouched. The entry is kept rather than deleted
+  because the reasoning that deferred it, and what changed to unblock it, is the
+  useful part.
 
-Neither is refused on principle; both are recorded with what they are worth so
-the trade can be re-made by someone who wants it.
+Neither was refused on principle; both were recorded with what they were worth
+so the trade could be re-made — and one of them since has been.
 
 ---
 
@@ -1721,8 +1724,12 @@ the trade can be re-made by someone who wants it.
   * `sub_unreduced_agrees_with_sub` — 1024 operand pairs *built the way the
     ladder builds them*, by multiplying and squaring random elements rather than
     assuming what those outputs look like, asserting both `to_bytes()` equality
-    with the general subtraction and that every limb stays under `2^54`. Plus
-    the worst case the precondition permits and the degenerate inputs.
+    with the general subtraction and that every limb stays under `2^53` — the
+    documented postcondition, not the looser `2^54` that `b < 3` would accept.
+    Plus the worst case the precondition permits, the degenerate inputs, and the
+    ladder's *first* iteration, whose operands are the identity `(1, 0)` and
+    `(from_bytes(u), 1)` rather than products — the one case the "both operands
+    are `mul`/`square` outputs" phrasing does not literally cover.
   * The precondition's `debug_assert!`s were exercised by the entire suite in a
     debug build, ladder included; a violation anywhere would have panicked.
 

@@ -188,10 +188,12 @@ pub fn run_kernel(which: u32, iters: u32) -> u64 {
         }
         K_ED_TABLE_CREATE => {
             // `EdwardsBasepointTable::create`: 32 `LookupTable<AffineNielsPoint>`,
-            // each converting 8 points to affine, i.e. 256 field inversions. This
-            // is the only place in the crate where many independent inversions
-            // are produced by a single call, so it is the only candidate for
-            // Montgomery's trick.
+            // each converting 8 points to affine. It was the only place in the
+            // crate where many independent inversions came from a single call —
+            // 256 of them — and so the only candidate for Montgomery's trick.
+            // It now performs 32 eight-element batch inversions instead; this
+            // kernel is what measured the 4.19x that change is worth, and what
+            // would catch it regressing.
             let mut s = Scalar::from_bytes_mod_order(seed_bytes(11));
             let mut acc = 0u64;
             for _ in 0..iters {
@@ -282,11 +284,12 @@ fn run_field_kernel(which: u32, iters: u32) -> u64 {
         // against one `invert_batch` over the same `n`: Montgomery's trick
         // replaces n inversions with 1 inversion and 3(n-1) multiplications.
         //
-        // n = 8 is the size of a `NafLookupTable5`, the only place in this crate
-        // where several independent inversions sit next to each other; n = 16 is
-        // the count the group profile attributes to `as_affine`. Both are priced
-        // even though neither turned out to be batchable, because the number is
-        // what makes the refusal checkable.
+        // n = 8 is the size of a lookup table, the one place in this crate where
+        // several independent inversions sit next to each other — that batch is
+        // now taken, and this pair is what prices it. n = 16 is the count the
+        // group profile attributes to `as_affine`; that one is *not* batchable,
+        // and pricing it is what makes the refusal checkable rather than
+        // asserted.
         //
         // The chain between iterations is preserved by folding limb 0 of the
         // first output back into every input, so the batch cannot be hoisted.

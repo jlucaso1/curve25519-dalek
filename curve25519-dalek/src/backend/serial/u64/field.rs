@@ -472,15 +472,6 @@ impl FieldElement51 {
         FieldElement51(square_limbs(self.0))
     }
 
-    /// Multiply this field element by \\((A+2)/4 = 121666\\), the constant the
-    /// Montgomery ladder needs once per step.
-    ///
-    /// `&x * &constants::APLUS2_OVER_FOUR` gives the same answer, but that
-    /// constant is `[121666, 0, 0, 0, 0]`, so twenty of the twenty-five partial
-    /// products in the general multiplication are multiplications by zero, and
-    /// the four `b[i] * 19` precomputations are `0 * 19`. The compiler cannot
-    /// fold them away because `mul` is not inlined into the ladder.
-    ///
     /// Compute `self - rhs` for operands narrow enough not to need a reduction.
     ///
     /// The general [`Sub`] must accept any input satisfying the crate-wide bit
@@ -497,7 +488,10 @@ impl FieldElement51 {
     ///
     /// Every limb of **both** operands must be `< 2^52 - 38`, which is the
     /// smallest limb of `2p`. `mul`/`square` outputs satisfy this with eleven
-    /// bits to spare. The `debug_assert!`s below enforce it in debug builds.
+    /// bits to spare, and so do the ladder's *initial* values, which are not
+    /// products: `ProjectivePoint::identity()` is `(1, 0)` and the other point
+    /// is `(from_bytes(u), 1)`, all limbs `< 2^51`. The `debug_assert!`s below
+    /// enforce it in debug builds, so the whole test suite checks it.
     ///
     /// # Postcondition
     ///
@@ -534,6 +528,15 @@ impl FieldElement51 {
         ])
     }
 
+    /// Multiply this field element by \\((A+2)/4 = 121666\\), the constant the
+    /// Montgomery ladder needs once per step.
+    ///
+    /// `&x * &constants::APLUS2_OVER_FOUR` gives the same answer, but that
+    /// constant is `[121666, 0, 0, 0, 0]`, so twenty of the twenty-five partial
+    /// products in the general multiplication are multiplications by zero, and
+    /// the four `b[i] * 19` precomputations are `0 * 19`. The compiler cannot
+    /// fold them away because `mul` is not inlined into the ladder.
+    ///
     /// Only the five surviving products are computed here. The carry chain is
     /// the same one `mul` uses, so the result is bit-for-bit identical to the
     /// general multiplication; `mul121666_matches_general_mul` checks that.
@@ -1006,9 +1009,9 @@ mod test {
             // Same field element as the general subtraction.
             assert_eq!(fast.to_bytes(), (&x - &y).to_bytes());
 
-            // Inside the documented bit excess `b < 3`, so the result may be
-            // fed to `mul`, `square` or `mul121666`.
-            assert!(fast.0.iter().all(|&l| l < (1u64 << 54)));
+            // The documented postcondition is the tighter `< 2^53`, which is
+            // what is asserted; `b < 3` only requires `< 2^54`.
+            assert!(fast.0.iter().all(|&l| l < (1u64 << 53)));
         }
 
         // The worst case the precondition permits: both operands one below the
@@ -1018,7 +1021,19 @@ mod test {
         let lo = FieldElement51([0; 5]);
         assert_eq!(hi.sub_unreduced(&lo).to_bytes(), (&hi - &lo).to_bytes());
         assert_eq!(lo.sub_unreduced(&hi).to_bytes(), (&lo - &hi).to_bytes());
-        assert!(hi.sub_unreduced(&lo).0.iter().all(|&l| l < (1u64 << 54)));
+        assert!(hi.sub_unreduced(&lo).0.iter().all(|&l| l < (1u64 << 53)));
+
+        // The ladder's *first* iteration, whose operands are not products:
+        // `x0` is the identity `(1, 0)` and `x1` is `(from_bytes(u), 1)`. This
+        // is the one case the "both operands are mul/square outputs" phrasing
+        // does not literally cover, so it is checked on its own.
+        let one = FieldElement51::ONE;
+        let zero = FieldElement51::ZERO;
+        let u = FieldElement51::from_bytes(&[0xff; 32]);
+        for (a, b) in [(one, zero), (u, one), (zero, one), (one, u)] {
+            assert_eq!(a.sub_unreduced(&b).to_bytes(), (&a - &b).to_bytes());
+            assert!(a.sub_unreduced(&b).0.iter().all(|&l| l < (1u64 << 53)));
+        }
 
         // Degenerate cases, including x - x == 0.
         for limbs in [[0u64; 5], [1, 0, 0, 0, 0], [0, 0, 0, 0, 1]] {
