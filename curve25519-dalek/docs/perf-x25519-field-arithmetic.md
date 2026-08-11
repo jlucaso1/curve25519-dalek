@@ -957,7 +957,7 @@ needed, with all the conversions done together at the end.
 
 That makes `EdwardsBasepointTable::create` the one place where Montgomery's
 trick applies, and it is not a marginal one: it builds 32 tables of 8, so
-**256 field inversions**, and at 3 527 ns each that is 903 µs of the 990 µs it
+**256 field inversions**, and at 3 685 ns each that is 943 µs of the 1 034 µs it
 takes — **91% of building a table is field inversion.** The existing source
 comment, `XXX batch inversion would be good if perf mattered here`, is now
 answered with a number.
@@ -968,13 +968,13 @@ available without `alloc`; `FieldElement::internal_invert_batch` became
 `pub(crate)` for that, which is a visibility change and not an API change.
 
 **Results.** Paired alternating runs of two binaries from the same tree with only
-`window.rs` differing, minimum of 7 repetitions:
+`window.rs` differing — seven alternating rounds, minimum of 15 repetitions each:
 
 | | sequential | batched | change | paired wins |
 | --- | ---: | ---: | ---: | :---: |
-| `EdwardsBasepointTable::create` | 990 203 ns | **236 475 ns** | **−76.1% (4.19×)** | 3/3 |
-| instructions per `create` (callgrind, exact) | 9 885 001 | **2 942 694** | **−70.2%** | — |
-| `x25519_mul_base_clamped` | 13 813 | 13 776 | unchanged | — |
+| `EdwardsBasepointTable::create` | 1 033 829 ns | **260 676 ns** | **−74.8% (3.97×)** | 7/7 |
+| instructions per `create` (callgrind, exact) | 9 616 631 | **2 678 042** | **−72.1%** | — |
+| `x25519_mul_base_clamped` | 15 555 | 15 755 | unchanged | — |
 | ~~`ed25519_verify`~~ | ~~38 919~~ | ~~37 936~~ | **withdrawn, see §9.7** | — |
 
 The unchanged `mul_base_clamped` row is the point of including it: the crate
@@ -988,6 +988,28 @@ this change did — it was not evidence. The claim it was offered for is better
 made without it, and was always available: verification never calls
 `BasepointTable::create`, which is a fact about the call graph rather than a
 measurement, so batching that constructor cannot move it in either direction.
+
+> **Correction.** The figures above were re-measured. The `edwards_table_create`
+> kernel called `EdwardsPoint::mul_base` and `compress` *inside* the timed loop,
+> so every repetition charged `create` with a fixed-base scalar multiplication
+> and an inversion that `create` does not perform. The kernel now builds its
+> input point once outside the loop — `black_box` on that input is what keeps
+> `create` from being hoisted as loop-invariant — and compresses once at the
+> end, outside the timing boundary.
+>
+> The overhead was **constant**, so it entered numerator and denominator alike
+> and pulled the ratio *toward 1*: the published 4.19× was an **under**statement,
+> not an overstatement. Measured on this tree, removing it takes 15.8 µs off
+> each arm and moves the ratio from 3.80× to 3.97×. The callgrind counts settle
+> this independently, being deterministic and host-independent: they fall by
+> 268 370 and 264 652 instructions, the same constant to within 1.4%, which is
+> the `mul_base` and `compress` the kernel was charging to `create`.
+>
+> The published timings also came from a different host and an older tree, so
+> only the same-tree pairing above should be read as the effect of the change.
+> The direction, the conclusion, and the 91% inversion share are unaffected —
+> the last one is now better supported, at 91.2% against the corrected
+> denominator. Thanks to Codex for catching it.
 
 **Correctness.** Montgomery's trick returns a different *representative* of each
 inverse than `invert` does — both are weakly reduced, and weak reduction is not
@@ -1618,13 +1640,13 @@ measured 3 766 to within 2.5%. It is optimal *as an exponentiation*.
 
 `EdwardsPoint::mul_base` uses the 30 KB radix-16 table. The crate also exposes
 radix-32/64/128/256 tables as public API, documented as needing fewer additions
-(64 → 47 → 43), so a consumer chasing fixed-base throughput would reasonably try
+(64 → 52 → 43), so a consumer chasing fixed-base throughput would reasonably try
 one. Best of three runs, minimum of 15 repetitions each, ns:
 
 | table | size | additions | x86_64 | wasm32 |
 | --- | ---: | ---: | ---: | ---: |
 | radix-16 (what `mul_base` uses) | 30 KB | 64 | **15 229** | **45 039** |
-| radix-32 | 60 KB | 47 | 15 369 (+0.9%) | 45 655 (+1.4%) |
+| radix-32 | 60 KB | 52 | 15 369 (+0.9%) | 45 655 (+1.4%) |
 | radix-64 | 120 KB | 43 | 17 302 (+13.6%) | 54 066 (+20.0%) |
 
 Doubling the table to radix-32 is a wash — the difference is inside this host's
@@ -2235,7 +2257,7 @@ the step, which is what makes §4 and §7 pay.
 | **E — ladder's conditional swap** | **Changed.** `ProjectivePoint` inherited `subtle`'s default `conditional_swap` — a struct copy plus two conditional assignments — instead of forwarding to the masked exchange every field backend already implements. The ladder driver drops from 324 to 294 instructions per iteration. wasm32 **−2.2%** across five paired runs; on x86_64 the 0.6% difference is below a 2.5% noise floor measured from identical binaries. |
 | **F — squaring's 128-bit doublings** | **Changed.** `square_limbs` doubled five 128-bit coefficients; `2*(x*y) == (2*x)*y`, so four precomputed 64-bit doublings cover all ten mirror-pair products instead — which is what `serial::u32` has always done. Isolated `fe_square` **−5.4%** (7/7 paired runs) and **−10.5%** with `+bmi2`; `mul_clamped` **−2.2%** with `+bmi2`, −0.7% stock; `fe_invert` −5.8%. The time win is several times the −1.29% instruction win because the 128-bit shift was on the dependency chain (§7). Bit-for-bit identical; wasm32 module byte-identical. |
 | **G — the ladder's subtractions** | **Changed.** `Sub` adds `16p` and must then `reduce`, because it has to accept anything at the crate-wide `b < 3`. The ladder's four subtractions all take `mul`/`square` outputs, which are far narrower, so a separate `sub_unreduced` offsets by `2p` and needs no reduction — a new operation with its own stated precondition, not a change to `Sub`'s contract. `mul_clamped` **−6.1%** on baseline `x86-64` and **−3.7%** with `+avx2,+bmi2`, 3/3 paired runs each, −6.58% instructions; `mul_base_clamped` unchanged. Not limb-for-limb identical — a different representative — so it is checked on field equality, the limb bound, debug-assertions across the whole suite, and the 1000-iteration RFC 7748 ladder vector. `serial::u32` forwards to `Sub`: the same bound closes there with only 0.167 bits of margin against a silent `u32` overflow (§8.4). |
-| **H — batching the affine table conversions** | **Changed.** `LookupTable<AffineNielsPoint>::from` converted eight multiples one at a time, one field inversion each, so `EdwardsBasepointTable::create` did **256** — 91% of its cost. The chain depends on the previous multiple's *value*, not its affine form, so it runs in extended coordinates and converts all eight at the end with Montgomery's trick. `create` **−76.1% (4.19×)**, 3/3 paired runs, −70.2% instructions. Both hot paths unchanged: the crate ships its table as a constant. Not limb-for-limb identical — the batch returns a different weakly-reduced representative — so it is checked on canonical bytes against a verbatim copy of the old code, on the identity, and against the precomputed table (§9.3). |
+| **H — batching the affine table conversions** | **Changed.** `LookupTable<AffineNielsPoint>::from` converted eight multiples one at a time, one field inversion each, so `EdwardsBasepointTable::create` did **256** — 91% of its cost. The chain depends on the previous multiple's *value*, not its affine form, so it runs in extended coordinates and converts all eight at the end with Montgomery's trick. `create` **−74.8% (3.97×)**, 7/7 paired runs, −72.1% instructions. Both hot paths unchanged: the crate ships its table as a constant. Not limb-for-limb identical — the batch returns a different weakly-reduced representative — so it is checked on canonical bytes against a verbatim copy of the old code, on the identity, and against the precomputed table (§9.3). |
 | **The verify kernel measured the wrong crate** | **Found and fixed (§9.7).** `ed25519-dalek` depends on `curve25519-dalek` by version, and the harness patched only `curve25519-dalek-derive`, so the binary linked two copies and `ed25519_verify` profiled the published 5.0.0 rather than this tree. It was blind to every change here — reporting "unchanged" for a regression as readily as for a win. Corrected: **354 575 → 330 457 Ir**, AVX2 87.8% → **87.4%**, the inversion 10.0% → **10.2%**. No conclusion in §9 changes, because they rest on the call graph rather than on these totals. The first attempt at the correction was itself contaminated by an uncommitted experiment and had to be re-taken in a pristine worktree; §9.7 records that too. |
 | **Batching verification's inversions** | **Refused: there is nothing to batch.** An Ed25519 verification performs **exactly one** field inversion, in `compress`; the vector table build and the wNAF loop perform none, and the vector backend contains no runtime `invert` at all. The profile's sixteen `as_affine` cannot be in verification, and cannot be sixteen X25519 operations either — that would be four times the whole message's cycle budget (§9.2). |
 | **safegcd, second look** | **Refused again.** Worth more here than in §13.11 — 10.0% of a verification, ~4% of the group client — but a 2–4× inversion caps the win at 2–3% of the client, while the crate's *existing* batch inversion is worth 6–10× wherever inversions co-occur. It also cannot be the variable-time kind, because `compress` is shared with secret-derived callers (§9.5). |

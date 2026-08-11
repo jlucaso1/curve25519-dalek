@@ -193,29 +193,35 @@ pub fn run_kernel(which: u32, iters: u32) -> u64 {
             // crate where many independent inversions came from a single call —
             // 256 of them — and so the only candidate for Montgomery's trick.
             // It now performs 32 eight-element batch inversions instead; this
-            // kernel is what measured the 4.19x that change is worth, and what
+            // kernel is what measured the 3.97x that change is worth, and what
             // would catch it regressing.
-            let mut s = Scalar::from_bytes_mod_order(seed_bytes(11));
-            let mut acc = 0u64;
+            // The input point is built once. An earlier version of this kernel
+            // called `mul_base` and `compress` *inside* the loop, which put a
+            // fixed-base scalar multiplication and an inversion into every
+            // repetition — work `create` does not do. `black_box` on the input
+            // is what keeps `create` from being hoisted as loop-invariant now
+            // that the point no longer changes; the barrier does the job the
+            // varying scalar was doing, without paying for a `mul_base`.
+            let p = EdwardsPoint::mul_base(&Scalar::from_bytes_mod_order(seed_bytes(11)));
+            let mut last = p;
             for _ in 0..iters {
-                let p = EdwardsPoint::mul_base(&s);
-                let table = curve25519_dalek::edwards::EdwardsBasepointTable::create(&p);
+                let table =
+                    curve25519_dalek::edwards::EdwardsBasepointTable::create(black_box(&p));
                 // `basepoint()` reads only the first of the 32 sub-tables, so
                 // without a barrier the optimizer would be entitled to discard
                 // the construction of the other 31 — most of what this kernel
-                // exists to measure. (It demonstrably does not: the marginal
-                // cost per `create` is ~33 field inversions, which is the 32
-                // sub-tables plus `compress`. The barrier makes that a
-                // guarantee rather than an observation.)
+                // exists to measure.
                 // A *reference* barrier: it forces the whole table to be
                 // materialised without copying its 30 KiB, which a by-value
                 // `black_box` would do — and that copy costs one instruction per
                 // byte under callgrind, inflating this kernel by 1%.
                 let table = black_box(&table);
-                acc = acc.wrapping_add(table.basepoint().compress().to_bytes()[0] as u64);
-                s += Scalar::ONE;
+                // A point copy, not a compression: keeping the result alive
+                // must not cost an inversion of its own.
+                last = table.basepoint();
             }
-            acc
+            // Compressed once, outside the timed loop, only to consume `last`.
+            last.compress().to_bytes()[0] as u64
         }
         K_ED25519_VERIFY => {
             // A full Ed25519 signature verification: SHA-512 over the message,
