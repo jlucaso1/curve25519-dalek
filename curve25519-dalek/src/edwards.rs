@@ -1196,13 +1196,13 @@ macro_rules! impl_basepoint_table {
                 let mut P = <$point>::identity();
 
                 for i in (0..$adds).filter(|x| x % 2 == 1) {
-                    P = (&P + &tables[i / 2].select(a[i])).as_extended();
+                    P = (&P + &tables[i / 2].select_or(a[i])).as_extended();
                 }
 
                 P = P.mul_by_pow_2($radix);
 
                 for i in (0..$adds).filter(|x| x % 2 == 0) {
-                    P = (&P + &tables[i / 2].select(a[i])).as_extended();
+                    P = (&P + &tables[i / 2].select_or(a[i])).as_extended();
                 }
 
                 P

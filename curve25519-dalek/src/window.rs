@@ -77,6 +77,74 @@ macro_rules! impl_lookup_table {
             }
         }
 
+        impl $name<AffineNielsPoint> {
+            /// `select`, specialised for the type every basepoint table holds.
+            ///
+            /// The generic version keeps a live accumulator and conditionally
+            /// assigns into it once per entry, which is a read-modify-write per
+            /// limb (`t ^= mask & (t ^ v)`, three operations) carrying a
+            /// dependency through `t` across the whole scan. This version
+            /// OR-accumulates into a zeroed accumulator instead
+            /// (`acc |= mask & v`, two operations), so each limb is an
+            /// independent chain, and computes the comparison mask once per
+            /// entry as a plain `u64` rather than going through `Choice` for
+            /// every limb.
+            ///
+            /// Constant time: straight line, no branch and no data-dependent
+            /// index. Exactly one of the masks is all-ones — including the
+            /// `xabs == 0` case, which selects the identity — so the OR is a
+            /// selection, not a merge.
+            pub(crate) fn select_or(&self, x: i8) -> AffineNielsPoint {
+                debug_assert!(x >= $neg);
+                debug_assert!(x as i16 <= $size as i16);
+
+                let xmask = x as i16 >> 7;
+                let xabs = (x as i16 + xmask) ^ xmask;
+
+                // Cross `subtle`'s optimisation barrier for every entry *first*,
+                // while the accumulator is not yet live. `Choice::from` is
+                // `#[inline(never)]` around a volatile read, so each crossing is
+                // a real call, and any caller-saved register live across it has
+                // to be spilled. Interleaving the crossings with the
+                // accumulation, as the generic `select` does, means spilling the
+                // whole running point once per entry.
+                let mut masks = [0u64; $size + 1];
+                for j in 0..=$size {
+                    let c = (xabs as u16).ct_eq(&(j as u16));
+                    masks[j] = (c.unwrap_u8() as u64).wrapping_neg();
+                }
+
+                // Now accumulate with no barrier in the way: `acc |= mask & v`,
+                // one independent chain per limb, against the generic version's
+                // read-modify-write `t ^= mask & (t ^ v)`.
+                let mut acc = AffineNielsPoint {
+                    y_plus_x: FieldElement::ZERO,
+                    y_minus_x: FieldElement::ZERO,
+                    xy2d: FieldElement::ZERO,
+                };
+
+                // `masks[0]` selects the identity, which the generic version
+                // gets by initialising the accumulator to it.
+                let identity = AffineNielsPoint::identity();
+                acc.y_plus_x.or_masked_assign(&identity.y_plus_x, masks[0]);
+                acc.y_minus_x
+                    .or_masked_assign(&identity.y_minus_x, masks[0]);
+                acc.xy2d.or_masked_assign(&identity.xy2d, masks[0]);
+
+                for j in $range {
+                    let m = masks[j];
+                    let e = &self.0[j - 1];
+                    acc.y_plus_x.or_masked_assign(&e.y_plus_x, m);
+                    acc.y_minus_x.or_masked_assign(&e.y_minus_x, m);
+                    acc.xy2d.or_masked_assign(&e.xy2d, m);
+                }
+
+                let neg_mask = Choice::from((xmask & 1) as u8);
+                acc.conditional_negate(neg_mask);
+                acc
+            }
+        }
+
         impl<T: Copy + Default> Default for $name<T> {
             fn default() -> $name<T> {
                 $name([T::default(); $size])
@@ -309,6 +377,33 @@ impl<'a> From<&'a EdwardsPoint> for NafLookupTable8<AffineNielsPoint> {
 
 #[cfg(test)]
 mod test {
+    use super::*;
+
+    /// `select_or` must agree with the generic `select` on every input in the
+    /// documented range, for every table radix a basepoint table uses. It is a
+    /// different formulation of the same selection, so agreement is exact.
+    #[test]
+    fn select_or_matches_select() {
+        use crate::constants::ED25519_BASEPOINT_POINT;
+        let P = ED25519_BASEPOINT_POINT;
+
+        let table: LookupTable<AffineNielsPoint> = LookupTable::from(&P);
+        for x in -8i8..=8 {
+            let want = table.select(x);
+            let got = table.select_or(x);
+            assert_eq!(
+                want.y_plus_x.to_bytes(),
+                got.y_plus_x.to_bytes(),
+                "y+x at x={x}"
+            );
+            assert_eq!(
+                want.y_minus_x.to_bytes(),
+                got.y_minus_x.to_bytes(),
+                "y-x at x={x}"
+            );
+            assert_eq!(want.xy2d.to_bytes(), got.xy2d.to_bytes(), "xy2d at x={x}");
+        }
+    }
     use super::*;
     use crate::scalar::Scalar;
 

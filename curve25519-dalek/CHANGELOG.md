@@ -46,6 +46,19 @@ major series.
   `alloc`. The batch returns a different weakly-reduced representative than
   `invert` does, so the result is equal as a field element but not limb for limb;
   it is tested against the previous construction on canonical bytes.
+* Perf: the constant-time window scan crosses `subtle`'s optimisation barrier
+  before its accumulator is live. `LookupTable::select` was 19.8% of a keygen.
+  `subtle`'s barrier is `#[inline(never)]` around a `read_volatile`, so each
+  `Choice` is a real call with a mandatory memory round-trip, and the original
+  loop interleaved one crossing per table entry with a live 15-limb accumulator,
+  spilling it every time. Computing all the comparison masks up front, then
+  accumulating, keeps the same barrier and the same number of crossings but
+  makes the spills cheap: `x25519_mul_base_clamped` -2.41%, `mul_base` -2.85%
+  at radix-16, -6.88% at radix-32 and -10.16% at radix-64. The Montgomery ladder
+  and signature verification are unchanged, as neither uses this scan. Constant
+  time is unaffected: the comparison still goes through `ct_eq`, every branch in
+  the emitted code is on the public loop index, and a test checks the new path
+  against the generic one for every input on all five backend configurations.
 * Perf: the AVX2 field multiply is emitted column-major. `FieldElement2625x4`'s
   10x10 schoolbook was written row-major, which needs all ten `y_j`, all nine
   `y_j_19`, all ten `x_i` and all five doubled `x_i` live simultaneously —

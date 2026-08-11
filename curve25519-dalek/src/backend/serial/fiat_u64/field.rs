@@ -168,6 +168,21 @@ impl ConditionallySelectable for FieldElement51 {
 }
 
 impl FieldElement51 {
+    /// `self |= mask & other`, limb by limb.
+    ///
+    /// `mask` must be all-ones or all-zeros. Used by the constant-time window
+    /// scan in `window.rs`, which OR-accumulates masked table entries into a
+    /// zeroed accumulator rather than conditionally assigning into a live one.
+    #[inline(always)]
+    pub(crate) fn or_masked_assign(&mut self, other: &Self, mask: u64) {
+        let m = mask;
+        self.0.0[0] |= m & other.0.0[0];
+        self.0.0[1] |= m & other.0.0[1];
+        self.0.0[2] |= m & other.0.0[2];
+        self.0.0[3] |= m & other.0.0[3];
+        self.0.0[4] |= m & other.0.0[4];
+    }
+
     pub(crate) const fn from_limbs(limbs: [u64; 5]) -> FieldElement51 {
         FieldElement51(fiat_25519_tight_field_element(limbs))
     }
