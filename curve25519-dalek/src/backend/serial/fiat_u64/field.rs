@@ -247,6 +247,17 @@ impl FieldElement51 {
         output
     }
 
+    /// Compute `self - rhs`, matching `FieldElement51::sub_unreduced`'s
+    /// signature so `montgomery.rs` can stay backend-agnostic.
+    ///
+    /// This backend's arithmetic is fiat-crypto's verified output, so there is
+    /// nothing to hand-optimize here: it forwards to the ordinary subtraction.
+    /// The narrower precondition is therefore not required of callers on this
+    /// backend, and imposing it would be misleading.
+    pub(crate) fn sub_unreduced(&self, rhs: &FieldElement51) -> FieldElement51 {
+        self - rhs
+    }
+
     /// Multiply this field element by \\((A+2)/4 = 121666\\), the constant the
     /// Montgomery ladder needs once per step.
     ///

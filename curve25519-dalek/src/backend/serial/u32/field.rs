@@ -596,6 +596,17 @@ impl FieldElement2625 {
         FieldElement2625::reduce(self.square_inner())
     }
 
+    /// Compute `self - rhs`, matching `FieldElement51::sub_unreduced`'s
+    /// signature so `montgomery.rs` can stay backend-agnostic.
+    ///
+    /// Currently forwards to the ordinary subtraction: the same `2p`-offset
+    /// trick applies in principle to the ten-limb layout, but its bit-excess
+    /// accounting is per-limb-parity and has not been verified here, and an
+    /// unverified bound in a subtraction is not worth a few percent.
+    pub(crate) fn sub_unreduced(&self, rhs: &FieldElement2625) -> FieldElement2625 {
+        self - rhs
+    }
+
     /// Multiply this field element by \\((A+2)/4 = 121666\\), the constant the
     /// Montgomery ladder needs once per step.
     ///

@@ -24,6 +24,17 @@ major series.
   `mul_clamped` 2.2% with `+bmi2`. Output is bit-for-bit identical, the limb
   representation and bit-excess preconditions are unchanged, and the wasm32
   module is byte-identical since `serial::u64` is not compiled there.
+* Perf: the Montgomery ladder's four subtractions no longer pay for a reduction.
+  The general `Sub` must accept any input at the crate-wide bit excess, so it
+  offsets by `16p` and has to reduce afterwards; the ladder's subtractions all
+  take `mul`/`square` outputs, which are narrow enough that an offset of `2p`
+  leaves the result already in range. `serial::u64` gains a `sub_unreduced` with
+  its own documented, stricter precondition — `Sub`'s contract is unchanged, and
+  the other backends forward to it. X25519 `mul_clamped` improves 6.1% on a
+  baseline x86-64 build and 3.7% with `-C target-feature=+avx2,+bmi2`;
+  `mul_base_clamped` is unchanged. The result is congruent to but not
+  limb-for-limb equal to `Sub`'s, so it is checked on field equality, on the
+  limb bound, and against the RFC 7748 iterated-ladder vector.
 * Perf: together, the `pow2k`, `mul121666` and conditional-swap changes listed
   here take `mul_clamped` down 9.7% in a stock `cargo --release` build, 25.0%
   with fat LTO, and 8.8% on wasm32, measured against the base branch in one
@@ -46,7 +57,7 @@ major series.
   x86_64.
 * Docs: the README now records the build settings that matter for X25519-heavy
   workloads, which are worth more than any source change measured here: fat LTO
-  plus `-C target-feature=+adx,+bmi2` takes `mul_clamped` from 58.8 us to
+  plus `-C target-feature=+bmi2` takes `mul_clamped` from 58.8 us to
   40.8 us on x86_64; adding `+avx2` is worth a further 6% on `mul_base_clamped`,
   since it vectorizes the constant-time window scan that key generation is
   dominated by — the two halves are complementary, `+bmi2` moving the ladder and
@@ -54,7 +65,8 @@ major series.
   off by default on `wasm32-unknown-unknown` — is worth 4.6% on `mul_clamped`
   and 15.7% on `mul_base_clamped`. The README also records that these flags
   raise the binary's CPU requirement, unlike the crate's runtime-detected vector
-  backends.
+  backends, and that `+adx` is deliberately absent: LLVM emits zero `adcx`/`adox`
+  with or without it, so it costs a CPU generation and buys nothing.
 * Docs: `docs/perf-x25519-field-arithmetic.md` records a measurement pass over
   the X25519 field arithmetic on x86_64 (ADX/BMI2) and wasm32, including why an
   ADX assembly path was not added and why wasm32 keeps the 32-bit backend. This

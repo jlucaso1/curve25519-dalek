@@ -481,6 +481,59 @@ impl FieldElement51 {
     /// the four `b[i] * 19` precomputations are `0 * 19`. The compiler cannot
     /// fold them away because `mul` is not inlined into the ladder.
     ///
+    /// Compute `self - rhs` for operands narrow enough not to need a reduction.
+    ///
+    /// The general [`Sub`] must accept any input satisfying the crate-wide bit
+    /// excess `b < 3`, so it adds `16p` to keep the difference positive — which
+    /// leaves limbs around `2^55` and forces a [`FieldElement51::reduce`] to get
+    /// back inside the contract. That reduction is about sixteen instructions,
+    /// and it is pure overhead whenever the operands are already narrow.
+    ///
+    /// This subtracts against `2p` instead, which is enough whenever both
+    /// operands are outputs of `mul`, `square` or `square2` — all of which
+    /// produce limbs below `2^51 + 2^13` — and so needs no reduction at all.
+    ///
+    /// # Preconditions
+    ///
+    /// Every limb of **both** operands must be `< 2^52 - 38`, which is the
+    /// smallest limb of `2p`. `mul`/`square` outputs satisfy this with eleven
+    /// bits to spare. The `debug_assert!`s below enforce it in debug builds.
+    ///
+    /// # Postcondition
+    ///
+    /// Limbs are `< 2^53`, so the result satisfies the documented `b < 3` and
+    /// may be fed to any operation in this module.
+    ///
+    /// The result is congruent to, but generally *not* limb-for-limb equal to,
+    /// `self - rhs`: it is a different representative of the same field
+    /// element. `sub_unreduced_agrees_with_sub` checks the field equality and
+    /// the limb bound; the ladder's callers are checked end to end against the
+    /// byte output of `mul_clamped`, which is canonical.
+    pub(crate) fn sub_unreduced(&self, rhs: &FieldElement51) -> FieldElement51 {
+        /// `2p`, limb by limb: `2 * (2^51 - 19)` then four times `2 * (2^51 - 1)`.
+        const TWO_P: [u64; 5] = [
+            4503599627370458,
+            4503599627370494,
+            4503599627370494,
+            4503599627370494,
+            4503599627370494,
+        ];
+
+        // The bound that makes the reduction unnecessary. It is stricter than
+        // the module-wide `b < 3`, which is why this is a separate operation
+        // rather than a change to `Sub`.
+        debug_assert!(self.0.iter().all(|&l| l < TWO_P[0]));
+        debug_assert!(rhs.0.iter().all(|&l| l < TWO_P[0]));
+
+        FieldElement51([
+            (self.0[0] + TWO_P[0]) - rhs.0[0],
+            (self.0[1] + TWO_P[1]) - rhs.0[1],
+            (self.0[2] + TWO_P[2]) - rhs.0[2],
+            (self.0[3] + TWO_P[3]) - rhs.0[3],
+            (self.0[4] + TWO_P[4]) - rhs.0[4],
+        ])
+    }
+
     /// Only the five surviving products are computed here. The carry chain is
     /// the same one `mul` uses, so the result is bit-for-bit identical to the
     /// general multiplication; `mul121666_matches_general_mul` checks that.
@@ -930,6 +983,51 @@ mod test {
             let rhs = &(&x.square() + &y.square()) + &(&xy + &xy);
 
             assert_eq!(lhs.to_bytes(), rhs.to_bytes());
+        }
+    }
+
+    /// `sub_unreduced` is not limb-for-limb equal to `Sub` — it returns a
+    /// different representative of the same field element — so it is checked on
+    /// the two properties the ladder actually depends on: the value is right,
+    /// and the limbs land inside the bit excess the next operation requires.
+    #[test]
+    fn sub_unreduced_agrees_with_sub() {
+        let mut rng = Rng(0x5eed_dead_beef_0051);
+
+        // The precondition is "both operands are `mul`/`square` outputs". Rather
+        // than assume what those look like, produce them: multiply random
+        // elements and subtract the actual results.
+        for _ in 0..1024 {
+            let x = &rng.field_element(51) * &rng.field_element(51);
+            let y = rng.field_element(51).square();
+
+            let fast = x.sub_unreduced(&y);
+
+            // Same field element as the general subtraction.
+            assert_eq!(fast.to_bytes(), (&x - &y).to_bytes());
+
+            // Inside the documented bit excess `b < 3`, so the result may be
+            // fed to `mul`, `square` or `mul121666`.
+            assert!(fast.0.iter().all(|&l| l < (1u64 << 54)));
+        }
+
+        // The worst case the precondition permits: both operands one below the
+        // smallest limb of 2p. This is the input that would underflow first if
+        // the offset were ever reduced.
+        let hi = FieldElement51([4503599627370457; 5]);
+        let lo = FieldElement51([0; 5]);
+        assert_eq!(hi.sub_unreduced(&lo).to_bytes(), (&hi - &lo).to_bytes());
+        assert_eq!(lo.sub_unreduced(&hi).to_bytes(), (&lo - &hi).to_bytes());
+        assert!(hi.sub_unreduced(&lo).0.iter().all(|&l| l < (1u64 << 54)));
+
+        // Degenerate cases, including x - x == 0.
+        for limbs in [[0u64; 5], [1, 0, 0, 0, 0], [0, 0, 0, 0, 1]] {
+            let x = FieldElement51(limbs);
+            assert_eq!(
+                x.sub_unreduced(&x).to_bytes(),
+                FieldElement51::ZERO.to_bytes()
+            );
+            assert_eq!(x.sub_unreduced(&x).to_bytes(), (&x - &x).to_bytes());
         }
     }
 }
