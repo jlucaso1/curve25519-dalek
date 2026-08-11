@@ -816,7 +816,59 @@ conditional selects to 43 × 32 = 1376, each over a three-field-element
 > once behind a `OnceLock`, outside the timing boundary. The ordering was
 > unaffected; the magnitudes were not. Thanks to CodeRabbit for catching it.
 
-### 8.6 What is left, and why it was not attempted
+### 8.6 Exact instruction profile, and what it says is left
+
+Everything above is wall-clock on a shared virtual machine, which is why the
+minimum over repetitions is the reported statistic. Instruction counts have no
+such problem, so the question "where does the work actually go" is answered
+exactly rather than statistically, with `callgrind` (`benches/harness/src/bin/cg.rs`
+is the entry point; the command is in its header).
+
+Instructions per operation, stock release build (`lto=off`, `cgu=16`, baseline
+x86-64 ISA — so `mulq` rather than `mulx`), averaged over 20 calls:
+
+**`mul_clamped`** — 600 000 instructions:
+
+| | share |
+| --- | ---: |
+| `<&FieldElement51 as Mul>::mul` | **46.4%** |
+| `differential_add_and_double` (self: the four inlined squarings, `mul121666`, the eight add/sub) | **40.2%** |
+| `pow2k` (the inversion's 254 squarings) | 5.2% |
+| ladder driver, self (conditional swap, bit extraction) | 4.9% |
+| `pow22501` | 0.1% |
+
+**`mul_base_clamped`** — 226 000 instructions:
+
+| | share |
+| --- | ---: |
+| `<&FieldElement51 as Mul>::mul` | **46.2%** |
+| `AffineNielsPoint::conditional_assign` (the constant-time window scan) | **15.0%** |
+| `pow2k` (the inversion's squarings) | 14.1% |
+| `EdwardsPoint + AffineNielsPoint` (the mixed addition) | 6.3% |
+| `LookupTable::select` (self: the scan's loop) | 4.8% |
+| `ProjectivePoint::double` | 1.3% |
+
+Three things worth pulling out.
+
+**The op-count model checks out exactly.** `mul` costs 284 427 instructions per
+`mul_clamped` over 1287 calls = 221 each, which is precisely the 221-instruction
+`mul` counted in the disassembly in §3.1. That is an independent confirmation of
+the operation counts in §1 from a completely different instrument.
+
+**The inversion is smaller than the wall-clock suggested.** It is 5.3% of
+`mul_clamped`'s instructions, against the ~8% estimated from timing, and about
+20% of `mul_base_clamped` once its share of `mul` is included. That is still the
+largest single algorithmic lever, but it is worth recording that the timing
+estimate flattered it.
+
+**The constant-time window scan is a fifth of key generation** — 15.0% in
+`conditional_assign` plus 4.8% in `select`, against 6.3% for the point addition
+the scan exists to feed. This is the quantitative version of §8.5: the scan, not
+the addition count, is what dominates fixed-base multiplication, which is why
+larger tables lose.
+
+### 8.7 What is left, and why it was not attempted
+
 
 After §4, §5 and §6, both hot loops are at their published operation counts and
 the field operations are at the floor for this representation. Three separate
@@ -839,13 +891,19 @@ checks say so:
   the four doublings — consistent with §8.5, where the scan is what makes the
   larger tables lose.
 
-The one substantial remaining lever is the **field inversion**, which is 3 766 ns
-on x86_64 and 9 280 ns on wasm32 — 8% of a `mul_clamped` and 20% of a
-`mul_base_clamped`. Fermat's little theorem is optimal as an exponentiation, but
+The one substantial remaining lever is the **field inversion**: 3 766 ns on
+x86_64 and 9 280 ns on wasm32, which §8.6 pins down exactly as 5.3% of a
+`mul_clamped`'s instructions and about 20% of a `mul_base_clamped`'s. Fermat's little theorem is optimal as an exponentiation, but
 it is not the only algorithm: a constant-time binary GCD in the style of
 Bernstein–Yang "safegcd" typically runs 2–4x faster than Fermat for a 255-bit
 field. At 2.5x that would be worth roughly −5% on `mul_clamped` and −12% on
 `mul_base_clamped`, or about −6% of the per-message X25519 cost.
+
+It is also worth recording that fiat-crypto, which this crate already carries
+behind a cfg, does **not** generate `divstep` for curve25519 — its requested
+operation list is `carry_mul, carry_square, carry, add, sub, opp, selectznz,
+to_bytes, from_bytes, relax, carry_scmul121666`. So there are no verified
+primitives to build on here; a safegcd would be hand-written from scratch.
 
 **Not attempted here.** safegcd is subtle, its constant-time property is a
 property of the divstep bound and the whole iteration count rather than of any
@@ -857,6 +915,29 @@ character from the two in §4 and §5, both of which move existing arithmetic an
 are bit-for-bit verifiable against what they replace. Recorded as the top
 candidate for anyone who wants to take it on, with the numbers that say what it
 is worth.
+
+Two smaller candidates that the instruction profile surfaced, and which were
+measured and left alone rather than merely skipped:
+
+* **XOR-accumulating the window scan.** `AffineNielsPoint::conditional_assign`
+  is `a ^ (mask & (a ^ b))` per limb — three operations. Accumulating into a
+  zeroed register instead would be `acc ^= mask & b`, two. Against 15.0% of
+  key generation that is worth roughly 3%, but it needs an extra pass to
+  reinstate the identity when the window digit is zero, and it is shared
+  constant-time code on every scalar multiplication in the crate, not just the
+  X25519 path. Poor trade.
+* **An unreduced subtraction.** `sub` adds 16p before subtracting and therefore
+  has to run a full carry chain, roughly 35 instructions against `add`'s 10, and
+  the ladder does four per step. Inputs there are always freshly reduced, so
+  adding 2p would suffice and the reduction could be dropped — worth about 3% of
+  `mul_clamped`'s instructions, which matters on wasm32 where instructions track
+  time. Left alone because it would mean a second subtraction with a different,
+  narrower documented precondition on the bit excess, and the bit-excess
+  contract is a correctness invariant of this backend rather than a detail. Not
+  worth 3% on one target.
+
+Neither is refused on principle; both are recorded with what they are worth so
+the trade can be re-made by someone who wants it.
 
 ---
 
