@@ -154,9 +154,11 @@ impl ExtendedPoint {
         // tmp0 = (0, 0,  2S_3, -S_4)
         tmp0 = tmp0 + S_1;
         // tmp0 = (  S_1,   S_1, S_1 + 2S_3, S_1 - S_4)
-        tmp0 = tmp0 + zero.blend(S_2, Lanes::AD);
-        // tmp0 = (S_1 + S_2,   S_1, S_1 + 2S_3, S_1 + S_2 - S_4)
-        tmp0 = tmp0 + zero.blend(S_2.negate_lazy(), Lanes::BC);
+        // `+S_2` into lanes A,D and `-S_2` into lanes B,C are disjoint, so one
+        // signed blend carries both: (S_2, 2p - S_2, 2p - S_2, S_2). Splitting
+        // them costs an extra blend and an extra add per limb for nothing —
+        // the `ifma` backend already folds them this way (`ifma/edwards.rs`).
+        tmp0 = tmp0 + S_2.blend(S_2.negate_lazy(), Lanes::BC);
         // tmp0 = (S_1 + S_2, S_1 - S_2, S_1 - S_2 + 2S_3, S_1 + S_2 - S_4)
         //    b < (     1.01,       1.6,             2.33,             1.6)
         // Now tmp0 = (S_5, S_6, S_8, S_9)
