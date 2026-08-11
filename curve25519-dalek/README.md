@@ -255,6 +255,40 @@ cargo +nightly bench --features "rand_core"
 Performance is a secondary goal behind correctness, safety, and
 clarity, but we aim to be competitive with other implementations.
 
+## Build settings for X25519-heavy workloads
+
+If your workload is dominated by X25519 — a Diffie-Hellman per message, say —
+two build settings are worth more than anything the source can do for you, and
+neither requires a code change:
+
+```toml
+# Cargo.toml
+[profile.release]
+lto = "fat"
+```
+
+```sh
+# and, on x86_64, let the compiler use BMI2
+RUSTFLAGS='-C target-feature=+adx,+bmi2'   # or -C target-cpu=native
+```
+
+Measured on an Intel Cascade Lake, `MontgomeryPoint::mul_clamped` goes from
+58.8 µs on a stock `cargo build --release` to 40.8 µs with both — **about a
+third faster**. LTO is the larger half: the Montgomery ladder's squaring is
+worth inlining into the ladder step, and only fat LTO chooses to do it. The
+`+bmi2` half is what lets LLVM emit `mulx` instead of `mulq`; without it the
+baseline `x86-64` target has no BMI2 and the field multiplication pays for it.
+
+Note that neither the AVX2 nor the AVX-512 backend accelerates X25519 — they
+cover Edwards and Ristretto variable-base and multiscalar multiplication, while
+`MontgomeryPoint` arithmetic and `EdwardsPoint::mul_base` are serial in every
+backend. A binary with the vector backend compiled in that spends its time in
+`backend::serial` on an X25519 workload is behaving as expected.
+
+`docs/perf-x25519-field-arithmetic.md` has the full measurements, the
+reproduction instructions, and the analysis behind these numbers, including
+wasm32.
+
 # FFI
 
 Unfortunately, we have no plans to add FFI to `curve25519-dalek` directly.  The
