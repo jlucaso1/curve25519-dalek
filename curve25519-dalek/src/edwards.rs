@@ -1022,7 +1022,33 @@ impl VartimeMultiscalarMul for EdwardsPoint {
         // Use this as the hint to decide which algorithm to use.
         let size = s_lo;
 
-        if size < 190 {
+        // Straus is linear with a small intercept; Pippenger has a large fixed
+        // cost — 43 digit columns, each summing 62 buckets regardless of `size`
+        // — and a shallower slope. Fitting measured instruction counts on this
+        // host (AVX2, callgrind, setup differenced out) gives
+        //
+        //     straus    ~   156 132 + 54 624 * n
+        //     pippenger ~ 3 065 179 + 41 991 * n
+        //
+        // which cross at n ~ 230, not at 190. Below the true crossover the
+        // switch is a step *up*: adding one point at 190 measured +5.5%, and
+        // running Straus instead is -3.63% at n = 200 and -1.66% at n = 220,
+        // tapering to zero as the fits meet.
+        //
+        // The band matters for `ed25519_dalek::verify_batch`, which passes
+        // 2n + 1 points: batches of 95..115 signatures land in it.
+        //
+        // The cost of the higher threshold is peak memory. Straus builds one
+        // `NafLookupTable5` per point — 1280 bytes with the vector backend — so
+        // it holds ~294 KiB at n = 230 against Pippenger's ~80 KiB. A consumer
+        // that cares more about footprint than about a few percent should lower
+        // this; it is deliberately a single named constant for that reason.
+        //
+        // Only the variable-time entry point is affected. `MultiscalarMul`, the
+        // constant-time one, always uses Straus and does not reach here.
+        const PIPPENGER_CROSSOVER: usize = 230;
+
+        if size < PIPPENGER_CROSSOVER {
             crate::backend::straus_optional_multiscalar_mul(scalars, points)
         } else {
             crate::backend::pippenger_optional_multiscalar_mul(scalars, points)
