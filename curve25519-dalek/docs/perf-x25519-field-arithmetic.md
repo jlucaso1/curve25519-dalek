@@ -818,11 +818,26 @@ conditional selects to 43 × 32 = 1376, each over a three-field-element
 
 ### 8.6 What is left, and why it was not attempted
 
-After §4 and §5, the serial field operations are essentially at the floor for
-this representation. `mul` is 25.36 ns for 25 partial products and `square` is
-15.03 ns for 15; the ratio 1.687 is within 1.2% of the 25/15 = 1.667 the product
-counts predict, so neither has meaningful slack left short of changing the limb
-layout.
+After §4, §5 and §6, both hot loops are at their published operation counts and
+the field operations are at the floor for this representation. Three separate
+checks say so:
+
+* **The field operations themselves.** `mul` is 25.36 ns for 25 partial products
+  and `square` is 15.03 ns for 15; the ratio 1.687 is within 1.2% of the
+  25/15 = 1.667 the product counts predict. Neither has meaningful slack short
+  of changing the limb layout.
+* **The ladder step.** `differential_add_and_double` now performs
+  5M + 4S + 1×a24 — five general multiplications (`t7`, `t8`, `t14`, `t16`,
+  `t17`), four squarings, and the specialized multiply by `(A+2)/4` from §5.
+  That is the textbook cost of a differential add-and-double; before §5 it was
+  6M + 4S, paying a general multiplication for the constant.
+* **The fixed-base loop.** Each of the 64 windows costs one mixed addition
+  (`&EdwardsPoint + &AffineNielsPoint`, 3M) plus `CompletedPoint::as_extended`
+  (4M) = 7M, which is the standard cost for a mixed addition against
+  Niels-form precomputed points. 64 × 7 × 25.36 ns = 11.4 µs against a measured
+  15.0 µs for `mul_base`, the remainder being the constant-time window scan and
+  the four doublings — consistent with §8.5, where the scan is what makes the
+  larger tables lose.
 
 The one substantial remaining lever is the **field inversion**, which is 3 766 ns
 on x86_64 and 9 280 ns on wasm32 — 8% of a `mul_clamped` and 20% of a
