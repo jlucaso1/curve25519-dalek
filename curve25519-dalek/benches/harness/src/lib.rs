@@ -22,6 +22,8 @@ use curve25519_dalek::montgomery::MontgomeryPoint;
 use curve25519_dalek::scalar::Scalar;
 use curve25519_dalek::traits::BasepointTable;
 
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+
 #[cfg(curve25519_dalek_bench_internals)]
 use curve25519_dalek::bench_internals::FieldElement;
 
@@ -39,6 +41,12 @@ pub const K_FE_INVERT: u32 = 8;
 pub const K_ED_MUL_BASE_R64: u32 = 9;
 pub const K_ED_MUL_BASE_R32: u32 = 10;
 pub const K_ED_VARTIME_DOUBLE: u32 = 11;
+pub const K_ED25519_VERIFY: u32 = 12;
+pub const K_FE_INVERT_X8: u32 = 13;
+pub const K_FE_BATCH_INVERT_8: u32 = 14;
+pub const K_FE_INVERT_X16: u32 = 15;
+pub const K_FE_BATCH_INVERT_16: u32 = 16;
+pub const K_ED_TABLE_CREATE: u32 = 17;
 
 pub const KERNELS: &[(u32, &str, u32)] = &[
     // (selector, name, field operations per iteration)
@@ -54,6 +62,12 @@ pub const KERNELS: &[(u32, &str, u32)] = &[
     (K_ED_VARTIME_DOUBLE, "edwards_vartime_double_base", 1),
     (K_MUL_CLAMPED, "x25519_mul_clamped", 1),
     (K_MUL_BASE_CLAMPED, "x25519_mul_base_clamped", 1),
+    (K_ED25519_VERIFY, "ed25519_verify", 1),
+    (K_FE_INVERT_X8, "fe_invert_x8", 8),
+    (K_FE_BATCH_INVERT_8, "fe_batch_invert_8", 8),
+    (K_FE_INVERT_X16, "fe_invert_x16", 16),
+    (K_FE_BATCH_INVERT_16, "fe_batch_invert_16", 16),
+    (K_ED_TABLE_CREATE, "edwards_table_create", 1),
 ];
 
 /// Whether the field-level kernels were compiled in. They need
@@ -172,6 +186,46 @@ pub fn run_kernel(which: u32, iters: u32) -> u64 {
             }
             sum.compress().to_bytes()[0] as u64
         }
+        K_ED_TABLE_CREATE => {
+            // `EdwardsBasepointTable::create`: 32 `LookupTable<AffineNielsPoint>`,
+            // each converting 8 points to affine, i.e. 256 field inversions. This
+            // is the only place in the crate where many independent inversions
+            // are produced by a single call, so it is the only candidate for
+            // Montgomery's trick.
+            let mut s = Scalar::from_bytes_mod_order(seed_bytes(11));
+            let mut acc = 0u64;
+            for _ in 0..iters {
+                let p = EdwardsPoint::mul_base(&s);
+                let table = curve25519_dalek::edwards::EdwardsBasepointTable::create(&p);
+                acc = acc.wrapping_add(table.basepoint().compress().to_bytes()[0] as u64);
+                s += Scalar::ONE;
+            }
+            acc
+        }
+        K_ED25519_VERIFY => {
+            // A full Ed25519 signature verification: SHA-512 over the message,
+            // then `vartime_double_scalar_mul_basepoint` and `compress`. This is
+            // the operation the group-messaging profile is dominated by, and the
+            // only hot path in this workspace that reaches the vector backend.
+            //
+            // Key, signature and message are built once, outside the timed loop.
+            // Verification is a pure function of them, so re-verifying the same
+            // signature measures exactly the work a consumer does per message;
+            // what must not leak into the timing is the *signing*, which is a
+            // different operation entirely.
+            let signing = SigningKey::from_bytes(&seed_bytes(9));
+            let verifying: VerifyingKey = signing.verifying_key();
+            let message = seed_bytes(10);
+            let signature: Signature = signing.sign(&message);
+
+            let mut acc = 0u64;
+            for _ in 0..iters {
+                acc = acc.wrapping_add(verifying.verify(&message, &signature).is_ok() as u64);
+            }
+            // Fail loudly rather than silently timing a rejected signature.
+            assert_eq!(acc, iters as u64, "verification failed");
+            acc
+        }
         K_TO_MONTGOMERY => {
             // The conversion half: one field inversion plus a multiplication.
             // The point is perturbed by a cheap Edwards addition each iteration
@@ -222,6 +276,44 @@ fn run_field_kernel(which: u32, iters: u32) -> u64 {
         K_FE_INVERT => {
             for _ in 0..iters {
                 x = curve25519_dalek::bench_internals::invert(&x);
+            }
+        }
+        // The batch-versus-repeated comparison. `n` independent inversions
+        // against one `invert_batch` over the same `n`: Montgomery's trick
+        // replaces n inversions with 1 inversion and 3(n-1) multiplications.
+        //
+        // n = 8 is the size of a `NafLookupTable5`, the only place in this crate
+        // where several independent inversions sit next to each other; n = 16 is
+        // the count the group profile attributes to `as_affine`. Both are priced
+        // even though neither turned out to be batchable, because the number is
+        // what makes the refusal checkable.
+        //
+        // The chain between iterations is preserved by folding limb 0 of the
+        // first output back into every input, so the batch cannot be hoisted.
+        K_FE_INVERT_X8 | K_FE_INVERT_X16 => {
+            let n = if which == K_FE_INVERT_X8 { 8 } else { 16 };
+            for _ in 0..iters {
+                let mut acc = FieldElement::ZERO;
+                for i in 0..n {
+                    let t = &x + &FieldElement::from_bytes(&seed_bytes(0x40 + i as u8));
+                    acc = &acc + &curve25519_dalek::bench_internals::invert(&t);
+                }
+                x = acc;
+            }
+        }
+        K_FE_BATCH_INVERT_8 | K_FE_BATCH_INVERT_16 => {
+            let n = if which == K_FE_BATCH_INVERT_8 { 8 } else { 16 };
+            let mut buf = vec![FieldElement::ZERO; n];
+            for _ in 0..iters {
+                for (i, slot) in buf.iter_mut().enumerate() {
+                    *slot = &x + &FieldElement::from_bytes(&seed_bytes(0x40 + i as u8));
+                }
+                curve25519_dalek::bench_internals::invert_batch(&mut buf);
+                let mut acc = FieldElement::ZERO;
+                for slot in buf.iter() {
+                    acc = &acc + slot;
+                }
+                x = acc;
             }
         }
         _ => return 0,

@@ -64,6 +64,18 @@ pub fn mul121666(x: &FieldElement) -> FieldElement {
     x.mul121666()
 }
 
+/// `FieldElement::invert_batch_alloc`: Montgomery's trick, replacing \\(n\\)
+/// inversions with one inversion and \\(3(n-1)\\) multiplications.
+///
+/// Exposed so the harness can price a batch against the repeated inversions it
+/// would replace. Nothing in the crate's hot paths calls it — see the
+/// verification-path section of `docs/perf-x25519-field-arithmetic.md` for why
+/// there is no batchable set of inversions to point it at.
+#[cfg(feature = "alloc")]
+pub fn invert_batch(xs: &mut [FieldElement]) {
+    FieldElement::invert_batch_alloc(xs)
+}
+
 /// Number of `differential_add_and_double` steps performed by one
 /// `MontgomeryPoint::mul_clamped` (255 bits, the MSB is skipped).
 pub const LADDER_STEPS: usize = 255;

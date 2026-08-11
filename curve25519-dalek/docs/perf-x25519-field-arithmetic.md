@@ -157,7 +157,7 @@ same form on wasm32.
 | file | purpose |
 | --- | --- |
 | `benches/x25519_field.rs` | Criterion benches: `mul_clamped`, `mul_base_clamped`, and (behind `--cfg curve25519_dalek_bench_internals`) `mul`, `square`, `square2`, `add`, `sub`, `pow2k(k)` for k ∈ {1,2,4,10,50,100}, `invert`, and a synthetic "field mix of one `mul_clamped`" |
-| `benches/harness/` | standalone crate with one set of kernels compiled for **both** x86_64 and wasm32; `src/main.rs` is the native driver, `run.mjs` the Node driver. Kernels: `fe_mul`, `fe_square`, `fe_pow2k50`, `fe_mul121666`, `fe_invert`, `edwards_mul_base` (and radix-32/64 variants), `edwards_to_montgomery`, `edwards_vartime_double_base`, `x25519_mul_clamped`, `x25519_mul_base_clamped`. `src/bin/cg.rs` is the `callgrind` entry point for §10.6. |
+| `benches/harness/` | standalone crate with one set of kernels compiled for **both** x86_64 and wasm32; `src/main.rs` is the native driver, `run.mjs` the Node driver. Kernels: `fe_mul`, `fe_square`, `fe_pow2k50`, `fe_mul121666`, `fe_invert`, `edwards_mul_base` (and radix-32/64 variants), `edwards_to_montgomery`, `edwards_vartime_double_base`, `x25519_mul_clamped`, `x25519_mul_base_clamped`, and, added for §9, `ed25519_verify`, `edwards_table_create`, and `fe_invert_x{8,16}` against `fe_batch_invert_{8,16}`. The verification kernel makes `ed25519-dalek` a path dependency **of the harness only** — it is not a dependency of `curve25519-dalek`. `src/bin/cg.rs` is the `callgrind` entry point for §11.6. |
 | `src/bench_internals.rs` | `--cfg`-gated, `#[doc(hidden)]` hook exposing `FieldElement` and the op counts to the benches. `FieldElement` is `pub(crate)` and Criterion benches are separate crates, so without this the only way to time `mul`/`square` is through a whole scalar multiplication — the exact confound these benches exist to avoid. Absent from every ordinary build; the public API is unchanged. |
 
 Reproduce with:
@@ -454,7 +454,7 @@ place of the general multiplication:
   backends get a verified fast path rather than hand-written arithmetic.
 
 Both hand-written versions are bit-for-bit identical to the general
-multiplication by construction, and the differential tests in §11 check it.
+multiplication by construction, and the differential tests in §12 check it.
 `APLUS2_OVER_FOUR` is now `#[cfg(test)]`: the only remaining use is the test
 that compares the two against each other.
 
@@ -581,7 +581,7 @@ leaves behind — so the two results compose rather than overlap.
 The per-change numbers in §4, §5 and §6 were each measured against the state of
 the tree immediately before that change, across several sessions. That is
 exactly the kind of bookkeeping that accumulates errors — and this document has
-already had to retract one figure (§10.5) — so the cumulative claim is certified
+already had to retract one figure (§11.5) — so the cumulative claim is certified
 directly instead of being assembled: `origin/main` checked out into a second
 worktree, the same harness copied into it, both trees measured **in one session,
 alternating, on the same pinned core**. Only the end-to-end kernels are used, so
@@ -694,7 +694,7 @@ part.** −0.74% of instructions produced −5.4% of time on the isolated squari
 and −10.5% once `+bmi2` makes the multiplies cheap enough for the shift to
 matter relatively more. That is a latency effect: the 128-bit doubling was on
 the critical path between the multiplies and the carry chain, and `callgrind`
-counts instructions, not dependency chains. It is the mirror image of the §10.7
+counts instructions, not dependency chains. It is the mirror image of the §11.7
 caution — there, removing instructions cost time; here, barely removing any
 instructions saved a good deal of it. Neither instrument is sufficient alone.
 
@@ -712,14 +712,14 @@ what the u32 backend has always done. It also speeds up every other caller of
 squaring in the crate — Ed25519 verification, `invert`, `sqrt_ratio_i` — not
 just X25519.
 
-§10.7 warns that the ladder is register-pressure bound and that changes adding
+§11.7 warns that the ladder is register-pressure bound and that changes adding
 live values lose. This one adds four live `u64`, so that risk was real; the
 instruction count going *down* rather than up is the evidence it did not
 materialize.
 
 **wasm32 cannot be affected, and this was verified rather than argued:**
 `serial::u64` is not compiled for `wasm32-unknown-unknown` (which takes
-`bits="32"`, §9). Building the harness module from the same directory with only
+`bits="32"`, §10). Building the harness module from the same directory with only
 `u64/field.rs` toggled between the two versions produces a byte-identical
 `.wasm` (md5 `5364e78e…` both ways).
 
@@ -729,7 +729,7 @@ materialize.
 
 ### 8.1 The observation
 
-§10.10 established that the ladder is sensitive to instruction *count* and
+§11.10 established that the ladder is sensitive to instruction *count* and
 indifferent to latency, because the core already overlaps its independent
 operation pairs. That makes "remove instructions without adding live values" the
 only shape worth looking for — and points at the four subtractions in the ladder
@@ -842,7 +842,260 @@ decide the margin is acceptable, not rediscover the idea.
 
 ---
 
-## 9. Front B — wasm32 with 64-bit limbs: **refused**
+## 9. The signature-verification path, and the inversions it does not do
+
+Everything above came from a profile of direct messaging, where X25519 runs once
+per message. A second profile of the same client — group messaging, Sender Key,
+128 members — reports a different shape: `vector::avx2` at 40.8% against
+`serial::u64` at 15.4%, where the direct-message profile had ~0% and ~64%. It
+also reports a call count that looks like an invitation: eighteen field
+inversions per message, sixteen of them from projective-to-affine conversion.
+
+As before, those numbers come from the consumer and are the reason for the work,
+not the specification. What follows is measured inside this repository, with a
+new `ed25519_verify` kernel in the harness (`ed25519-dalek` is a bench-only path
+dependency of the harness, not of `curve25519-dalek`).
+
+### 9.1 What verification actually costs
+
+`callgrind`, AVX2 backend live, `lto=true`/`cgu=1`. Setup is removed exactly by
+differencing 220 iterations against 20, so these are per-verify figures with no
+amortized key generation or hashing in them:
+
+**354 575 instructions per `ed25519_verify`.**
+
+| | instructions | share |
+| --- | ---: | ---: |
+| `avx2::FieldElement2625x4::mul` | 188 448 | **53.15%** |
+| `avx2::FieldElement2625x4::square_and_negate_D` | 64 507 | 18.19% |
+| `vartime_double_base::spec_avx2::mul`, self | 53 471 | 15.08% |
+| **`serial::u64::FieldElement51::pow2k` — the one inversion** | **32 570** | **9.19%** |
+| `NafLookupTable5<CachedPoint>::from`, self | 4 784 | 1.35% |
+| `sha2::sha512` | 4 447 | 1.25% |
+| `serial::u64::FieldElement51::mul` (the inversion's) | 2 860 | 0.81% |
+
+**The vector backend is 87.8% of a verification** (the three AVX2 rows plus the
+table build). That is the same conclusion as §11.3, reached from the other end:
+the vector backend delivers where it is wired in, and signature verification is
+where it is wired in. It is also the in-repository counterpart of the group
+profile's 40.8%.
+
+### 9.2 The sixteen inversions are not in verification. There is exactly one
+
+This is the question the batch hinges on, and the answer is available from the
+source before any measurement.
+
+`as_affine` exists once in this crate — `montgomery::ProjectivePoint::as_affine`,
+`montgomery.rs:427`. It is called from exactly one place, the last line of
+`MontgomeryPoint::mul_bits_be`, so it runs **once per X25519 scalar
+multiplication**. `curve_models::ProjectivePoint`, the Edwards projective type
+the profile's symbol names, **has no `as_affine` at all**.
+
+The verification path does not call it. Verification is
+
+```rust
+EdwardsPoint::vartime_double_scalar_mul_basepoint(&k, &minus_A, &s).compress()
+```
+
+and the inversions on that path are:
+
+| site | inversions |
+| --- | ---: |
+| `NafLookupTable5<CachedPoint>::from(A)` — the vector table build | **0** |
+| the wNAF loop — doublings and additions in extended coordinates | **0** |
+| `EdwardsPoint::compress` — one `Z.invert()` | **1** |
+
+Measured, not assumed: `callgrind` counts **12.0 `pow2k` calls per `compress`**,
+which is one Fermat inversion (`pow22501`'s eleven plus `invert`'s own), and
+**zero** `pow2k` anywhere else in the verify subtree. Grepping agrees from the
+other direction: every `invert` in `backend/vector/` is inside a `#[cfg(test)]`
+module. **The vector backend performs no field inversion at runtime at all.**
+
+So: **the answer to "are the sixteen batchable" is that there are not sixteen.**
+There is one, and one inversion cannot be batched with itself. The batch does not
+apply to verification, and no amount of restructuring inside this crate changes
+that.
+
+**A cross-check on the premise, offered because it may be useful to whoever
+owns the consumer.** If the sixteen were sixteen `mul_bits_be` calls, they would
+cost sixteen X25519 scalar multiplications. One measures 32 µs here, about
+90 000 cycles; sixteen is roughly 1.4 M cycles, which is four times the 358 906
+cycles the same profile reports for the *entire* message. So the sixteen cannot
+be sixteen X25519 operations either. The only construct in this crate that emits
+eight inversions from a single call is `LookupTable<AffineNielsPoint>::from` —
+via `as_affine_niels`, a name that truncates to something very close to
+`as_affine` — and two of those is sixteen. That is §9.3, and it is where the
+batch does apply.
+
+### 9.3 Sixth change: basepoint-table construction batches its inversions
+
+There are exactly three inverting conversions in the crate, all in `window.rs`,
+all of the same shape:
+
+| construction | inversions | callers |
+| --- | ---: | --- |
+| `LookupTable<AffineNielsPoint>::from` | 8 | `BasepointTable::create`, ×32 |
+| `NafLookupTable5<AffineNielsPoint>::from` | 8 | **none** |
+| `NafLookupTable8<AffineNielsPoint>::from` | 64 | none directly |
+
+Each is written as a chain — convert, add, convert, add — and in that form the
+conversions really are sequential: `points[j+1]` is computed from `points[j]`,
+which is already affine. Taken literally there is nothing to batch, which is the
+trap. The dependency is on the *value* of the previous multiple, not on its
+affine form, so the chain can run in extended coordinates, where no inversion is
+needed, with all the conversions done together at the end.
+
+That makes `EdwardsBasepointTable::create` the one place where Montgomery's
+trick applies, and it is not a marginal one: it builds 32 tables of 8, so
+**256 field inversions**, and at 3 527 ns each that is 903 µs of the 990 µs it
+takes — **91% of building a table is field inversion.** The existing source
+comment, `XXX batch inversion would be good if perf mattered here`, is now
+answered with a number.
+
+The change keeps the additions but defers the conversions, then inverts all
+`Z` at once. The batch is a fixed-size array rather than a `Vec`, so this stays
+available without `alloc`; `FieldElement::internal_invert_batch` became
+`pub(crate)` for that, which is a visibility change and not an API change.
+
+**Results.** Paired alternating runs of two binaries from the same tree with only
+`window.rs` differing, minimum of 7 repetitions:
+
+| | sequential | batched | change | paired wins |
+| --- | ---: | ---: | ---: | :---: |
+| `EdwardsBasepointTable::create` | 990 203 ns | **236 475 ns** | **−76.1% (4.19×)** | 3/3 |
+| instructions per `create` (callgrind, exact) | 9 885 001 | **2 942 694** | **−70.2%** | — |
+| `x25519_mul_base_clamped` | 13 813 | 13 776 | unchanged | — |
+| `ed25519_verify` | 38 919 | 37 936 | unchanged | — |
+
+The two unchanged rows are the point of including them: the crate ships its
+basepoint table as a constant, so nothing on either hot path builds one. This
+helps a consumer that calls `BasepointTable::create` at runtime for a point of
+its own, and it helps nobody else.
+
+**Correctness.** Montgomery's trick returns a different *representative* of each
+inverse than `invert` does — both are weakly reduced, and weak reduction is not
+unique — so unlike every other change in this document this one is **not**
+limb-for-limb identical, and claiming otherwise would be wrong. The tests compare
+canonical bytes instead, which is the strongest true statement and the one the
+table's users depend on:
+
+* `batched_lookup_table_matches_reference` — 32 distinct base points, all eight
+  entries, all three coordinates of each, against a verbatim copy of the
+  pre-batch construction.
+* `batched_lookup_table_handles_identity` — the identity is the input whose `Z`
+  handling differs most between the two (`internal_invert_batch` special-cases
+  zeros), and a table built from it must still select the identity everywhere.
+* `created_table_agrees_with_precomputed` — a table built the new way multiplies
+  identically to the crate's own precomputed constant, over 16 scalars.
+
+**Constant time.** `internal_invert_batch` was already the crate's constant-time
+batch inversion, used by `Scalar::invert_batch`: it is straight-line, and skips
+zero inputs with `conditional_assign` rather than a branch. Table construction
+takes a public point, so this is not a secret-dependent path in the first place,
+but the change does not introduce a branch either way.
+
+### 9.4 What a batch is worth, priced
+
+Since the batch has exactly one applicable site, it is worth recording what it
+would have been worth elsewhere. Per element, minimum of 5 repetitions:
+
+| n | n separate `invert` | one `invert_batch` | ratio |
+| ---: | ---: | ---: | ---: |
+| 1 | 3 528 ns | — | — |
+| 8 | 3 534 ns/element | **578 ns/element** | **6.1×** |
+| 16 | 3 535 ns/element | **355 ns/element** | **9.9×** |
+
+Montgomery's trick replaces \\(n\\) inversions with one inversion and
+\\(3(n-1)\\) multiplications, so the ratio grows with \\(n\\) and is bounded by
+the ratio of an inversion to three multiplications. These kernels ship even
+though only one site could use them, because they are what makes the refusals in
+§9.2 and §9.5 checkable rather than assertions.
+
+### 9.5 safegcd, reassessed against verification. Still refused
+
+§11.11 deferred safegcd with the inversion at 5.3% of `mul_clamped`. On the
+verification path it is worth more: 9.19% in `pow2k` plus 0.81% in the
+inversion's multiplications, so **10.0% of a verification**. Against the group
+profile's 40.8% for verification that is about 4% of the client.
+
+Refused again, on three counts, and the first is new:
+
+1. **The ceiling is low and the alternative is better where it exists.** A
+   safegcd inversion is usually quoted at 2–4× Fermat, so 10.0% becomes perhaps
+   5–7% of a verification, i.e. 2–3% of the group client. Meanwhile §9.4 shows
+   the crate's *existing* batch inversion is worth 6–10× wherever several
+   inversions co-occur. The algorithmic lever with real leverage is "find a set
+   of inversions to batch", not "make one inversion faster" — and §9.2 shows
+   verification has exactly one.
+2. **It cannot be a variable-time inversion, even though verification is
+   variable time.** `compress` is shared: it is called on secret-derived points
+   elsewhere in the workspace, including in signing. A vartime inversion reached
+   from `compress` would be a timing leak in those callers, and splitting
+   `compress` into two variants is public API surface this fork should not add
+   while it is trying to merge upstream.
+3. **Unchanged from before:** a constant-time safegcd's constant-time property is
+   global to the iteration count rather than local to each step, so it cannot be
+   checked the way every change in this document has been checked, and
+   fiat-crypto does not generate `divstep` for curve25519, so there is no
+   verified primitive to build on.
+
+### 9.6 Headroom in `vartime_double_scalar_mul_basepoint`: none in the tables
+
+The obvious follow-up is whether the wNAF window or the table has slack, and the
+first thing to check is whether §11.5's rejection of bigger tables transfers.
+**It does not, and for a reason worth stating:** §11.5 rejected larger tables
+because `LookupTable::select` is a *constant-time linear scan*, so scan cost
+grows with table size. The vartime path's `NafLookupTable5::select` is
+
+```rust
+self.0[x / 2]
+```
+
+a direct index. Table size costs nothing to read here. The scan argument is
+simply absent, and the trade is a different one: build cost against addition
+count.
+
+That trade is already at its optimum. For a 256-bit scalar, width-\\(w\\) wNAF
+averages \\(256/(w+1)\\) additions and needs \\(2^{w-2}\\) table entries, which
+cost \\(2^{w-2}-1\\) additions to build:
+
+| \\(w\\) | entries | build additions | loop additions | total |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 4 | 3 | 51.2 | 54.2 |
+| **5 (what the crate uses)** | **8** | **7** | **42.7** | **49.7** |
+| 6 | 16 | 15 | 36.6 | 51.6 |
+| 7 | 32 | 31 | 32.0 | 63.0 |
+
+Width 5 is the minimum, and the crate already uses it. The measurement agrees:
+the table build is 17 778 instructions per verification, 5.0% of it, and going
+to width 6 would double that to gain about six additions out of a loop that also
+performs 256 doublings — roughly +5% against −1.4%. Not attempted beyond the
+arithmetic, because the arithmetic is not close.
+
+Consistently, the crate uses width **8** for the *precomputed* basepoint table,
+where the build cost is paid once at compile time and the only term left is the
+addition count. That is the same trade resolved with one term deleted, and it is
+resolved the other way, which is a good sign the model is right.
+
+### 9.7 Where a group message's `serial::u64` time goes
+
+The group profile's 15.4% in `serial::u64`, against 87.8% of a *verification*
+being AVX2, is consistent: whatever serial time a group message spends is not
+inside verification, except for the single `compress` inversion. From this
+crate's side there are exactly two sources it can be:
+
+1. **Montgomery ladder work** — every X25519 operation is `serial::u64` in every
+   backend (§11.3), and this is precisely the work §4 through §8 reduced by
+   10.1% stock and 28.7% under fat LTO.
+2. **`compress`'s inversion**, at 10.0% of each verification.
+
+There is no third: `mul_base` is serial in every backend too, but it appears in
+the group profile only through key generation, not per message. Nothing else in
+the crate runs `serial::u64` on that path.
+
+---
+
+## 10. Front B — wasm32 with 64-bit limbs: **refused**
 
 `build.rs` picks `curve25519_dalek_bits` from `target_pointer_width`, so wasm32
 gets `DalekBits::Dalek32` (`serial::u32::FieldElement2625`), carrying the note:
@@ -855,7 +1108,7 @@ The hypothesis was that because wasm32 has native `i64.mul`/`i64.add`, a `u64`
 is not emulated the way it would be on a real 32-bit ARM, so `bits="64"` might
 win.
 
-### 9.1 Method
+### 10.1 Method
 
 Criterion does not run on wasm32-unknown-unknown. Rather than introduce
 `wasm-pack` and a second set of kernels, the **same** harness crate is compiled
@@ -870,7 +1123,7 @@ Rust source, which is the point.
 
 `node v22.22.2`, `--release` with `lto=true, codegen-units=1, panic=abort`.
 
-### 9.2 Results
+### 10.2 Results
 
 ns per operation, minimum of 15 repetitions:
 
@@ -885,7 +1138,7 @@ ns per operation, minimum of 15 repetitions:
 Run-to-run spread was 2.0% on the `bits=32` `mul_clamped` row and 16.5% on the
 `bits=64` one; the 2.3× gap is two orders of magnitude larger than the noise.
 
-### 9.3 Verdict
+### 10.3 Verdict
 
 **Refused. `curve25519_dalek_bits="64"` is 2.31× slower than the default on
 wasm32**, and the current `build.rs` behaviour is correct.
@@ -908,9 +1161,9 @@ behaviour change: the code path it documents is the one that was already taken.
 
 ---
 
-## 10. The rest of the inventory
+## 11. The rest of the inventory
 
-### 10.1 `pow2k` versus repeated `square`
+### 11.1 `pow2k` versus repeated `square`
 
 Answered in §4. Summary: `pow2k` is used where it should be (only the inversion
 tail needs `k > 1`), its amortization is real on this target — after the change
@@ -923,7 +1176,7 @@ Criterion's `pow2k(k)` ladder after the change (default flags, no forced LTO):
 `pow2k(50)` 739.45 (14.79/sq), `pow2k(100)` 1478 (14.78/sq) — i.e. the
 per-squaring cost flattens by about k = 10.
 
-### 10.2 Cost of the `fiat` backend
+### 11.2 Cost of the `fiat` backend
 
 The formally verified backend was measured as the cheap control on both targets.
 `mul_clamped`, ns, minimum of 15:
@@ -953,7 +1206,7 @@ Two things worth recording for a consumer:
 dedicated routine (15.29 ns, competitive) but its `pow2k` is repeated squaring
 with no amortization (16.65 ns/sq, worse than this crate's 14.09).
 
-### 10.3 Could the vector backend cover the Montgomery ladder?
+### 11.3 Could the vector backend cover the Montgomery ladder?
 
 **Viable, but not worth it for a single X25519, and it is a new backend rather
 than an extension of the existing one.**
@@ -979,8 +1232,8 @@ about.
 There is a related and more tractable gap worth recording, though. The vector
 backend covers `variable_base`, `straus`, `precomputed_straus` and `pippenger`,
 but **not** fixed-base multiplication: `EdwardsPoint::mul_base` is serial in
-every backend. That is 80% of `mul_base_clamped` (§10.4), i.e. of every ephemeral
-key generation. Whether vectorizing it would pay is genuinely unclear — §10.5
+every backend. That is 80% of `mul_base_clamped` (§11.4), i.e. of every ephemeral
+key generation. Whether vectorizing it would pay is genuinely unclear — §11.5
 shows the constant-time window scan, not the point additions, is what dominates
 there, and a scan is a different thing to vectorize than an addition chain — but
 it is the one place where the existing vector backend has an obvious hole on
@@ -993,7 +1246,7 @@ dead backend.
 
 ---
 
-### 10.4 Where `mul_base_clamped` spends its time
+### 11.4 Where `mul_base_clamped` spends its time
 
 The other X25519 operation on a libsignal-style hot path is ephemeral key
 generation, which is `MontgomeryPoint::mul_base_clamped`. It splits cleanly in
@@ -1014,7 +1267,7 @@ The inversion is not doing anything wasteful: `invert` is Fermat, 254 squarings
 and 11 multiplications, and 254 x 14.10 + 11 x 25.36 = 3 860 ns predicts the
 measured 3 766 to within 2.5%. It is optimal *as an exponentiation*.
 
-### 10.5 Bigger basepoint tables do not help, on either target
+### 11.5 Bigger basepoint tables do not help, on either target
 
 `EdwardsPoint::mul_base` uses the 30 KB radix-16 table. The crate also exposes
 radix-32/64/128/256 tables as public API, documented as needing fewer additions
@@ -1047,7 +1300,7 @@ conditional selects to 43 × 32 = 1376, each over a three-field-element
 > once behind a `OnceLock`, outside the timing boundary. The ordering was
 > unaffected; the magnitudes were not. Thanks to CodeRabbit for catching it.
 
-### 10.6 Exact instruction profile, and what it says is left
+### 11.6 Exact instruction profile, and what it says is left
 
 Everything above is wall-clock on a shared virtual machine, which is why the
 minimum over repetitions is the reported statistic. Instruction counts have no
@@ -1094,13 +1347,13 @@ estimate flattered it.
 
 **The constant-time window scan is a fifth of key generation** — 15.0% in
 `conditional_assign` plus 4.8% in `select`, against 6.3% for the point addition
-the scan exists to feed. This is the quantitative version of §10.5: the scan, not
+the scan exists to feed. This is the quantitative version of §11.5: the scan, not
 the addition count, is what dominates fixed-base multiplication, which is why
 larger tables lose.
 
-### 10.7 The ladder is register-pressure bound, not schedule bound
+### 11.7 The ladder is register-pressure bound, not schedule bound
 
-§10.6 shows `differential_add_and_double`'s self cost is 966 instructions per
+§11.6 shows `differential_add_and_double`'s self cost is 966 instructions per
 step while the arithmetic in it accounts for about 820. The rest is register
 pressure: the step holds up to six live field elements — thirty `u64` — against
 sixteen general-purpose registers, so the allocator spills. And the step runs in
@@ -1156,11 +1409,11 @@ what the core already recovers on its own, and there is no cheap way to get more
 **A methodological note worth keeping:** x86-64 instruction count is not a proxy
 for wasm32 time. Attempt 1 removed 1.42% of instructions and lost 1.5% on
 wasm32. The targets run different backends with different liveness and different
-compilers downstream. This is the same caution as §9's `bits="64"` result,
+compilers downstream. This is the same caution as §10's `bits="64"` result,
 reached from the opposite direction, and it is why §6 was accepted on a measured
 wasm32 win rather than on its instruction count.
 
-### 10.8 wasm32: `simd128` is worth 4.6% on DH and 15.7% on key generation
+### 11.8 wasm32: `simd128` is worth 4.6% on DH and 15.7% on key generation
 
 `simd128` is a stable wasm feature, but it is **not** enabled by default for
 `wasm32-unknown-unknown`. Turning it on costs nothing but a flag:
@@ -1186,7 +1439,7 @@ Faster in every paired run for both X25519 operations. The module also gets
 interesting. `fe_mul`, `fe_square` and `fe_invert` are unchanged — LLVM does not
 vectorize the radix-2^25.5 schoolbook, and that is where one might have expected
 a SIMD flag to pay. The gain is entirely in the **constant-time selection
-code**, and §10.6 says exactly why: `AffineNielsPoint::conditional_assign` is 15%
+code**, and §11.6 says exactly why: `AffineNielsPoint::conditional_assign` is 15%
 of key generation and `LookupTable::select` another 4.8%, and a masked select
 over ten 32-bit limbs is the most vectorizable thing in the crate — four lanes
 to a `v128`. That the gain is 15.7% on key generation, which is scan-dominated,
@@ -1207,9 +1460,9 @@ set does not expose. `simd128` shipped in Chrome 91, Firefox 89, Safari 16.4 and
 Node 16, so for most deployments it is free; a consumer targeting older engines
 should check their floor first.
 
-### 10.9 x86_64: `+avx2` vectorizes the same scan, and is complementary to `+bmi2`
+### 11.9 x86_64: `+avx2` vectorizes the same scan, and is complementary to `+bmi2`
 
-The wasm32 result in §10.8 raises the obvious question for the other target: the
+The wasm32 result in §11.8 raises the obvious question for the other target: the
 constant-time window scan is 19.8% of key generation there too, so does x86_64
 already vectorize it?
 
@@ -1256,7 +1509,7 @@ Thanks to Codex for raising it.
 
 Note that the −11.6% instruction reduction becomes −4.4% in time. That is the
 expected direction: the scan streams 30 KB of table and is not purely
-instruction-bound. It is also another instance of the §10.7 caution against
+instruction-bound. It is also another instance of the §11.7 caution against
 reading instruction counts as time.
 
 One caveat that is a deployment decision rather than a measurement, and it
@@ -1279,7 +1532,7 @@ the rest.
 valgrind 3.22 rejects with SIGILL, so the instruction counts above use explicit
 `+avx2` rather than `native`. The timing runs are unaffected.
 
-### 10.10 `mul`'s carry chain: isolated −16%, `mul_clamped` +2%. Refused
+### 11.10 `mul`'s carry chain: isolated −16%, `mul_clamped` +2%. Refused
 
 §7 succeeded by taking a dependency chain off the critical path, so the obvious
 follow-up is the longest chain left in the hottest function. `mul`'s carry
@@ -1326,7 +1579,7 @@ The reason is worth more than the result, because it is the sharpest form of the
 kernel is a serial chain — each multiplication consumes the previous one's
 output — so it is latency-bound, and shortening the carry chain is exactly what
 it wants. The ladder is not.** `differential_add_and_double` has three pairs of
-mutually independent operations (§10.7), so an out-of-order core already overlaps
+mutually independent operations (§11.7), so an out-of-order core already overlaps
 one multiplication's carry chain with the next multiplication's products.
 Latency there is already hidden; the extra carry is not. The same intervention
 is therefore worth −16% in one place and +2% in the other.
@@ -1339,7 +1592,7 @@ number.
 
 Not implemented; the working tree was reverted to the serial chain.
 
-### 10.11 What is left, and why it was not attempted
+### 11.11 What is left, and why it was not attempted
 
 
 
@@ -1361,11 +1614,11 @@ checks say so:
   (4M) = 7M, which is the standard cost for a mixed addition against
   Niels-form precomputed points. 64 × 7 × 25.36 ns = 11.4 µs against a measured
   15.0 µs for `mul_base`, the remainder being the constant-time window scan and
-  the four doublings — consistent with §10.5, where the scan is what makes the
+  the four doublings — consistent with §11.5, where the scan is what makes the
   larger tables lose.
 
 The one substantial remaining lever is the **field inversion**: 3 766 ns on
-x86_64 and 9 280 ns on wasm32, which §10.6 pins down exactly as 5.3% of a
+x86_64 and 9 280 ns on wasm32, which §11.6 pins down exactly as 5.3% of a
 `mul_clamped`'s instructions and about 20% of a `mul_base_clamped`'s. Fermat's little theorem is optimal as an exponentiation, but
 it is not the only algorithm: a constant-time binary GCD in the style of
 Bernstein–Yang "safegcd" typically runs 2–4x faster than Fermat for a 255-bit
@@ -1414,7 +1667,7 @@ the trade can be re-made by someone who wants it.
 
 ---
 
-## 11. Validation
+## 12. Validation
 
 * **Full test suite**, `--all-features`, on every backend path — with and
   without the new cfg, since a path only tested when enabled is not tested:
@@ -1484,6 +1737,22 @@ the trade can be re-made by someone who wants it.
     `mul121666` or `mul`. This is what would catch the two being wrong the same
     way.
 
+* **Ed25519 reference vectors.** `window.rs` changed, and `LookupTable` is what
+  every fixed-base multiplication selects from, so `ed25519-dalek`'s
+  `against_reference_implementation` was run explicitly: the 128 vectors of
+  `sign.input` from `ed25519.cr.yp.to`, sign and verify, all pass. Its full suite
+  passes too, `--all-features` included, as does the `ed25519ph` RFC 8032
+  prehash vector.
+
+* **Batched table construction** (`src/window.rs`, `mod test`), three tests
+  described in §9.3: `batched_lookup_table_matches_reference` against a verbatim
+  copy of the pre-batch construction over 32 base points and all three
+  coordinates of all eight entries, `batched_lookup_table_handles_identity`, and
+  `created_table_agrees_with_precomputed`. The comparison is on canonical bytes
+  rather than limbs, because Montgomery's trick returns a different
+  weakly-reduced representative; §9.3 says why that is the strongest true
+  statement here.
+
 * **RFC 7748 known-answer tests.** `montgomery.rs` changed, so the ladder's own
   vectors were run from the dependent crate: `x25519-dalek`'s
   `rfc7748_ladder_test1_vectorset1`/`vectorset2` and the four
@@ -1539,9 +1808,9 @@ the trade can be re-made by someone who wants it.
 
 ---
 
-## 12. Summary
+## 13. Summary
 
-### 12.1 The whole branch, certified against `origin/main`
+### 13.1 The whole branch, certified against `origin/main`
 
 §6.4 certified §4+§5+§6 when those were all there was. With §7 and §8 landed,
 the cumulative claim was re-measured the same way and end to end: `origin/main`
@@ -1571,21 +1840,25 @@ alternating pair. And the `lto=fat` rows improve far more than the `lto=off`
 rows for the reason §4 gives: only fat LTO inlines the ladder's squaring into
 the step, which is what makes §4 and §7 pay.
 
-### 12.2 Front by front
+### 13.2 Front by front
 
 | front | outcome |
 | --- | --- |
 | **A — ADX/BMI2 asm on x86_64** | **Refused.** LLVM emits all 25/25 and 15/15 available `mulx` under `+bmi2`; `adcx`/`adox` have no second carry chain to run in a 5×51 two-word accumulator, and their payoff belongs to a 4×64 saturated layout that is out of scope. Calibration: an intervention giving isolated `mul` −30% moved `mul_clamped` by 0.5%. |
-| **wasm32 `+simd128` (no code)** | `-C target-feature=+simd128` is worth **−4.6%** on `mul_clamped` and **−15.7%** on `mul_base_clamped`, and shrinks the module. Not on by default for `wasm32-unknown-unknown`. The field arithmetic does not vectorize; the whole gain is in the constant-time selection code (§10.8). |
-| **A′ — build flags (no code)** | `+bmi2` moves the ladder (`mulx`), `+avx2` moves key generation (it halves the constant-time scan); together **−9.2%** on `mul_clamped` and **−6.0%** on `mul_base_clamped`, and with fat LTO ~−31% against stock `main`. **`+adx` was dropped from the recommendation**: identical instruction mix with and without it (882 `mulx`, 0 `adcx`, 0 `adox` either way), indistinguishable times, and it costs a CPU generation. Deployment findings for consumers (§10.9). |
+| **wasm32 `+simd128` (no code)** | `-C target-feature=+simd128` is worth **−4.6%** on `mul_clamped` and **−15.7%** on `mul_base_clamped`, and shrinks the module. Not on by default for `wasm32-unknown-unknown`. The field arithmetic does not vectorize; the whole gain is in the constant-time selection code (§11.8). |
+| **A′ — build flags (no code)** | `+bmi2` moves the ladder (`mulx`), `+avx2` moves key generation (it halves the constant-time scan); together **−9.2%** on `mul_clamped` and **−6.0%** on `mul_base_clamped`, and with fat LTO ~−31% against stock `main`. **`+adx` was dropped from the recommendation**: identical instruction mix with and without it (882 `mulx`, 0 `adcx`, 0 `adox` either way), indistinguishable times, and it costs a CPU generation. Deployment findings for consumers (§11.9). |
 | **B — wasm32 `bits="64"`** | **Refused.** 2.31× slower than the current default. wasm has no 64×64→128 multiply, so `u128` products are emulated. `build.rs`'s `TODO(Wasm32)` closed with evidence; behaviour unchanged. |
 | **C — `square` via `pow2k(1)`** | **Changed.** `mul_clamped` −3.5% on a stock release build, −21.9% with fat LTO, −23.5% with fat LTO and `+adx,+bmi2`. Bit-for-bit identical output, no `unsafe`, no representation change, no API change, `serial::u32`/`fiat` untouched. |
 | **D — ladder's multiply by 121666** | **Changed.** A specialized `mul121666` (fiat's verified `carry_scmul_121666` on the fiat backends) replaces a general multiplication whose operand had four zero limbs. Isolated 2.5x cheaper on x86_64, 3.8x on wasm32. `mul_clamped` −6.0% on a stock release build and −7.0% on wasm32; nothing under fat LTO, where the inliner already folded it. Complementary to C: between them every build profile improves. |
 | **E — ladder's conditional swap** | **Changed.** `ProjectivePoint` inherited `subtle`'s default `conditional_swap` — a struct copy plus two conditional assignments — instead of forwarding to the masked exchange every field backend already implements. The ladder driver drops from 324 to 294 instructions per iteration. wasm32 **−2.2%** across five paired runs; on x86_64 the 0.6% difference is below a 2.5% noise floor measured from identical binaries. |
 | **F — squaring's 128-bit doublings** | **Changed.** `square_limbs` doubled five 128-bit coefficients; `2*(x*y) == (2*x)*y`, so four precomputed 64-bit doublings cover all ten mirror-pair products instead — which is what `serial::u32` has always done. Isolated `fe_square` **−5.4%** (7/7 paired runs) and **−10.5%** with `+bmi2`; `mul_clamped` **−2.2%** with `+bmi2`, −0.7% stock; `fe_invert` −5.8%. The time win is several times the −1.29% instruction win because the 128-bit shift was on the dependency chain (§7). Bit-for-bit identical; wasm32 module byte-identical. |
 | **G — the ladder's subtractions** | **Changed.** `Sub` adds `16p` and must then `reduce`, because it has to accept anything at the crate-wide `b < 3`. The ladder's four subtractions all take `mul`/`square` outputs, which are far narrower, so a separate `sub_unreduced` offsets by `2p` and needs no reduction — a new operation with its own stated precondition, not a change to `Sub`'s contract. `mul_clamped` **−6.1%** on baseline `x86-64` and **−3.7%** with `+avx2,+bmi2`, 3/3 paired runs each, −6.58% instructions; `mul_base_clamped` unchanged. Not limb-for-limb identical — a different representative — so it is checked on field equality, the limb bound, debug-assertions across the whole suite, and the 1000-iteration RFC 7748 ladder vector. `serial::u32` forwards to `Sub`: the same bound closes there with only 0.167 bits of margin against a silent `u32` overflow (§8.4). |
-| **Combined C + D + E** | Superseded by the whole-branch certification in §12.1; kept because it is the only figure isolating these three. Certified against `origin/main` in one alternating session (§6.4) — F and G are *not* in it: x86_64 stock release **−9.7%**, stock + `+adx,+bmi2` **−10.0%**, fat LTO **−25.0%**, fat LTO + `+adx,+bmi2` **−25.3%**; wasm32 **−8.8%**. `mul_base_clamped` unchanged in every cell. |
+| **H — batching the affine table conversions** | **Changed.** `LookupTable<AffineNielsPoint>::from` converted eight multiples one at a time, one field inversion each, so `EdwardsBasepointTable::create` did **256** — 91% of its cost. The chain depends on the previous multiple's *value*, not its affine form, so it runs in extended coordinates and converts all eight at the end with Montgomery's trick. `create` **−76.1% (4.19×)**, 3/3 paired runs, −70.2% instructions. Both hot paths unchanged: the crate ships its table as a constant. Not limb-for-limb identical — the batch returns a different weakly-reduced representative — so it is checked on canonical bytes against a verbatim copy of the old code, on the identity, and against the precomputed table (§9.3). |
+| **Batching verification's inversions** | **Refused: there is nothing to batch.** An Ed25519 verification performs **exactly one** field inversion, in `compress`; the vector table build and the wNAF loop perform none, and the vector backend contains no runtime `invert` at all. The profile's sixteen `as_affine` cannot be in verification, and cannot be sixteen X25519 operations either — that would be four times the whole message's cycle budget (§9.2). |
+| **safegcd, second look** | **Refused again.** Worth more here than in §11.11 — 10.0% of a verification, ~4% of the group client — but a 2–4× inversion caps the win at 2–3% of the client, while the crate's *existing* batch inversion is worth 6–10× wherever inversions co-occur. It also cannot be the variable-time kind, because `compress` is shared with secret-derived callers (§9.5). |
+| **wNAF width / vartime tables** | **Refused analytically.** §11.5's rejection does *not* transfer — `NafLookupTable5::select` is a direct index, not a constant-time scan — but width 5 is already the minimum of build-plus-loop additions (49.7 against 51.6 at width 6), and the build is only 5.0% of a verification (§9.6). |
+| **Combined C + D + E** | Superseded by the whole-branch certification in §13.1; kept because it is the only figure isolating these three. Certified against `origin/main` in one alternating session (§6.4) — F and G are *not* in it: x86_64 stock release **−9.7%**, stock + `+adx,+bmi2` **−10.0%**, fat LTO **−25.0%**, fat LTO + `+adx,+bmi2` **−25.3%**; wasm32 **−8.8%**. `mul_base_clamped` unchanged in every cell. |
 | **Vector backend for Montgomery** | Viable but not worthwhile for single exchanges; the win would require a batched multi-exchange API. Not implemented. |
 | **Bigger basepoint tables** | **Measured and rejected.** radix-32 is a wash against the default radix-16 (+0.9% x86_64, +1.4% wasm32) for twice the table size; radix-64 is +13.6% and +20.0% for four times. The constant-time window scan grows faster than the addition count falls. The crate's default is already right. |
-| **Exploiting the ladder's spare ILP** | **Three attempts, all measured and reverted (§10.7).** Rescheduling the step removes 1.42% of x86-64 instructions but is 1.5% *slower* on wasm32; fusing the three independent operation pairs into single function bodies is +1.0% instructions, noise on x86_64 and 3.6% slower on wasm32; inlining `mul` gives −29.5% isolated and −0.5% end to end. All three add live values, and the step already spills — it is register-pressure bound, not schedule bound. |
+| **Exploiting the ladder's spare ILP** | **Three attempts, all measured and reverted (§11.7).** Rescheduling the step removes 1.42% of x86-64 instructions but is 1.5% *slower* on wasm32; fusing the three independent operation pairs into single function bodies is +1.0% instructions, noise on x86_64 and 3.6% slower on wasm32; inlining `mul` gives −29.5% isolated and −0.5% end to end. All three add live values, and the step already spills — it is register-pressure bound, not schedule bound. |
 | **Faster field inversion (safegcd)** | **Not attempted.** The top remaining lever — the inversion is 8% of `mul_clamped` and 20% of `mul_base_clamped`, and a constant-time binary GCD would plausibly be 2–4x faster than Fermat. Deferred because its constant-time property is global to the iteration rather than local, unlike the two changes above, which are bit-for-bit verifiable against the code they replace. |

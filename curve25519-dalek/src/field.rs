@@ -234,9 +234,13 @@ impl FieldElement {
     ///
     /// When an input `FieldElement` is zero, its value is unchanged.
     ///
+    /// `pub(crate)` rather than private so that callers with a compile-time
+    /// known batch size can supply a fixed-size array as scratch and stay
+    /// `no_std`-friendly; `invert_batch_alloc` above is the `alloc` version.
+    ///
     /// # Panics
     /// Panics when `scratch.len() != inputs.len()`
-    fn internal_invert_batch(inputs: &mut [FieldElement], scratch: &mut [FieldElement]) {
+    pub(crate) fn internal_invert_batch(inputs: &mut [FieldElement], scratch: &mut [FieldElement]) {
         // Montgomery’s Trick and Fast Implementation of Masked AES
         // Genelle, Prouff and Quisquater
         // Section 3.2

@@ -25,6 +25,12 @@ curve25519-dalek = { path = "../..", default-features = false, features = [
     "precomputed-tables",
     "zeroize",
 ] }
+# For the Ed25519 signature-verification kernel. `verify` is the operation the
+# group-messaging profile is dominated by, and it is the only hot path in this
+# workspace that reaches the vector backend, so it needs to be measurable here.
+# Bench-only: this crate is `publish = false` and is not a dependency of
+# `curve25519-dalek`.
+ed25519-dalek = { path = "../../../ed25519-dalek", default-features = false }
 
 [patch.crates-io]
 curve25519-dalek-derive = { path = "../../../curve25519-dalek-derive" }

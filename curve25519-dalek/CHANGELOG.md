@@ -35,6 +35,17 @@ major series.
   `mul_base_clamped` is unchanged. The result is congruent to but not
   limb-for-limb equal to `Sub`'s, so it is checked on field equality, on the
   limb bound, and against the RFC 7748 iterated-ladder vector.
+* Perf: `EdwardsBasepointTable::create` is about 4x faster. Building a
+  `LookupTable<AffineNielsPoint>` converted its eight multiples to affine one at
+  a time, paying a field inversion for each, so creating a basepoint table did
+  256 inversions — 91% of its cost. The multiples depend on each other's value,
+  not on their affine form, so the chain now runs in extended coordinates and all
+  eight conversions share a single inversion via Montgomery's trick. Table
+  creation improves 76%; the crate's own hot paths are unchanged, since it ships
+  its basepoint table as a constant. Uses a fixed-size batch, so it needs no
+  `alloc`. The batch returns a different weakly-reduced representative than
+  `invert` does, so the result is equal as a field element but not limb for limb;
+  it is tested against the previous construction on canonical bytes.
 * Perf: together, the five X25519 changes listed here take `mul_clamped` down
   **10.1%** in a stock `cargo --release` build, **28.7%** with fat LTO and
   **30.3%** with fat LTO plus `-C target-feature=+avx2,+bmi2`, and **9.5%** on
