@@ -1541,6 +1541,38 @@ the trade can be re-made by someone who wants it.
 
 ## 12. Summary
 
+### 12.1 The whole branch, certified against `origin/main`
+
+§6.4 certified §4+§5+§6 when those were all there was. With §7 and §8 landed,
+the cumulative claim was re-measured the same way and end to end: `origin/main`
+checked out into a second worktree, the same harness copied in, both trees
+measured **in one session, alternating, on the same pinned core**. Minimum of 15
+repetitions, three alternating rounds; `mul_clamped` in ns.
+
+| profile | `origin/main` | this branch | change | paired wins |
+| --- | ---: | ---: | ---: | :---: |
+| x86_64, `lto=off`, `cgu=16` (cargo `--release` default) | 54 815 | **49 306** | **−10.1%** | 3/3 |
+| x86_64, `lto=off`, `cgu=16`, `+avx2,+bmi2` | 54 037 | 48 967 | −9.4% | 3/3 |
+| x86_64, `lto=fat`, `cgu=1` | 56 428 | **40 234** | **−28.7%** | 3/3 |
+| x86_64, `lto=fat`, `cgu=1`, `+avx2,+bmi2` | 53 388 | **37 235** | **−30.3%** | 3/3 |
+| wasm32, `serial::u32` | 137 213 | **124 191** | **−9.5%** | 3/3 |
+
+`mul_base_clamped` over the same runs: 17 870 → 17 573, 17 021 → 16 620,
+16 872 → 16 393, 15 694 → 15 510, and on wasm32 49 317 → 49 331. So key
+generation is now slightly *better* rather than flat — between 1% and 3% on
+x86_64 — which is §7 reaching the field inversion in `to_montgomery`; nothing
+here touches the fixed-base path itself.
+
+Two notes on reading this table. The `origin/main` column varies by about 6%
+across profiles measured minutes apart on the same host, which is the honest
+size of the run-to-run environment on a shared virtual machine and the reason
+every figure in this document is a minimum over repetitions taken from an
+alternating pair. And the `lto=fat` rows improve far more than the `lto=off`
+rows for the reason §4 gives: only fat LTO inlines the ladder's squaring into
+the step, which is what makes §4 and §7 pay.
+
+### 12.2 Front by front
+
 | front | outcome |
 | --- | --- |
 | **A — ADX/BMI2 asm on x86_64** | **Refused.** LLVM emits all 25/25 and 15/15 available `mulx` under `+bmi2`; `adcx`/`adox` have no second carry chain to run in a 5×51 two-word accumulator, and their payoff belongs to a 4×64 saturated layout that is out of scope. Calibration: an intervention giving isolated `mul` −30% moved `mul_clamped` by 0.5%. |
@@ -1552,7 +1584,7 @@ the trade can be re-made by someone who wants it.
 | **E — ladder's conditional swap** | **Changed.** `ProjectivePoint` inherited `subtle`'s default `conditional_swap` — a struct copy plus two conditional assignments — instead of forwarding to the masked exchange every field backend already implements. The ladder driver drops from 324 to 294 instructions per iteration. wasm32 **−2.2%** across five paired runs; on x86_64 the 0.6% difference is below a 2.5% noise floor measured from identical binaries. |
 | **F — squaring's 128-bit doublings** | **Changed.** `square_limbs` doubled five 128-bit coefficients; `2*(x*y) == (2*x)*y`, so four precomputed 64-bit doublings cover all ten mirror-pair products instead — which is what `serial::u32` has always done. Isolated `fe_square` **−5.4%** (7/7 paired runs) and **−10.5%** with `+bmi2`; `mul_clamped` **−2.2%** with `+bmi2`, −0.7% stock; `fe_invert` −5.8%. The time win is several times the −1.29% instruction win because the 128-bit shift was on the dependency chain (§7). Bit-for-bit identical; wasm32 module byte-identical. |
 | **G — the ladder's subtractions** | **Changed.** `Sub` adds `16p` and must then `reduce`, because it has to accept anything at the crate-wide `b < 3`. The ladder's four subtractions all take `mul`/`square` outputs, which are far narrower, so a separate `sub_unreduced` offsets by `2p` and needs no reduction — a new operation with its own stated precondition, not a change to `Sub`'s contract. `mul_clamped` **−6.1%** on baseline `x86-64` and **−3.7%** with `+avx2,+bmi2`, 3/3 paired runs each, −6.58% instructions; `mul_base_clamped` unchanged. Not limb-for-limb identical — a different representative — so it is checked on field equality, the limb bound, debug-assertions across the whole suite, and the 1000-iteration RFC 7748 ladder vector. `serial::u32` forwards to `Sub`: the same bound closes there with only 0.167 bits of margin against a silent `u32` overflow (§8.4). |
-| **Combined C + D + E** | Certified against `origin/main` in one alternating session (§6.4) — **F is not in this figure**; it was measured separately on top of this state, so the two compose: x86_64 stock release **−9.7%**, stock + `+adx,+bmi2` **−10.0%**, fat LTO **−25.0%**, fat LTO + `+adx,+bmi2` **−25.3%**; wasm32 **−8.8%**. `mul_base_clamped` unchanged in every cell. |
+| **Combined C + D + E** | Superseded by the whole-branch certification in §12.1; kept because it is the only figure isolating these three. Certified against `origin/main` in one alternating session (§6.4) — F and G are *not* in it: x86_64 stock release **−9.7%**, stock + `+adx,+bmi2` **−10.0%**, fat LTO **−25.0%**, fat LTO + `+adx,+bmi2` **−25.3%**; wasm32 **−8.8%**. `mul_base_clamped` unchanged in every cell. |
 | **Vector backend for Montgomery** | Viable but not worthwhile for single exchanges; the win would require a batched multi-exchange API. Not implemented. |
 | **Bigger basepoint tables** | **Measured and rejected.** radix-32 is a wash against the default radix-16 (+0.9% x86_64, +1.4% wasm32) for twice the table size; radix-64 is +13.6% and +20.0% for four times. The constant-time window scan grows faster than the addition count falls. The crate's default is already right. |
 | **Exploiting the ladder's spare ILP** | **Three attempts, all measured and reverted (§10.7).** Rescheduling the step removes 1.42% of x86-64 instructions but is 1.5% *slower* on wasm32; fusing the three independent operation pairs into single function bodies is +1.0% instructions, noise on x86_64 and 3.6% slower on wasm32; inlining `mul` gives −29.5% isolated and −0.5% end to end. All three add live values, and the step already spills — it is register-pressure bound, not schedule bound. |

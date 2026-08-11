@@ -302,8 +302,8 @@ Use these flags when you control where the binary runs; otherwise keep
 `lto = "fat"`, which costs nothing in portability.
 
 Measured on an Intel Cascade Lake, `MontgomeryPoint::mul_clamped` goes from
-58.8 µs on a stock `cargo build --release` to 40.8 µs with both — **about a
-third faster** — and `mul_base_clamped` gains a further 6% on top. LTO is the
+49.3 µs on a stock `cargo build --release` to 37.2 µs with both — **about a
+quarter faster** — and `mul_base_clamped` gains a further 6% on top. LTO is the
 larger half: the Montgomery ladder's squaring is worth inlining into the ladder
 step, and only fat LTO chooses to do it. The `+bmi2` half is what lets LLVM emit
 `mulx` instead of `mulq`; without it the baseline `x86-64` target has no BMI2

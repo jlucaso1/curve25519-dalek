@@ -35,13 +35,13 @@ major series.
   `mul_base_clamped` is unchanged. The result is congruent to but not
   limb-for-limb equal to `Sub`'s, so it is checked on field equality, on the
   limb bound, and against the RFC 7748 iterated-ladder vector.
-* Perf: together, the `pow2k`, `mul121666` and conditional-swap changes listed
-  here take `mul_clamped` down 9.7% in a stock `cargo --release` build, 25.0%
-  with fat LTO, and 8.8% on wasm32, measured against the base branch in one
-  alternating session on the same pinned core. `mul_base_clamped` is unchanged.
-  This figure does not include the squaring-doubling change above, which was
-  measured separately on top of it. See `docs/perf-x25519-field-arithmetic.md`
-  section 6.4.
+* Perf: together, the five X25519 changes listed here take `mul_clamped` down
+  **10.1%** in a stock `cargo --release` build, **28.7%** with fat LTO and
+  **30.3%** with fat LTO plus `-C target-feature=+avx2,+bmi2`, and **9.5%** on
+  wasm32. Measured against the base branch in one alternating session on the
+  same pinned core, minimum of 15 repetitions, winning all three paired rounds
+  in every profile. `mul_base_clamped` improves 1-3% on x86_64 and is unchanged
+  on wasm32. See `docs/perf-x25519-field-arithmetic.md` section 12.1.
 * Perf: the Montgomery ladder's multiplication by `(A+2)/4 = 121666` no longer
   goes through the general field multiplication, whose second operand had four
   zero limbs. Each backend gains a `mul121666`; the fiat backends use
