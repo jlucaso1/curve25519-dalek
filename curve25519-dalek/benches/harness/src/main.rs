@@ -16,9 +16,7 @@
 
 use std::time::Instant;
 
-use x25519_field_harness::{
-    HAS_FIELD_KERNELS, HAS_VECTOR_KERNELS, KERNELS, config_code_impl, run_kernel,
-};
+use x25519_field_harness::{HAS_FIELD_KERNELS, KERNELS, config_code_impl, run_kernel};
 
 /// Target wall time for a single repetition, in nanoseconds. Long enough to
 /// dwarf the timer's resolution, short enough that a scheduling hiccup lands in
@@ -62,9 +60,7 @@ fn main() {
     println!("kernel\titers\treps\tmin_ns_op\tmed_ns_op\tmax_ns_op\tspread_pct");
 
     for &(which, name, ops_per_iter) in KERNELS {
-        if (!HAS_FIELD_KERNELS && name.starts_with("fe_"))
-            || (!HAS_VECTOR_KERNELS && name.starts_with("vec_"))
-        {
+        if !HAS_FIELD_KERNELS && name.starts_with("fe_") {
             println!("{name}\t-\t-\tunavailable\t-\t-\t-");
             continue;
         }

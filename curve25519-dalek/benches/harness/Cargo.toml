@@ -52,7 +52,4 @@ panic = "abort"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
-check-cfg = [
-    'cfg(curve25519_dalek_bench_internals)',
-    'cfg(curve25519_dalek_backend, values("simd"))',
-]
+check-cfg = ['cfg(curve25519_dalek_bench_internals)']

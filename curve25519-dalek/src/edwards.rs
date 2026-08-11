@@ -923,7 +923,7 @@ impl EdwardsPoint {
 
         #[cfg(feature = "precomputed-tables")]
         {
-            scalar * constants::ED25519_BASEPOINT_TABLE
+            crate::backend::mul_base(scalar)
         }
     }
 

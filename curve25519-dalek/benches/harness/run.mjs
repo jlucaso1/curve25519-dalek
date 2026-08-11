@@ -118,8 +118,7 @@ function calibrate(which) {
 }
 
 for (const [which, name, opsPerIter] of KERNELS) {
-  // `vec_*` needs the AVX2 backend, which wasm32 cannot have.
-  if ((!hasFieldKernels && name.startsWith("fe_")) || name.startsWith("vec_")) {
+  if (!hasFieldKernels && name.startsWith("fe_")) {
     console.log(`${name}\t-\t-\tunavailable\t-\t-\t-`);
     continue;
   }
