@@ -1997,6 +1997,29 @@ so the trade could be re-made — and one of them since has been.
 
 ## 14. Validation
 
+* **A 12-cell feature x backend matrix, under `-D warnings`.** Three feature
+  sets (default, `--no-default-features --features alloc`, `--all-features`)
+  against four backend selections (default, `serial`, `fiat`, `bits="32"`), plus
+  `+avx2` and `no_std` thumbv7em builds of all three crates.
+
+  **That matrix exists because this class of bug has now bitten three times, and
+  the third time it was the same mistake as the first.** §11.4 was green locally
+  and broke seven CI jobs on dead code: `select_or` is called only by the
+  basepoint tables, which are `precomputed-tables`-gated, so with that feature
+  off nothing referenced it and `-D warnings` promoted the dead-code warning to
+  an error. Every local run had the feature on — which is verbatim what change 6
+  did, and the note written after change 6, quoted just below, was correct and
+  got ignored.
+
+  A subtler variant hid in the same fix: the local command was `cargo test`,
+  CI's is effectively `cargo test` under `-D warnings`, so a duplicated
+  `use super::*;` was invisible here and fatal there. **Match CI's strictness,
+  not only its targets.** The widened matrix also caught a wart of this branch's
+  own making: after change 2 moved the ladder off `APLUS2_OVER_FOUR`, the
+  constant's only surviving reference was a test in `serial/u64/field.rs`, which
+  the `fiat` build does not compile — dead there, and tolerated only because
+  CI's `fiat` job does not pass `-D warnings`. Its `cfg` is now precise.
+
 * **Full test suite**, `--all-features`, on every backend path — with and
   without the new cfg, since a path only tested when enabled is not tested:
 
