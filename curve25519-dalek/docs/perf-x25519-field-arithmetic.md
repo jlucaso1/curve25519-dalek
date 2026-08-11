@@ -94,7 +94,7 @@ therefore corroborated, and it is what turns "25% of the client in `mul`" into
 
 **Host** (a shared 4-vCPU KVM guest, *not* the Zen 4 of the motivating profile):
 
-```
+```text
 Architecture:   x86_64
 Vendor ID:      GenuineIntel
 Model name:     Intel(R) Xeon(R) Processor @ 2.80GHz
@@ -390,7 +390,7 @@ should set `lto = "fat"` and `-C target-feature=+bmi2`: together those take
 `build.rs` picks `curve25519_dalek_bits` from `target_pointer_width`, so wasm32
 gets `DalekBits::Dalek32` (`serial::u32::FieldElement2625`), carrying the note:
 
-```
+```rust
 //TODO(Wasm32): Needs tests + benchmarks to back this up
 ```
 

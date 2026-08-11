@@ -55,8 +55,10 @@ mod x25519_benches {
             b.iter(|| black_box(point).mul_clamped(black_box(s)))
         });
 
-        // Fixed-base: goes through EdwardsPoint::mul_base, so on x86_64 this
-        // one *does* reach the vectorized backend, and then converts.
+        // Fixed-base: goes through EdwardsPoint::mul_base, which uses the
+        // *serial* EdwardsBasepointTable, and then converts. So this does not
+        // reach the vector backend either: measured, `backend="serial"` and
+        // `backend="simd"` give the same number here.
         g.bench_function("MontgomeryPoint::mul_base_clamped", |b| {
             let s = scalar_bytes(2);
             b.iter(|| MontgomeryPoint::mul_base_clamped(black_box(s)))

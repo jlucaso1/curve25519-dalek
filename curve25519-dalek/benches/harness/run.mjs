@@ -26,11 +26,20 @@ const KERNELS = [
 const TARGET_NS = 20_000_000n;
 
 const path = process.argv[2];
-const reps = Number(process.argv[3] ?? 15);
 if (!path) {
   console.error("usage: node run.mjs <module.wasm> [reps]");
   process.exit(2);
 }
+
+// Mirror the native driver's parsing (src/main.rs): a u32, falling back to 15
+// on anything unparseable, and never fewer than 3 repetitions. Without the
+// floor, `reps < 1` would leave `samples` empty and the reporting below would
+// read `undefined`.
+const repsArg = process.argv[3] ?? "15";
+const reps =
+  /^\d+$/.test(repsArg) && Number(repsArg) <= 0xffff_ffff
+    ? Math.max(3, Number(repsArg))
+    : 15;
 
 const bytes = await readFile(path);
 const { instance } = await WebAssembly.instantiate(bytes, {});
