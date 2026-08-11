@@ -26,6 +26,13 @@ major series.
   fiat-crypto's own verified `carry_scmul_121666`. X25519 `mul_clamped` improves
   by ~6% in a stock release build and ~7-8.5% on wasm32, with bit-for-bit
   identical output on the hand-written backends.
+* Perf: `ProjectivePoint` now implements `ConditionallySelectable::conditional_swap`
+  and `conditional_assign` by forwarding to the field element's own masked
+  exchange, instead of inheriting `subtle`'s default (a struct copy plus two
+  conditional assignments). The Montgomery ladder performs this swap once per
+  scalar bit; the ladder driver drops from 324 to 294 instructions per
+  iteration, worth ~2.2% of X25519 on wasm32 and below the noise floor on
+  x86_64.
 * Docs: `docs/perf-x25519-field-arithmetic.md` records a measurement pass over
   the X25519 field arithmetic on x86_64 (ADX/BMI2) and wasm32, including why an
   ADX assembly path was not added and why wasm32 keeps the 32-bit backend. This

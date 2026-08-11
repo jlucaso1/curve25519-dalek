@@ -449,7 +449,7 @@ place of the general multiplication:
   backends get a verified fast path rather than hand-written arithmetic.
 
 Both hand-written versions are bit-for-bit identical to the general
-multiplication by construction, and the differential tests in §8 check it.
+multiplication by construction, and the differential tests in §9 check it.
 `APLUS2_OVER_FOUR` is now `#[cfg(test)]`: the only remaining use is the test
 that compares the two against each other.
 
@@ -528,7 +528,79 @@ statistic: it needs one clean repetition, not a clean run.
 
 ---
 
-## 6. Front B — wasm32 with 64-bit limbs: **refused**
+## 6. Third change: the ladder's conditional swap
+
+### 6.1 The observation
+
+`mul_bits_be` conditionally swaps its two working points once per scalar bit —
+256 times per `mul_clamped`, and the swap must be constant time, so it is a
+masked exchange rather than a branch.
+
+Every field backend implements `ConditionallySelectable::conditional_swap`
+directly, as a masked exchange of the limbs. `ProjectivePoint`, which is two
+field elements, implemented only `conditional_select`, so it inherited
+`subtle`'s default:
+
+```rust
+fn conditional_swap(a: &mut Self, b: &mut Self, choice: Choice) {
+    let t: Self = *a;
+    a.conditional_assign(&b, choice);
+    b.conditional_assign(&t, choice);
+}
+```
+
+That is a whole-struct copy plus two conditional assignments — twice the
+per-limb work of the exchange the backends already provide, for the one
+operation the ladder performs on every single bit. It reads like an oversight
+rather than a decision: `FieldElement51` has the override, `ProjectivePoint`
+was the type that did not.
+
+### 6.2 The change
+
+Forward `conditional_swap` and `conditional_assign` to the field element's own
+implementations. Eight lines, no arithmetic touched, and the constant-time
+property is unchanged — a masked exchange is what it was before and what it is
+now, only once instead of twice.
+
+### 6.3 Results
+
+The instruction count is the noise-free part of the evidence. The ladder driver
+(`<&Scalar as Mul<&MontgomeryPoint>>::mul`, which is where `mul_bits_be` and its
+255-iteration loop end up):
+
+| | instructions |
+| --- | ---: |
+| before | 324 |
+| after | **294** |
+
+Thirty fewer per iteration.
+
+End to end, the two targets disagree, and the disagreement is the interesting
+part:
+
+| target | before | after | change |
+| --- | ---: | ---: | ---: |
+| x86_64, `lto=fat` | 46 249 | 45 987 | −0.6%, **not resolvable** |
+| wasm32, `serial::u32` | 138 228 | **135 217** | **−2.2%**, 5/5 paired runs |
+
+On x86_64 the difference is below the measurement floor. That floor was
+established directly rather than guessed: two *identical* binaries measured
+alternately four times varied by 2.5% in their minima, so a 0.6% difference on
+this host means nothing. Thirty instructions removed from a loop whose critical
+path is a chain of dependent field multiplications is work a wide
+out-of-order core absorbs.
+
+On wasm32 it shows up: five alternating paired runs, `with` faster in every one,
+best-of-five −2.2%. `mul_base_clamped` is unchanged there (51 836 → 52 166,
+52 124 → 51 151), which is the expected control — it does not use the ladder.
+
+Kept on that basis: a measured gain on one target this fork's consumer ships to,
+no regression on the other, and it brings `ProjectivePoint` in line with what
+every field backend already does.
+
+---
+
+## 7. Front B — wasm32 with 64-bit limbs: **refused**
 
 `build.rs` picks `curve25519_dalek_bits` from `target_pointer_width`, so wasm32
 gets `DalekBits::Dalek32` (`serial::u32::FieldElement2625`), carrying the note:
@@ -541,7 +613,7 @@ The hypothesis was that because wasm32 has native `i64.mul`/`i64.add`, a `u64`
 is not emulated the way it would be on a real 32-bit ARM, so `bits="64"` might
 win.
 
-### 6.1 Method
+### 7.1 Method
 
 Criterion does not run on wasm32-unknown-unknown. Rather than introduce
 `wasm-pack` and a second set of kernels, the **same** harness crate is compiled
@@ -556,7 +628,7 @@ Rust source, which is the point.
 
 `node v22.22.2`, `--release` with `lto=true, codegen-units=1, panic=abort`.
 
-### 6.2 Results
+### 7.2 Results
 
 ns per operation, minimum of 15 repetitions:
 
@@ -571,7 +643,7 @@ ns per operation, minimum of 15 repetitions:
 Run-to-run spread was 2.0% on the `bits=32` `mul_clamped` row and 16.5% on the
 `bits=64` one; the 2.3× gap is two orders of magnitude larger than the noise.
 
-### 6.3 Verdict
+### 7.3 Verdict
 
 **Refused. `curve25519_dalek_bits="64"` is 2.31× slower than the default on
 wasm32**, and the current `build.rs` behaviour is correct.
@@ -594,9 +666,9 @@ behaviour change: the code path it documents is the one that was already taken.
 
 ---
 
-## 7. The rest of the inventory
+## 8. The rest of the inventory
 
-### 7.1 `pow2k` versus repeated `square`
+### 8.1 `pow2k` versus repeated `square`
 
 Answered in §4. Summary: `pow2k` is used where it should be (only the inversion
 tail needs `k > 1`), its amortization is real on this target — after the change
@@ -609,7 +681,7 @@ Criterion's `pow2k(k)` ladder after the change (default flags, no forced LTO):
 `pow2k(50)` 739.45 (14.79/sq), `pow2k(100)` 1478 (14.78/sq) — i.e. the
 per-squaring cost flattens by about k = 10.
 
-### 7.2 Cost of the `fiat` backend
+### 8.2 Cost of the `fiat` backend
 
 The formally verified backend was measured as the cheap control on both targets.
 `mul_clamped`, ns, minimum of 15:
@@ -639,7 +711,7 @@ Two things worth recording for a consumer:
 dedicated routine (15.29 ns, competitive) but its `pow2k` is repeated squaring
 with no amortization (16.65 ns/sq, worse than this crate's 14.09).
 
-### 7.3 Could the vector backend cover the Montgomery ladder?
+### 8.3 Could the vector backend cover the Montgomery ladder?
 
 **Viable, but not worth it for a single X25519, and it is a new backend rather
 than an extension of the existing one.**
@@ -665,7 +737,7 @@ about.
 There is a related and more tractable gap worth recording, though. The vector
 backend covers `variable_base`, `straus`, `precomputed_straus` and `pippenger`,
 but **not** fixed-base multiplication: `EdwardsPoint::mul_base` is serial in
-every backend. That is 80% of `mul_base_clamped` (§7.4), i.e. of every ephemeral
+every backend. That is 80% of `mul_base_clamped` (§8.4), i.e. of every ephemeral
 key generation. Whether vectorizing it would pay is genuinely unclear — §7.5
 shows the constant-time window scan, not the point additions, is what dominates
 there, and a scan is a different thing to vectorize than an addition chain — but
@@ -679,7 +751,7 @@ dead backend.
 
 ---
 
-### 7.4 Where `mul_base_clamped` spends its time
+### 8.4 Where `mul_base_clamped` spends its time
 
 The other X25519 operation on a libsignal-style hot path is ephemeral key
 generation, which is `MontgomeryPoint::mul_base_clamped`. It splits cleanly in
@@ -700,7 +772,7 @@ The inversion is not doing anything wasteful: `invert` is Fermat, 254 squarings
 and 11 multiplications, and 254 x 14.10 + 11 x 25.36 = 3 860 ns predicts the
 measured 3 766 to within 2.5%. It is optimal *as an exponentiation*.
 
-### 7.5 Bigger basepoint tables do not help, on either target
+### 8.5 Bigger basepoint tables do not help, on either target
 
 `EdwardsPoint::mul_base` uses the 30 KB radix-16 table. The crate also exposes
 radix-32/64/128/256 tables as public API, documented as needing fewer additions
@@ -733,7 +805,7 @@ conditional selects to 43 × 32 = 1376, each over a three-field-element
 > once behind a `OnceLock`, outside the timing boundary. The ordering was
 > unaffected; the magnitudes were not. Thanks to CodeRabbit for catching it.
 
-### 7.6 What is left, and why it was not attempted
+### 8.6 What is left, and why it was not attempted
 
 After §4 and §5, the serial field operations are essentially at the floor for
 this representation. `mul` is 25.36 ns for 25 partial products and `square` is
@@ -762,7 +834,7 @@ is worth.
 
 ---
 
-## 8. Validation
+## 9. Validation
 
 * **Full test suite**, `--all-features`, on every backend path — with and
   without the new cfg, since a path only tested when enabled is not tested:
@@ -840,7 +912,7 @@ is worth.
 
 ---
 
-## 9. Summary
+## 10. Summary
 
 | front | outcome |
 | --- | --- |
@@ -849,6 +921,7 @@ is worth.
 | **B — wasm32 `bits="64"`** | **Refused.** 2.31× slower than the current default. wasm has no 64×64→128 multiply, so `u128` products are emulated. `build.rs`'s `TODO(Wasm32)` closed with evidence; behaviour unchanged. |
 | **C — `square` via `pow2k(1)`** | **Changed.** `mul_clamped` −3.5% on a stock release build, −21.9% with fat LTO, −23.5% with fat LTO and `+adx,+bmi2`. Bit-for-bit identical output, no `unsafe`, no representation change, no API change, `serial::u32`/`fiat` untouched. |
 | **D — ladder's multiply by 121666** | **Changed.** A specialized `mul121666` (fiat's verified `carry_scmul_121666` on the fiat backends) replaces a general multiplication whose operand had four zero limbs. Isolated 2.5x cheaper on x86_64, 3.8x on wasm32. `mul_clamped` −6.0% on a stock release build and −7.0% on wasm32; nothing under fat LTO, where the inliner already folded it. Complementary to C: between them every build profile improves. |
+| **E — ladder's conditional swap** | **Changed.** `ProjectivePoint` inherited `subtle`'s default `conditional_swap` — a struct copy plus two conditional assignments — instead of forwarding to the masked exchange every field backend already implements. The ladder driver drops from 324 to 294 instructions per iteration. wasm32 **−2.2%** across five paired runs; on x86_64 the 0.6% difference is below a 2.5% noise floor measured from identical binaries. |
 | **Combined C + D** | Certified against `origin/main` in one alternating session (§5.4): x86_64 stock release **−9.5%**, stock + `+adx,+bmi2` **−8.8%**, fat LTO **−24.2%**, fat LTO + `+adx,+bmi2` **−25.6%**; wasm32 **−7.0%** (`serial::u32`) and **−8.5%** (`fiat_u32`). `mul_base_clamped` unchanged in every cell. |
 | **Vector backend for Montgomery** | Viable but not worthwhile for single exchanges; the win would require a batched multi-exchange API. Not implemented. |
 | **Bigger basepoint tables** | **Measured and rejected.** radix-32 is a wash against the default radix-16 (+0.9% x86_64, +1.4% wasm32) for twice the table size; radix-64 is +13.6% and +20.0% for four times. The constant-time window scan grows faster than the addition count falls. The crate's default is already right. |

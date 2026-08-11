@@ -396,6 +396,25 @@ impl ConditionallySelectable for ProjectivePoint {
             W: FieldElement::conditional_select(&a.W, &b.W, choice),
         }
     }
+
+    /// The ladder conditionally swaps its two working points once per bit, so
+    /// this runs 256 times per scalar multiplication.
+    ///
+    /// Every field backend implements `conditional_swap` as a masked exchange
+    /// of the limbs. Without this override, `ProjectivePoint` would inherit
+    /// `subtle`'s default, which copies `a` and then performs two
+    /// `conditional_assign`s — twice the per-limb work, plus the copy.
+    fn conditional_swap(a: &mut ProjectivePoint, b: &mut ProjectivePoint, choice: Choice) {
+        FieldElement::conditional_swap(&mut a.U, &mut b.U, choice);
+        FieldElement::conditional_swap(&mut a.W, &mut b.W, choice);
+    }
+
+    /// Likewise: forward to the field element's own implementation instead of
+    /// going through `conditional_select` and a whole-struct assignment.
+    fn conditional_assign(&mut self, other: &ProjectivePoint, choice: Choice) {
+        self.U.conditional_assign(&other.U, choice);
+        self.W.conditional_assign(&other.W, choice);
+    }
 }
 
 impl ProjectivePoint {
