@@ -298,8 +298,9 @@ This is a documentation/deployment finding for consumers, not a code change:
 ## 4. What *was* changed: `square` no longer goes through `pow2k(1)`
 
 This came out of the "`pow2k` versus repeated `square`" item in the inventory,
-and it is the first of the three code changes in this work (§5 and §6 are the
-others).
+and it is the first of the four code changes in this work. §5 and §6 are the
+other two covered by the combined certification in §6.4; §7 came later and is
+measured separately, on top of that certified state.
 
 ### 4.1 The observation
 
@@ -571,7 +572,11 @@ every field backend already does.
 
 ---
 
-### 6.4 End-to-end certification of all three changes
+### 6.4 End-to-end certification of changes §4, §5 and §6
+
+**Scope: this certifies §4 + §5 + §6 against `origin/main`. It does not include
+§7**, which was measured later and separately, against the tree this section
+leaves behind — so the two results compose rather than overlap.
 
 The per-change numbers in §4, §5 and §6 were each measured against the state of
 the tree immediately before that change, across several sessions. That is
@@ -1121,17 +1126,87 @@ expected direction: the scan streams 30 KB of table and is not purely
 instruction-bound. It is also another instance of the §9.7 caution against
 reading instruction counts as time.
 
-One caveat that is a deployment decision rather than a measurement: `+avx2`
-raises the binary's CPU floor to Haswell (2013). This is unlike the crate's own
-vector backend, which detects AVX2 at runtime and falls back. A consumer who
-cannot raise the floor keeps the runtime-detected backend for Edwards work and
-simply does not get this.
+One caveat that is a deployment decision rather than a measurement, and it
+applies to **every** flag recommended here, not only `+avx2`. `-C
+target-feature` lets the compiler emit those instructions unconditionally, with
+no runtime check, so the binary's CPU floor rises to whatever it was told it
+had: Haswell (2013) for `+avx2`, Broadwell (2014) for `+adx`, and for the
+combination the later of the two. `-C target-cpu=native` is the same hazard in
+sharper form, since it targets the build machine rather than a stated baseline —
+fine for something compiled where it runs, wrong for a redistributed artifact.
+On an older CPU the result is a fault, not a slowdown.
+
+This is unlike the crate's own vector backend, which detects AVX2 at runtime and
+falls back. A consumer who cannot raise the floor keeps the runtime-detected
+backend for Edwards work, keeps `lto = "fat"` — which costs nothing in
+portability and is the larger half of the win anyway — and simply does not get
+the rest.
 
 **Reproduction note:** `-C target-cpu=native` on this host emits AVX-512 that
 valgrind 3.22 rejects with SIGILL, so the instruction counts above use explicit
 `+avx2` rather than `native`. The timing runs are unaffected.
 
-### 9.10 What is left, and why it was not attempted
+### 9.10 `mul`'s carry chain: isolated −16%, `mul_clamped` +2%. Refused
+
+§7 succeeded by taking a dependency chain off the critical path, so the obvious
+follow-up is the longest chain left in the hottest function. `mul`'s carry
+propagation is strictly serial and six deep:
+
+```
+c0 → c1 → c2 → c3 → c4 → out[0] → out[1]
+```
+
+Because the limbs form a *ring* — `c4` folds back into `c0` with a factor of 19 —
+the carries can be reordered into four levels with two independent carries each,
+at the cost of one extra carry (seven instead of six):
+
+| level | carries (independent within a level) |
+| --- | --- |
+| 1 | `0 → 1` and `2 → 3` |
+| 2 | `1 → 2` and `3 → 4` |
+| 3 | `4 → 0` (×19) and `2 → 3` again |
+| 4 | `0 → 1` |
+
+The bound analysis works out with room to spare — the final limbs are
+`c0 < 2^51`, `c1 < 2^51 + 2^12.7`, `c2 < 2^51`, `c3 < 2^51 + 2^6.4`,
+`c4 < 2^51`, all far inside the `b < 3` the next operation requires — and the
+full suite passes, RFC 7748 vectors included.
+
+**It makes isolated `mul` dramatically faster and `mul_clamped` slower.**
+
+| | `fe_mul` | `mul_clamped` |
+| --- | ---: | ---: |
+| §7 only, baseline `x86-64` | 28.70 | 43 082 |
+| §7 + ring carry | **23.97 (−16.5%)** | 42 547 (−1.2%, 2/3 runs) |
+| §7 only, `+avx2,+adx,+bmi2` | 26.05 | 39 116 |
+| §7 + ring carry | **23.85 (−8.4%)** | **39 928 (+2.0%, slower 3/3)** |
+
+`fe_invert`, `fe_square` and `mul_base_clamped` do not move at all.
+Instructions go **up**: +3.6% on the isolated kernel, +0.76% on `mul_clamped`.
+
+**Refused**, by the brief's own rule that the number that counts is
+`mul_clamped`'s: +2.0% on the configuration the crate recommends, losing all
+three paired runs.
+
+The reason is worth more than the result, because it is the sharpest form of the
+§3.3 calibration and it points the opposite way from §7. **The isolated `fe_mul`
+kernel is a serial chain — each multiplication consumes the previous one's
+output — so it is latency-bound, and shortening the carry chain is exactly what
+it wants. The ladder is not.** `differential_add_and_double` has three pairs of
+mutually independent operations (§9.7), so an out-of-order core already overlaps
+one multiplication's carry chain with the next multiplication's products.
+Latency there is already hidden; the extra carry is not. The same intervention
+is therefore worth −16% in one place and +2% in the other.
+
+So `fe_mul` and `mul_clamped` are not merely weakly correlated, as §3.3 found —
+here they are **anti-correlated**, and an optimizer trusting the isolated
+microbenchmark would have shipped a regression. This is also why §7 was accepted
+on `mul_clamped` rather than on its far more impressive isolated `fe_square`
+number.
+
+Not implemented; the working tree was reverted to the serial chain.
+
+### 9.11 What is left, and why it was not attempted
 
 
 
@@ -1328,7 +1403,7 @@ the trade can be re-made by someone who wants it.
 | **D — ladder's multiply by 121666** | **Changed.** A specialized `mul121666` (fiat's verified `carry_scmul_121666` on the fiat backends) replaces a general multiplication whose operand had four zero limbs. Isolated 2.5x cheaper on x86_64, 3.8x on wasm32. `mul_clamped` −6.0% on a stock release build and −7.0% on wasm32; nothing under fat LTO, where the inliner already folded it. Complementary to C: between them every build profile improves. |
 | **E — ladder's conditional swap** | **Changed.** `ProjectivePoint` inherited `subtle`'s default `conditional_swap` — a struct copy plus two conditional assignments — instead of forwarding to the masked exchange every field backend already implements. The ladder driver drops from 324 to 294 instructions per iteration. wasm32 **−2.2%** across five paired runs; on x86_64 the 0.6% difference is below a 2.5% noise floor measured from identical binaries. |
 | **F — squaring's 128-bit doublings** | **Changed.** `square_limbs` doubled five 128-bit coefficients; `2*(x*y) == (2*x)*y`, so four precomputed 64-bit doublings cover all ten mirror-pair products instead — which is what `serial::u32` has always done. Isolated `fe_square` **−5.4%** (7/7 paired runs) and **−10.5%** with `+bmi2`; `mul_clamped` **−2.2%** with `+bmi2`, −0.7% stock; `fe_invert` −5.8%. The time win is several times the −1.29% instruction win because the 128-bit shift was on the dependency chain (§7). Bit-for-bit identical; wasm32 module byte-identical. |
-| **Combined C + D + E** | Certified against `origin/main` in one alternating session (§6.4): x86_64 stock release **−9.7%**, stock + `+adx,+bmi2` **−10.0%**, fat LTO **−25.0%**, fat LTO + `+adx,+bmi2` **−25.3%**; wasm32 **−8.8%**. `mul_base_clamped` unchanged in every cell. |
+| **Combined C + D + E** | Certified against `origin/main` in one alternating session (§6.4) — **F is not in this figure**; it was measured separately on top of this state, so the two compose: x86_64 stock release **−9.7%**, stock + `+adx,+bmi2` **−10.0%**, fat LTO **−25.0%**, fat LTO + `+adx,+bmi2` **−25.3%**; wasm32 **−8.8%**. `mul_base_clamped` unchanged in every cell. |
 | **Vector backend for Montgomery** | Viable but not worthwhile for single exchanges; the win would require a batched multi-exchange API. Not implemented. |
 | **Bigger basepoint tables** | **Measured and rejected.** radix-32 is a wash against the default radix-16 (+0.9% x86_64, +1.4% wasm32) for twice the table size; radix-64 is +13.6% and +20.0% for four times. The constant-time window scan grows faster than the addition count falls. The crate's default is already right. |
 | **Exploiting the ladder's spare ILP** | **Three attempts, all measured and reverted (§9.7).** Rescheduling the step removes 1.42% of x86-64 instructions but is 1.5% *slower* on wasm32; fusing the three independent operation pairs into single function bodies is +1.0% instructions, noise on x86_64 and 3.6% slower on wasm32; inlining `mul` gives −29.5% isolated and −0.5% end to end. All three add live values, and the step already spills — it is register-pressure bound, not schedule bound. |

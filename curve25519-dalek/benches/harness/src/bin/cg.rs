@@ -32,5 +32,19 @@ fn main() {
     };
     assert!(iters > 0, "iteration count must be greater than zero");
 
+    // `run_kernel` routes any unrecognized selector to the field-kernel
+    // dispatcher, which without the internals hook returns zero immediately. A
+    // typo, or a field kernel asked for in a build that cannot run one, would
+    // therefore produce a *successful* callgrind run over no work at all — the
+    // worst failure mode for a measurement tool, since the output looks real.
+    let (_, name, _) = x25519_field_harness::KERNELS
+        .iter()
+        .find(|(selector, _, _)| *selector == which)
+        .unwrap_or_else(|| panic!("unknown kernel selector {which}; see K_* in lib.rs"));
+    assert!(
+        x25519_field_harness::HAS_FIELD_KERNELS || !name.starts_with("fe_"),
+        "kernel {name} needs --cfg curve25519_dalek_bench_internals"
+    );
+
     std::hint::black_box(x25519_field_harness::run_kernel(which, iters));
 }

@@ -24,11 +24,13 @@ major series.
   `mul_clamped` 2.2% with `+bmi2`. Output is bit-for-bit identical, the limb
   representation and bit-excess preconditions are unchanged, and the wasm32
   module is byte-identical since `serial::u64` is not compiled there.
-* Perf: together, the three X25519 changes below take `mul_clamped` down 9.7% in
-  a stock `cargo --release` build, 25.0% with fat LTO, and 8.8% on wasm32,
-  measured against the base branch in one alternating session on the same pinned
-  core. `mul_base_clamped` is unchanged. See
-  `docs/perf-x25519-field-arithmetic.md` section 6.4.
+* Perf: together, the `pow2k`, `mul121666` and conditional-swap changes listed
+  here take `mul_clamped` down 9.7% in a stock `cargo --release` build, 25.0%
+  with fat LTO, and 8.8% on wasm32, measured against the base branch in one
+  alternating session on the same pinned core. `mul_base_clamped` is unchanged.
+  This figure does not include the squaring-doubling change above, which was
+  measured separately on top of it. See `docs/perf-x25519-field-arithmetic.md`
+  section 6.4.
 * Perf: the Montgomery ladder's multiplication by `(A+2)/4 = 121666` no longer
   goes through the general field multiplication, whose second operand had four
   zero limbs. Each backend gains a `mul121666`; the fiat backends use
@@ -45,9 +47,14 @@ major series.
 * Docs: the README now records the build settings that matter for X25519-heavy
   workloads, which are worth more than any source change measured here: fat LTO
   plus `-C target-feature=+adx,+bmi2` takes `mul_clamped` from 58.8 us to
-  40.8 us on x86_64, and `-C target-feature=+simd128` — stable but off by
-  default on `wasm32-unknown-unknown` — is worth 4.6% on `mul_clamped` and
-  15.7% on `mul_base_clamped`.
+  40.8 us on x86_64; adding `+avx2` is worth a further 6% on `mul_base_clamped`,
+  since it vectorizes the constant-time window scan that key generation is
+  dominated by — the two halves are complementary, `+bmi2` moving the ladder and
+  `+avx2` moving key generation; and `-C target-feature=+simd128` — stable but
+  off by default on `wasm32-unknown-unknown` — is worth 4.6% on `mul_clamped`
+  and 15.7% on `mul_base_clamped`. The README also records that these flags
+  raise the binary's CPU requirement, unlike the crate's runtime-detected vector
+  backends.
 * Docs: `docs/perf-x25519-field-arithmetic.md` records a measurement pass over
   the X25519 field arithmetic on x86_64 (ADX/BMI2) and wasm32, including why an
   ADX assembly path was not added and why wasm32 keeps the 32-bit backend. This

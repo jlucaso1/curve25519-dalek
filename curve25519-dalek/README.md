@@ -276,9 +276,19 @@ The two halves of that flag do different jobs: `+adx,+bmi2` lets LLVM emit
 `mulx` in the field multiplication, which is what moves the Montgomery ladder,
 while `+avx2` vectorizes the constant-time table lookup, which is what moves
 key generation — it halves the instruction count of that lookup. Neither
-substitutes for the other. Note that `+avx2` raises the binary's CPU floor to
-Haswell; the crate's own vector backend detects AVX2 at runtime instead and
-needs no such promise.
+substitutes for the other.
+
+**These flags raise the binary's CPU requirement.** Every `-C target-feature`
+here lets the compiler emit instructions unconditionally, with no runtime check:
+a binary built with `+avx2,+adx,+bmi2` needs a CPU that has all three — in
+practice Broadwell (2014) or later on Intel, Excavator/Zen on AMD — and will
+fault with an illegal instruction on anything older. `-C target-cpu=native` is
+the sharper version of the same hazard, since it targets whatever machine
+happened to run the build, which for a redistributed artifact is rarely the
+machine that runs it. This is unlike the crate's own AVX2/AVX-512 backends,
+which detect the feature at runtime and fall back, and so need no promise about
+the deployment target. Use these flags when you control where the binary runs;
+otherwise keep `lto = "fat"`, which costs nothing in portability.
 
 Measured on an Intel Cascade Lake, `MontgomeryPoint::mul_clamped` goes from
 58.8 µs on a stock `cargo build --release` to 40.8 µs with both — **about a
