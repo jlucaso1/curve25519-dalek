@@ -146,7 +146,12 @@ mod deterministic {
             //Issues: 449 and 456
             //TODO: When adding arch defaults use proper types not String match
             //TODO(Arm): Needs tests + benchmarks to back this up
-            //TODO(Wasm32): Needs tests + benchmarks to back this up
+            // Wasm32: measured, and the pointer-width default is the right one.
+            // Forcing curve25519_dalek_bits="64" on wasm32 is 2.31x SLOWER for
+            // X25519 than the Dalek32 default: wasm has no 64x64->128 widening
+            // multiply, so serial::u64's u128 partial products are emulated in
+            // software, while serial::u32 needs only 32x32->64, which is a
+            // single i64.mul. See docs/perf-x25519-field-arithmetic.md.
             _ => match target_pointer_width.as_ref() {
                 "64" => DalekBits::Dalek64,
                 "32" => DalekBits::Dalek32,

@@ -450,68 +450,178 @@ impl FieldElement51 {
     }
 
     /// Given `k > 0`, return `self^(2^k)`.
-    #[rustfmt::skip] // keep alignment of c* calculations
     pub fn pow2k(&self, mut k: u32) -> FieldElement51 {
+        debug_assert!(k > 0);
 
+        let mut a: [u64; 5] = self.0;
+
+        loop {
+            a = square_limbs(a);
+
+            k -= 1;
+            if k == 0 {
+                break;
+            }
+        }
+
+        FieldElement51(a)
+    }
+
+    /// Returns the square of this field element.
+    pub fn square(&self) -> FieldElement51 {
+        FieldElement51(square_limbs(self.0))
+    }
+
+    /// Returns 2 times the square of this field element.
+    pub fn square2(&self) -> FieldElement51 {
+        let mut square = square_limbs(self.0);
+        for limb in &mut square {
+            *limb *= 2;
+        }
+
+        FieldElement51(square)
+    }
+}
+
+/// One squaring step in radix \\(2^{51}\\): given limbs `a` of \\(x\\), return
+/// the limbs of \\(x^2\\).
+///
+/// This is the body of [`FieldElement51::pow2k`], factored out so that
+/// [`FieldElement51::square`] can be a single squaring rather than a call into
+/// a loop. Squaring is a third of the field operations on the X25519 ladder,
+/// and it was previously spelled `pow2k(1)`, which paid for `pow2k`'s call and
+/// loop machinery without getting any amortization back for it.
+///
+/// The arithmetic below is unchanged from the original `pow2k` loop body, so
+/// `pow2k(k)` and `k` chained `square()`s remain bit-for-bit identical.
+#[rustfmt::skip] // keep alignment of c* calculations
+#[inline(always)]
+fn square_limbs(mut a: [u64; 5]) -> [u64; 5] {
+    /// Multiply two 64-bit integers with 128 bits of output.
+    #[inline(always)]
+    fn m(x: u64, y: u64) -> u128 {
+        (x as u128) * (y as u128)
+    }
+
+    // Precondition: assume input limbs a[i] are bounded as
+    //
+    // a[i] < 2^(51 + b)
+    //
+    // where b is a real parameter measuring the "bit excess" of the limbs.
+
+    // Precomputation: 64-bit multiply by 19.
+    //
+    // This fits into a u64 whenever 51 + b + lg(19) < 64.
+    //
+    // Since 51 + b + lg(19) < 51 + 4.25 + b
+    //                       = 55.25 + b,
+    // this fits if b < 8.75.
+    let a3_19 = 19 * a[3];
+    let a4_19 = 19 * a[4];
+
+    // Multiply to get 128-bit coefficients of output.
+    //
+    // The 128-bit multiplications by 2 turn into 1 slr + 1 slrd each,
+    // which doesn't seem any better or worse than doing them as precomputations
+    // on the 64-bit inputs.
+    let     c0: u128 = m(a[0],  a[0]) + 2*( m(a[1], a4_19) + m(a[2], a3_19) );
+    let mut c1: u128 = m(a[3], a3_19) + 2*( m(a[0],  a[1]) + m(a[2], a4_19) );
+    let mut c2: u128 = m(a[1],  a[1]) + 2*( m(a[0],  a[2]) + m(a[4], a3_19) );
+    let mut c3: u128 = m(a[4], a4_19) + 2*( m(a[0],  a[3]) + m(a[1],  a[2]) );
+    let mut c4: u128 = m(a[2],  a[2]) + 2*( m(a[0],  a[4]) + m(a[1],  a[3]) );
+
+    // Same bound as in multiply:
+    //    c[i] < 2^(102 + 2*b) * (1+i + (4-i)*19)
+    //         < 2^(102 + lg(1 + 4*19) + 2*b)
+    //         < 2^(108.27 + 2*b)
+    //
+    // The carry (c[i] >> 51) fits into a u64 when
+    //    108.27 + 2*b - 51 < 64
+    //    2*b < 6.73
+    //    b < 3.365.
+    //
+    // So we require b < 3 to ensure this fits.
+    debug_assert!(a[0] < (1 << 54));
+    debug_assert!(a[1] < (1 << 54));
+    debug_assert!(a[2] < (1 << 54));
+    debug_assert!(a[3] < (1 << 54));
+    debug_assert!(a[4] < (1 << 54));
+
+    const LOW_51_BIT_MASK: u64 = (1u64 << 51) - 1;
+
+    // Casting to u64 and back tells the compiler that the carry is bounded by 2^64, so
+    // that the addition is a u128 + u64 rather than u128 + u128.
+    c1 += ((c0 >> 51) as u64) as u128;
+    a[0] = (c0 as u64) & LOW_51_BIT_MASK;
+
+    c2 += ((c1 >> 51) as u64) as u128;
+    a[1] = (c1 as u64) & LOW_51_BIT_MASK;
+
+    c3 += ((c2 >> 51) as u64) as u128;
+    a[2] = (c2 as u64) & LOW_51_BIT_MASK;
+
+    c4 += ((c3 >> 51) as u64) as u128;
+    a[3] = (c3 as u64) & LOW_51_BIT_MASK;
+
+    let carry: u64 = (c4 >> 51) as u64;
+    a[4] = (c4 as u64) & LOW_51_BIT_MASK;
+
+    // To see that this does not overflow, we need a[0] + carry * 19 < 2^64.
+    //
+    // c4 < a2^2 + 2*a0*a4 + 2*a1*a3 + (carry from c3)
+    //    < 2^(102 + 2*b + lg(5)) + 2^64.
+    //
+    // When b < 3 we get
+    //
+    // c4 < 2^110.33  so that carry < 2^59.33
+    //
+    // so that
+    //
+    // a[0] + carry * 19 < 2^51 + 19 * 2^59.33 < 2^63.58
+    //
+    // and there is no overflow.
+    a[0] += carry * 19;
+
+    // Now a[1] < 2^51 + 2^(64 -51) = 2^51 + 2^13 < 2^(51 + epsilon).
+    a[1] += a[0] >> 51;
+    a[0] &= LOW_51_BIT_MASK;
+
+    // Now all a[i] < 2^(51 + epsilon) and a = (input)^2.
+
+    a
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// Verbatim copy of `pow2k` as it was implemented before `square_limbs` was
+    /// factored out of it, kept here as the reference for the differential
+    /// tests below. If a future change to the squaring code is not a pure
+    /// refactor, these tests are what will say so.
+    #[rustfmt::skip]
+    fn reference_pow2k(fe: &FieldElement51, mut k: u32) -> FieldElement51 {
         debug_assert!( k > 0 );
 
-        /// Multiply two 64-bit integers with 128 bits of output.
         #[inline(always)]
         fn m(x: u64, y: u64) -> u128 {
             (x as u128) * (y as u128)
         }
 
-        let mut a: [u64; 5] = self.0;
+        let mut a: [u64; 5] = fe.0;
 
         loop {
-            // Precondition: assume input limbs a[i] are bounded as
-            //
-            // a[i] < 2^(51 + b)
-            //
-            // where b is a real parameter measuring the "bit excess" of the limbs.
-
-            // Precomputation: 64-bit multiply by 19.
-            //
-            // This fits into a u64 whenever 51 + b + lg(19) < 64.
-            //
-            // Since 51 + b + lg(19) < 51 + 4.25 + b
-            //                       = 55.25 + b,
-            // this fits if b < 8.75.
             let a3_19 = 19 * a[3];
             let a4_19 = 19 * a[4];
 
-            // Multiply to get 128-bit coefficients of output.
-            //
-            // The 128-bit multiplications by 2 turn into 1 slr + 1 slrd each,
-            // which doesn't seem any better or worse than doing them as precomputations
-            // on the 64-bit inputs.
             let     c0: u128 = m(a[0],  a[0]) + 2*( m(a[1], a4_19) + m(a[2], a3_19) );
             let mut c1: u128 = m(a[3], a3_19) + 2*( m(a[0],  a[1]) + m(a[2], a4_19) );
             let mut c2: u128 = m(a[1],  a[1]) + 2*( m(a[0],  a[2]) + m(a[4], a3_19) );
             let mut c3: u128 = m(a[4], a4_19) + 2*( m(a[0],  a[3]) + m(a[1],  a[2]) );
             let mut c4: u128 = m(a[2],  a[2]) + 2*( m(a[0],  a[4]) + m(a[1],  a[3]) );
 
-            // Same bound as in multiply:
-            //    c[i] < 2^(102 + 2*b) * (1+i + (4-i)*19)
-            //         < 2^(102 + lg(1 + 4*19) + 2*b)
-            //         < 2^(108.27 + 2*b)
-            //
-            // The carry (c[i] >> 51) fits into a u64 when
-            //    108.27 + 2*b - 51 < 64
-            //    2*b < 6.73
-            //    b < 3.365.
-            //
-            // So we require b < 3 to ensure this fits.
-            debug_assert!(a[0] < (1 << 54));
-            debug_assert!(a[1] < (1 << 54));
-            debug_assert!(a[2] < (1 << 54));
-            debug_assert!(a[3] < (1 << 54));
-            debug_assert!(a[4] < (1 << 54));
-
             const LOW_51_BIT_MASK: u64 = (1u64 << 51) - 1;
 
-            // Casting to u64 and back tells the compiler that the carry is bounded by 2^64, so
-            // that the addition is a u128 + u64 rather than u128 + u128.
             c1 += ((c0 >> 51) as u64) as u128;
             a[0] = (c0 as u64) & LOW_51_BIT_MASK;
 
@@ -527,27 +637,10 @@ impl FieldElement51 {
             let carry: u64 = (c4 >> 51) as u64;
             a[4] = (c4 as u64) & LOW_51_BIT_MASK;
 
-            // To see that this does not overflow, we need a[0] + carry * 19 < 2^64.
-            //
-            // c4 < a2^2 + 2*a0*a4 + 2*a1*a3 + (carry from c3)
-            //    < 2^(102 + 2*b + lg(5)) + 2^64.
-            //
-            // When b < 3 we get
-            //
-            // c4 < 2^110.33  so that carry < 2^59.33
-            //
-            // so that
-            //
-            // a[0] + carry * 19 < 2^51 + 19 * 2^59.33 < 2^63.58
-            //
-            // and there is no overflow.
             a[0] += carry * 19;
 
-            // Now a[1] < 2^51 + 2^(64 -51) = 2^51 + 2^13 < 2^(51 + epsilon).
             a[1] += a[0] >> 51;
             a[0] &= LOW_51_BIT_MASK;
-
-            // Now all a[i] < 2^(51 + epsilon) and a = self^(2^k).
 
             k -= 1;
             if k == 0 {
@@ -558,18 +651,152 @@ impl FieldElement51 {
         FieldElement51(a)
     }
 
-    /// Returns the square of this field element.
-    pub fn square(&self) -> FieldElement51 {
-        self.pow2k(1)
-    }
-
-    /// Returns 2 times the square of this field element.
-    pub fn square2(&self) -> FieldElement51 {
-        let mut square = self.pow2k(1);
+    /// Pre-refactor `square2`, for the same reason.
+    fn reference_square2(fe: &FieldElement51) -> FieldElement51 {
+        let mut square = reference_pow2k(fe, 1);
         for i in 0..5 {
             square.0[i] *= 2;
         }
-
         square
+    }
+
+    /// Deterministic xorshift64, so the differential tests are reproducible and
+    /// need no dependencies.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// A field element whose limbs are uniform below `2^bits`.
+        ///
+        /// The documented precondition of `mul`/`pow2k` is a bit excess
+        /// `b < 3`, i.e. limbs below `2^54`, so `bits == 54` is exactly the
+        /// upper edge of the supported input range.
+        fn field_element(&mut self, bits: u32) -> FieldElement51 {
+            let mask = (1u64 << bits) - 1;
+            FieldElement51([
+                self.next() & mask,
+                self.next() & mask,
+                self.next() & mask,
+                self.next() & mask,
+                self.next() & mask,
+            ])
+        }
+    }
+
+    /// The refactored `square` must agree with the old `pow2k(1)` limb for
+    /// limb, not merely as a field element: the limbs are an input to the next
+    /// operation's bit-excess accounting.
+    #[test]
+    fn square_matches_reference_bit_for_bit() {
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+
+        // 51 bits is the reduced case; 54 bits is the documented upper edge of
+        // the bit excess.
+        for bits in [51u32, 52, 53, 54] {
+            for _ in 0..512 {
+                let x = rng.field_element(bits);
+                assert_eq!(x.square().0, reference_pow2k(&x, 1).0);
+                assert_eq!(x.square2().0, reference_square2(&x).0);
+            }
+        }
+
+        // The all-ones limbs at the top of the documented range.
+        let edge = FieldElement51([(1u64 << 54) - 1; 5]);
+        assert_eq!(edge.square().0, reference_pow2k(&edge, 1).0);
+        assert_eq!(edge.square2().0, reference_square2(&edge).0);
+
+        // And the degenerate inputs.
+        for limbs in [[0u64; 5], [1, 0, 0, 0, 0], [0, 0, 0, 0, 1]] {
+            let x = FieldElement51(limbs);
+            assert_eq!(x.square().0, reference_pow2k(&x, 1).0);
+            assert_eq!(x.square2().0, reference_square2(&x).0);
+        }
+    }
+
+    /// `pow2k(k)` is now a loop over the same factored-out step, so it must
+    /// still agree with the old monolithic loop for every `k`.
+    #[test]
+    fn pow2k_matches_reference_bit_for_bit() {
+        let mut rng = Rng(0xfeed_face_dead_beef);
+
+        for bits in [51u32, 54] {
+            for _ in 0..128 {
+                let x = rng.field_element(bits);
+                for k in 1..=8u32 {
+                    assert_eq!(x.pow2k(k).0, reference_pow2k(&x, k).0);
+                }
+                // The k values actually used on the X25519 inversion path.
+                for k in [10u32, 20, 50, 100] {
+                    assert_eq!(x.pow2k(k).0, reference_pow2k(&x, k).0);
+                }
+            }
+        }
+    }
+
+    /// `k` chained squarings must equal one `pow2k(k)`: this is the property
+    /// that lets the ladder use `square()` and the inversion use `pow2k`.
+    #[test]
+    fn chained_square_matches_pow2k() {
+        let mut rng = Rng(0x0bad_c0de_0bad_c0de);
+
+        for _ in 0..128 {
+            let x = rng.field_element(54);
+            let mut chained = x;
+            for k in 1..=16u32 {
+                chained = chained.square();
+                assert_eq!(chained.0, x.pow2k(k).0);
+            }
+        }
+    }
+
+    /// An independent cross-check that does not go through the reference copy:
+    /// squaring and multiplying a value by itself must give the same field
+    /// element, including at the top of the documented bit excess.
+    #[test]
+    fn square_agrees_with_mul_at_bit_excess_bound() {
+        let mut rng = Rng(0xa5a5_5a5a_a5a5_5a5a);
+
+        for bits in [51u32, 54] {
+            for _ in 0..512 {
+                let x = rng.field_element(bits);
+                assert_eq!(x.square().to_bytes(), (&x * &x).to_bytes());
+
+                let two_x_sq = {
+                    let sq = x.square();
+                    &sq + &sq
+                };
+                assert_eq!(x.square2().to_bytes(), two_x_sq.to_bytes());
+            }
+        }
+    }
+
+    /// `mul` is unchanged by this refactor, but pin its output down anyway so
+    /// that a future change to the multiplication has a differential test
+    /// waiting for it: `(x + y)^2 == x^2 + 2xy + y^2` exercises `mul` and
+    /// `square` against each other on random inputs.
+    #[test]
+    fn mul_and_square_are_consistent() {
+        let mut rng = Rng(0x5eed_1234_5eed_1234);
+
+        for _ in 0..512 {
+            // Keep the sum inside the documented bit excess: two 53-bit limbs
+            // add to at most 2^54.
+            let x = rng.field_element(53);
+            let y = rng.field_element(53);
+
+            let sum = &x + &y;
+            let lhs = sum.square();
+
+            let xy = &x * &y;
+            let rhs = &(&x.square() + &y.square()) + &(&xy + &xy);
+
+            assert_eq!(lhs.to_bytes(), rhs.to_bytes());
+        }
     }
 }

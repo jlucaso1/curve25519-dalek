@@ -1,0 +1,40 @@
+# Standalone (non-workspace) harness used to measure X25519 field arithmetic on
+# targets where Criterion cannot run, in particular wasm32-unknown-unknown, and
+# to cross-check Criterion on noisy virtualized x86_64 hosts.
+#
+# See ../../docs/perf-x25519-field-arithmetic.md for how it is driven.
+[package]
+name = "x25519-field-harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "BSD-3-Clause"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "native"
+path = "src/main.rs"
+
+[dependencies]
+curve25519-dalek = { path = "../..", default-features = false, features = [
+    "alloc",
+    "precomputed-tables",
+    "zeroize",
+] }
+
+[patch.crates-io]
+curve25519-dalek-derive = { path = "../../../curve25519-dalek-derive" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ['cfg(curve25519_dalek_bench_internals)']

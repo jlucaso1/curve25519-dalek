@@ -1,0 +1,165 @@
+//! Benchmark kernels for the X25519 field-arithmetic measurement.
+//!
+//! The same kernels are compiled for x86_64 and for wasm32, and are driven
+//! either by `src/main.rs` (native, `std::time::Instant`) or by `run.mjs`
+//! (wasm32, Node's `process.hrtime.bigint()` around an exported function).
+//! Keeping one set of kernels is the point: the wasm32 and native numbers then
+//! measure literally the same code.
+//!
+//! Every kernel is a *dependent* chain: the output of one operation feeds the
+//! next. That is deliberate. The Montgomery ladder is latency bound, not
+//! throughput bound, so a chained kernel is the honest model of what
+//! `mul_clamped` sees. It also removes the need for `black_box`, which is not
+//! uniformly available across targets.
+
+use curve25519_dalek::constants;
+use curve25519_dalek::montgomery::MontgomeryPoint;
+
+#[cfg(curve25519_dalek_bench_internals)]
+use curve25519_dalek::bench_internals::FieldElement;
+
+/// Kernel selector. Kept as small integers so the wasm export stays a plain
+/// `extern "C"` function with no imports.
+pub const K_FE_MUL: u32 = 0;
+pub const K_FE_SQUARE: u32 = 1;
+pub const K_FE_POW2K50: u32 = 2;
+pub const K_MUL_CLAMPED: u32 = 3;
+pub const K_MUL_BASE_CLAMPED: u32 = 4;
+
+pub const KERNELS: &[(u32, &str, u32)] = &[
+    // (selector, name, field operations per iteration)
+    (K_FE_MUL, "fe_mul", 1),
+    (K_FE_SQUARE, "fe_square", 1),
+    (K_FE_POW2K50, "fe_pow2k50", 50),
+    (K_MUL_CLAMPED, "x25519_mul_clamped", 1),
+    (K_MUL_BASE_CLAMPED, "x25519_mul_base_clamped", 1),
+];
+
+/// Whether the field-level kernels were compiled in. They need
+/// `--cfg curve25519_dalek_bench_internals`, because `FieldElement` is
+/// `pub(crate)`.
+pub const HAS_FIELD_KERNELS: bool = cfg!(curve25519_dalek_bench_internals);
+
+/// Deterministic pseudo-random 32 bytes; fixed so that every target and every
+/// backend is fed identical input.
+pub fn seed_bytes(seed: u8) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (seed as u64);
+    let mut i = 0;
+    while i < 32 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        bytes[i..i + 8].copy_from_slice(&x.to_le_bytes());
+        i += 8;
+    }
+    bytes
+}
+
+/// Run `iters` iterations of kernel `which`, returning a checksum so nothing
+/// can be optimized away.
+pub fn run_kernel(which: u32, iters: u32) -> u64 {
+    match which {
+        K_MUL_CLAMPED => {
+            let point = constants::X25519_BASEPOINT;
+            let mut s = seed_bytes(1);
+            let mut acc = 0u64;
+            for _ in 0..iters {
+                // Feed the result back in as the next scalar: this keeps a
+                // real data dependency between iterations, so the compiler
+                // cannot hoist the call out of the loop.
+                s = point.mul_clamped(s).to_bytes();
+                acc = acc.wrapping_add(s[0] as u64);
+            }
+            acc
+        }
+        K_MUL_BASE_CLAMPED => {
+            let mut s = seed_bytes(2);
+            let mut acc = 0u64;
+            for _ in 0..iters {
+                s = MontgomeryPoint::mul_base_clamped(s).to_bytes();
+                acc = acc.wrapping_add(s[0] as u64);
+            }
+            acc
+        }
+        _ => run_field_kernel(which, iters),
+    }
+}
+
+#[cfg(curve25519_dalek_bench_internals)]
+fn run_field_kernel(which: u32, iters: u32) -> u64 {
+    let mut bytes_a = seed_bytes(3);
+    let mut bytes_b = seed_bytes(4);
+    bytes_a[31] &= 0x7f;
+    bytes_b[31] &= 0x7f;
+    let mut x = FieldElement::from_bytes(&bytes_a);
+    let y = FieldElement::from_bytes(&bytes_b);
+
+    match which {
+        K_FE_MUL => {
+            for _ in 0..iters {
+                x = &x * &y;
+            }
+        }
+        K_FE_SQUARE => {
+            for _ in 0..iters {
+                x = x.square();
+            }
+        }
+        K_FE_POW2K50 => {
+            for _ in 0..iters {
+                x = x.pow2k(50);
+            }
+        }
+        _ => return 0,
+    }
+
+    let out = x.to_bytes();
+    u64::from_le_bytes([
+        out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7],
+    ])
+}
+
+/// Without the internal hook the field kernels are not measurable; return 0 so
+/// the driver reports them as unavailable rather than failing to build.
+#[cfg(not(curve25519_dalek_bench_internals))]
+fn run_field_kernel(_which: u32, _iters: u32) -> u64 {
+    0
+}
+
+/// What `curve25519-dalek` *actually* compiled, read out of the dependency
+/// itself rather than out of the flags we hoped we passed.
+///
+/// bit 0: 64-bit limbs · bit 1: fiat backend · bit 2: simd backend ·
+/// bit 3: field kernels available.
+pub fn config_code_impl() -> u32 {
+    let mut code = 0;
+    #[cfg(curve25519_dalek_bench_internals)]
+    {
+        use curve25519_dalek::bench_internals as bi;
+        if bi::LIMB_BITS == 64 {
+            code |= 1;
+        }
+        if bi::BACKEND == "fiat" {
+            code |= 2;
+        }
+        if bi::BACKEND == "simd" || bi::BACKEND == "avx512" {
+            code |= 4;
+        }
+        code |= 8;
+    }
+    code
+}
+
+/// wasm32 entry point. Node instantiates the module and times this call.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn bench_kernel(which: u32, iters: u32) -> u64 {
+    run_kernel(which, iters)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn config_code() -> u32 {
+    config_code_impl()
+}
