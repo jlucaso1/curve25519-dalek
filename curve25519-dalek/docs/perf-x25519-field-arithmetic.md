@@ -859,27 +859,36 @@ dependency of the harness, not of `curve25519-dalek`).
 
 ### 9.1 What verification actually costs
 
+> **Corrected.** The figures first published in this section were measured
+> against the *wrong crate*, and the error and its consequences are recorded in
+> §9.8 rather than quietly overwritten. Everything below is the re-measurement.
+
 `callgrind`, AVX2 backend live, `lto=true`/`cgu=1`. Setup is removed exactly by
 differencing 220 iterations against 20, so these are per-verify figures with no
 amortized key generation or hashing in them:
 
-**354 575 instructions per `ed25519_verify`.**
+**315 697 instructions per `ed25519_verify`.**
 
 | | instructions | share |
 | --- | ---: | ---: |
-| `avx2::FieldElement2625x4::mul` | 188 448 | **53.15%** |
-| `avx2::FieldElement2625x4::square_and_negate_D` | 64 507 | 18.19% |
-| `vartime_double_base::spec_avx2::mul`, self | 53 471 | 15.08% |
-| **`serial::u64::FieldElement51::pow2k` — the one inversion** | **32 570** | **9.19%** |
-| `NafLookupTable5<CachedPoint>::from`, self | 4 784 | 1.35% |
-| `sha2::sha512` | 4 447 | 1.25% |
-| `serial::u64::FieldElement51::mul` (the inversion's) | 2 860 | 0.81% |
+| `avx2::FieldElement2625x4::mul` | 155 800 | **49.35%** |
+| `avx2::FieldElement2625x4::square_and_negate_D` | 64 250 | 20.35% |
+| `vartime_double_base::spec_avx2::mul`, self | 53 938 | 17.09% |
+| **`serial::u64::FieldElement51::pow2k` — the one inversion** | **30 724** | **9.73%** |
+| `sha2::sha512` | 4 447 | 1.41% |
+| `serial::u64::FieldElement51::mul` (the inversion's) | 2 860 | 0.91% |
 
-**The vector backend is 87.8% of a verification** (the three AVX2 rows plus the
-table build). That is the same conclusion as §11.3, reached from the other end:
-the vector backend delivers where it is wired in, and signature verification is
-where it is wired in. It is also the in-repository counterpart of the group
-profile's 40.8%.
+**The vector backend is 86.8% of a verification** (the three AVX2 rows). That is
+the same conclusion as §11.3, reached from the other end: the vector backend
+delivers where it is wired in, and signature verification is where it is wired
+in. It is also the in-repository counterpart of the group profile's 40.8%.
+
+The runtime `NafLookupTable5` build no longer appears as its own row. With
+`precomputed-tables` on — which is the default, and which the corrected harness
+now actually links — the basepoint's table is the static `NafLookupTable8`
+constant, so only **one** table is built at runtime (for `A`), and it inlines
+into the caller. That is why the `vartime_double_base` self row grows from
+15.08% to 17.09% while the total falls.
 
 ### 9.2 The sixteen inversions are not in verification. There is exactly one
 
@@ -966,12 +975,19 @@ available without `alloc`; `FieldElement::internal_invert_batch` became
 | `EdwardsBasepointTable::create` | 990 203 ns | **236 475 ns** | **−76.1% (4.19×)** | 3/3 |
 | instructions per `create` (callgrind, exact) | 9 885 001 | **2 942 694** | **−70.2%** | — |
 | `x25519_mul_base_clamped` | 13 813 | 13 776 | unchanged | — |
-| `ed25519_verify` | 38 919 | 37 936 | unchanged | — |
+| ~~`ed25519_verify`~~ | ~~38 919~~ | ~~37 936~~ | **withdrawn, see §9.7** | — |
 
-The two unchanged rows are the point of including them: the crate ships its
-basepoint table as a constant, so nothing on either hot path builds one. This
-helps a consumer that calls `BasepointTable::create` at runtime for a point of
-its own, and it helps nobody else.
+The unchanged `mul_base_clamped` row is the point of including it: the crate
+ships its basepoint table as a constant, so nothing on either hot path builds
+one. This helps a consumer that calls `BasepointTable::create` at runtime for a
+point of its own, and it helps nobody else.
+
+The `ed25519_verify` row is **withdrawn**. It was measured against a different
+copy of this crate (§9.7), so it was guaranteed to report "unchanged" whatever
+this change did — it was not evidence. The claim it was offered for is better
+made without it, and was always available: verification never calls
+`BasepointTable::create`, which is a fact about the call graph rather than a
+measurement, so batching that constructor cannot move it in either direction.
 
 **Correctness.** Montgomery's trick returns a different *representative* of each
 inverse than `invert` does — both are weakly reduced, and weak reduction is not
@@ -1015,14 +1031,15 @@ though only one site could use them, because they are what makes the refusals in
 ### 9.5 safegcd, reassessed against verification. Still refused
 
 §11.11 deferred safegcd with the inversion at 5.3% of `mul_clamped`. On the
-verification path it is worth more: 9.19% in `pow2k` plus 0.81% in the
-inversion's multiplications, so **10.0% of a verification**. Against the group
-profile's 40.8% for verification that is about 4% of the client.
+verification path it is worth more: 9.73% in `pow2k` plus 0.91% in the
+inversion's multiplications, so **10.6% of a verification** (§9.1 as corrected;
+the share rose slightly because the corrected denominator is smaller). Against
+the group profile's 40.8% for verification that is about 4% of the client.
 
 Refused again, on three counts, and the first is new:
 
 1. **The ceiling is low and the alternative is better where it exists.** A
-   safegcd inversion is usually quoted at 2–4× Fermat, so 10.0% becomes perhaps
+   safegcd inversion is usually quoted at 2–4× Fermat, so 10.6% becomes perhaps
    5–7% of a verification, i.e. 2–3% of the group client. Meanwhile §9.4 shows
    the crate's *existing* batch inversion is worth 6–10× wherever several
    inversions co-occur. The algorithmic lever with real leverage is "find a set
@@ -1067,20 +1084,82 @@ cost \\(2^{w-2}-1\\) additions to build:
 | 6 | 16 | 15 | 36.6 | 51.6 |
 | 7 | 32 | 31 | 32.0 | 63.0 |
 
-Width 5 is the minimum, and the crate already uses it. The measurement agrees:
-the table build is 17 778 instructions per verification, 5.0% of it, and going
-to width 6 would double that to gain about six additions out of a loop that also
-performs 256 doublings — roughly +5% against −1.4%. Not attempted beyond the
-arithmetic, because the arithmetic is not close.
+Width 5 is the minimum, and the crate already uses it. Going to width 6 would
+double the table build to gain about six additions out of a loop that also
+performs 256 doublings. The conclusion rests on that addition count, which is
+arithmetic and does not depend on any measurement; it was not attempted beyond
+the arithmetic because the arithmetic is not close.
+
+**One supporting number here was wrong** and is withdrawn: this section
+originally said "the table build is 17 778 instructions per verification, 5.0%
+of it". That was measured against a build *without* `precomputed-tables`
+(§9.7), where the basepoint's table is also built at runtime — so it was two
+builds, not one, and priced against an inflated total. On the corrected build
+the single remaining build inlines into its caller and does not separate out at
+all. The ranking of widths is unaffected.
 
 Consistently, the crate uses width **8** for the *precomputed* basepoint table,
 where the build cost is paid once at compile time and the only term left is the
 addition count. That is the same trade resolved with one term deleted, and it is
 resolved the other way, which is a good sign the model is right.
 
-### 9.7 Where a group message's `serial::u64` time goes
+### 9.7 The verification kernel was measuring the wrong crate
 
-The group profile's 15.4% in `serial::u64`, against 87.8% of a *verification*
+This is recorded rather than quietly fixed, because the failure mode is worth
+more than the numbers it cost.
+
+`ed25519-dalek` depends on `curve25519-dalek` **by version**, not by path. The
+benchmark harness is its own workspace, and its `[patch.crates-io]` covered
+`curve25519-dalek-derive` but not `curve25519-dalek` itself. So Cargo resolved
+`ed25519-dalek`'s dependency to the *published* 5.0.0 from crates.io, and the
+harness binary linked **two copies** of the crate: the path copy under the field
+and ladder kernels, the registry copy under `ed25519_verify`. The lockfile said
+so plainly, with two `name = "curve25519-dalek"` entries, one carrying a
+`source = "registry+…"` and a checksum.
+
+**The consequence is worse than wrong numbers.** `ed25519_verify` was blind to
+this repository. It would have reported "unchanged" for a real regression
+exactly as readily as for a real improvement — which is the worst failure a
+measurement tool can have, because it fails silently and in the direction of
+reassurance. Every use of that kernel as a *control* was vacuous, including the
+§9.3 row that offered it as evidence that batched table construction leaves the
+hot paths alone.
+
+What it cost, all now corrected in place:
+
+| claim | published | corrected |
+| --- | ---: | ---: |
+| instructions per verification (§9.1) | 354 575 | **315 697** |
+| AVX2 share of a verification (§9.1) | 87.8% | **86.8%** |
+| the one inversion's share (§9.5) | 10.0% | **10.6%** |
+| runtime NAF table build (§9.6) | 17 778 Ir, 5.0% | one build, inlined |
+
+The registry build was 11% more expensive for two structural reasons, both
+downstream of `precomputed-tables` being off in it: the basepoint's odd-multiples
+table was built at runtime instead of being the static constant, so there were
+two table builds per verification rather than one; and the basepoint used a
+width-5 wNAF instead of width 8, costing roughly fourteen extra additions.
+
+**No conclusion in §9 changes.** The load-bearing arguments there are facts
+about the call graph — that `as_affine` is called from exactly one place, that
+the vector backend contains no runtime `invert`, that `compress` performs one
+inversion — and those were established by reading the source and by counting
+`pow2k` calls, both of which are true of either copy. The safegcd refusal moves
+from 10.0% to 10.6%, which strengthens it as an argument and does not come close
+to reversing it.
+
+The fix is one line of `[patch.crates-io]` in the harness manifest, with a
+comment saying why it must stay. The general lesson is the one this document
+already applies to `cfg`s and features in §12: **a measurement you have not
+verified is measuring the thing you changed is not a measurement.** The cheap
+check that would have caught it is to make a change you *know* is large, and
+confirm the number moves.
+
+---
+
+### 9.8 Where a group message's `serial::u64` time goes
+
+The group profile's 15.4% in `serial::u64`, against 86.8% of a *verification*
 being AVX2, is consistent: whatever serial time a group message spends is not
 inside verification, except for the single `compress` inversion. From this
 crate's side there are exactly two sources it can be:
@@ -1088,7 +1167,7 @@ crate's side there are exactly two sources it can be:
 1. **Montgomery ladder work** — every X25519 operation is `serial::u64` in every
    backend (§11.3), and this is precisely the work §4 through §8 reduced by
    10.1% stock and 28.7% under fat LTO.
-2. **`compress`'s inversion**, at 10.0% of each verification.
+2. **`compress`'s inversion**, at 10.6% of each verification.
 
 There is no third: `mul_base` is serial in every backend too, but it appears in
 the group profile only through key generation, not per message. Nothing else in
@@ -1744,6 +1823,12 @@ so the trade could be re-made — and one of them since has been.
     `mul121666` or `mul`. This is what would catch the two being wrong the same
     way.
 
+* **The harness links this crate, checked rather than assumed.** After §9.7,
+  the harness manifest patches `curve25519-dalek` itself, and the lockfile
+  carries exactly one entry for it with no `source = "registry+…"`. Worth
+  re-checking whenever a bench-only dependency is added: any crate that depends
+  on `curve25519-dalek` by version will silently pull a second copy.
+
 * **Ed25519 reference vectors.** `window.rs` changed, and `LookupTable` is what
   every fixed-base multiplication selects from, so `ed25519-dalek`'s
   `against_reference_implementation` was run explicitly: the 128 vectors of
@@ -1861,6 +1946,7 @@ the step, which is what makes §4 and §7 pay.
 | **F — squaring's 128-bit doublings** | **Changed.** `square_limbs` doubled five 128-bit coefficients; `2*(x*y) == (2*x)*y`, so four precomputed 64-bit doublings cover all ten mirror-pair products instead — which is what `serial::u32` has always done. Isolated `fe_square` **−5.4%** (7/7 paired runs) and **−10.5%** with `+bmi2`; `mul_clamped` **−2.2%** with `+bmi2`, −0.7% stock; `fe_invert` −5.8%. The time win is several times the −1.29% instruction win because the 128-bit shift was on the dependency chain (§7). Bit-for-bit identical; wasm32 module byte-identical. |
 | **G — the ladder's subtractions** | **Changed.** `Sub` adds `16p` and must then `reduce`, because it has to accept anything at the crate-wide `b < 3`. The ladder's four subtractions all take `mul`/`square` outputs, which are far narrower, so a separate `sub_unreduced` offsets by `2p` and needs no reduction — a new operation with its own stated precondition, not a change to `Sub`'s contract. `mul_clamped` **−6.1%** on baseline `x86-64` and **−3.7%** with `+avx2,+bmi2`, 3/3 paired runs each, −6.58% instructions; `mul_base_clamped` unchanged. Not limb-for-limb identical — a different representative — so it is checked on field equality, the limb bound, debug-assertions across the whole suite, and the 1000-iteration RFC 7748 ladder vector. `serial::u32` forwards to `Sub`: the same bound closes there with only 0.167 bits of margin against a silent `u32` overflow (§8.4). |
 | **H — batching the affine table conversions** | **Changed.** `LookupTable<AffineNielsPoint>::from` converted eight multiples one at a time, one field inversion each, so `EdwardsBasepointTable::create` did **256** — 91% of its cost. The chain depends on the previous multiple's *value*, not its affine form, so it runs in extended coordinates and converts all eight at the end with Montgomery's trick. `create` **−76.1% (4.19×)**, 3/3 paired runs, −70.2% instructions. Both hot paths unchanged: the crate ships its table as a constant. Not limb-for-limb identical — the batch returns a different weakly-reduced representative — so it is checked on canonical bytes against a verbatim copy of the old code, on the identity, and against the precomputed table (§9.3). |
+| **The verify kernel measured the wrong crate** | **Found and fixed (§9.7).** `ed25519-dalek` depends on `curve25519-dalek` by version, and the harness patched only `curve25519-dalek-derive`, so the binary linked two copies and `ed25519_verify` profiled the published 5.0.0 rather than this tree. It was blind to every change here — reporting "unchanged" for a regression as readily as for a win. Corrected: **354 575 → 315 697 Ir**, AVX2 87.8% → **86.8%**, the inversion 10.0% → **10.6%**. No conclusion in §9 changes, because they rest on the call graph rather than on these totals. |
 | **Batching verification's inversions** | **Refused: there is nothing to batch.** An Ed25519 verification performs **exactly one** field inversion, in `compress`; the vector table build and the wNAF loop perform none, and the vector backend contains no runtime `invert` at all. The profile's sixteen `as_affine` cannot be in verification, and cannot be sixteen X25519 operations either — that would be four times the whole message's cycle budget (§9.2). |
 | **safegcd, second look** | **Refused again.** Worth more here than in §11.11 — 10.0% of a verification, ~4% of the group client — but a 2–4× inversion caps the win at 2–3% of the client, while the crate's *existing* batch inversion is worth 6–10× wherever inversions co-occur. It also cannot be the variable-time kind, because `compress` is shared with secret-derived callers (§9.5). |
 | **wNAF width / vartime tables** | **Refused analytically.** §11.5's rejection does *not* transfer — `NafLookupTable5::select` is a direct index, not a constant-time scan — but width 5 is already the minimum of build-plus-loop additions (49.7 against 51.6 at width 6), and the build is only 5.0% of a verification (§9.6). |

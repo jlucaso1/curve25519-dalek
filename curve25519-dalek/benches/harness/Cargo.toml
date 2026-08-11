@@ -34,6 +34,15 @@ ed25519-dalek = { path = "../../../ed25519-dalek", default-features = false }
 
 [patch.crates-io]
 curve25519-dalek-derive = { path = "../../../curve25519-dalek-derive" }
+# `ed25519-dalek` depends on `curve25519-dalek` *by version*, not by path. This
+# harness is its own workspace, so without this patch Cargo resolves that to the
+# published 5.0.0 from crates.io and the binary links **two** copies of the
+# crate: the path one for the field/ladder kernels, the registry one underneath
+# `ed25519_verify`. The verification kernel would then be blind to every change
+# in this repository — reporting "unchanged" for a real regression exactly as
+# readily as for a real improvement, which is the worst failure mode a
+# measurement tool has. Keep this patch.
+curve25519-dalek = { path = "../.." }
 
 [profile.release]
 opt-level = 3
