@@ -963,6 +963,13 @@ to a `v128`. That the gain is 15.7% on key generation, which is scan-dominated,
 and 4.6% on the ladder, which does 256 conditional swaps but is otherwise
 multiplication-bound, follows directly from that split.
 
+**Verified before recommending it.** A build flag that changes generated code is
+a correctness question, not just a speed one, so the two modules were run
+side by side over all twelve kernels at three iteration counts each and their
+returned checksums compared: identical in every case. The kernels chain their
+output back into the next iteration, so a checksum match covers the full
+sequence of field and point operations, not just a final value.
+
 So this is the wasm32 counterpart of the `+bmi2` result in §3.5: a consumer-side
 build flag worth more than any source change measured here, and for the same
 reason — the target has a capability the code can use that the default feature
