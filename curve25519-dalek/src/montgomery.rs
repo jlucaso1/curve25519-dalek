@@ -209,6 +209,49 @@ impl MontgomeryPoint {
         x0.as_affine()
     }
 
+    /// The ladder over a scalar held as little-endian bytes.
+    ///
+    /// Identical in every operation to
+    /// `mul_bits_be(scalar.bits_le().rev().skip(1))` — `bits_le` is defined as
+    /// `bytes[i >> 3] >> (i & 7) & 1` over `0..256`, so reversing and skipping
+    /// one yields exactly `i = 254 ..= 0` — but it indexes the bytes directly
+    /// instead of going through `Rev<Skip<Map<Range>>>`.
+    ///
+    /// That indirection is not free. LLVM cannot prove `i >> 3 < 32` through the
+    /// iterator adaptors, so the ladder carries a **slice bounds check with a
+    /// panic edge on every one of its 255 bits**, plus the `Skip` flag test and
+    /// the `Range` emptiness test. Indexing a fixed-size array with a loop-local
+    /// `i` makes the bound a compile-time fact and all three fold away.
+    fn mul_bits_be_bytes(&self, bytes: &[u8; 32]) -> MontgomeryPoint {
+        // Algorithm 8 of Costello-Smith 2017, as in `mul_bits_be`.
+        let affine_u = FieldElement::from_bytes(&self.0);
+        let mut x0 = ProjectivePoint::identity();
+        let mut x1 = ProjectivePoint {
+            U: affine_u,
+            W: FieldElement::ONE,
+        };
+
+        let mut prev_bit = 0u8;
+        for i in (0..255).rev() {
+            let cur_bit = (bytes[i >> 3] >> (i & 7)) & 1;
+            let choice = prev_bit ^ cur_bit;
+
+            debug_assert!(choice == 0 || choice == 1);
+
+            ProjectivePoint::conditional_swap(&mut x0, &mut x1, choice.into());
+            differential_add_and_double(&mut x0, &mut x1, &affine_u);
+
+            prev_bit = cur_bit;
+        }
+        // `prev_bit` is now bit 0 of the scalar, as in `mul_bits_be`.
+        ProjectivePoint::conditional_swap(&mut x0, &mut x1, Choice::from(prev_bit));
+        // Don't leave the bit on the stack
+        #[cfg(feature = "zeroize")]
+        prev_bit.zeroize();
+
+        x0.as_affine()
+    }
+
     /// View this `MontgomeryPoint` as an array of bytes.
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
@@ -506,7 +549,7 @@ impl Mul<&Scalar> for &MontgomeryPoint {
     fn mul(self, scalar: &Scalar) -> MontgomeryPoint {
         // We multiply by the integer representation of the given Scalar. By scalar invariant #1,
         // the MSB is 0, so we can skip it.
-        self.mul_bits_be(scalar.bits_le().rev().skip(1))
+        self.mul_bits_be_bytes(scalar.as_bytes())
     }
 }
 
@@ -631,6 +674,32 @@ mod test {
 
     /// Given a bytestring that's little-endian at the byte level, return an iterator over all the
     /// bits, in little-endian order.
+    /// The byte-indexed ladder must agree with the iterator-driven one it
+    /// replaced, for every scalar — not just for clamped ones.
+    ///
+    /// This is the equivalence the refactor rests on, and asserting it here is
+    /// also what keeps `Scalar::bits_le` in use: the ladder was its only caller,
+    /// so the two spellings are now checked against each other rather than one
+    /// of them being deleted.
+    #[test]
+    fn mul_bits_be_bytes_matches_iterator() {
+        let mut bytes = [0u8; 32];
+        for case in 0..64u32 {
+            // A spread of shapes: small, dense, sparse, and with low bits set,
+            // which the clamped path never produces.
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = (case.wrapping_mul(0x9E37_79B9) >> (i % 24)) as u8 ^ (i as u8);
+            }
+            bytes[31] &= 0x7f; // scalar invariant #1: below 2^255
+            let s = Scalar { bytes };
+
+            let p = MontgomeryPoint::mul_base_clamped([case as u8; 32]);
+            let want = p.mul_bits_be(s.bits_le().rev().skip(1));
+            let got = p.mul_bits_be_bytes(s.as_bytes());
+            assert_eq!(want, got, "ladders disagree for case {case}");
+        }
+    }
+
     fn bytestring_bits_le(x: &[u8]) -> impl DoubleEndedIterator<Item = bool> + Clone + '_ {
         let bitlen = x.len() * 8;
         (0..bitlen).map(|i| {
