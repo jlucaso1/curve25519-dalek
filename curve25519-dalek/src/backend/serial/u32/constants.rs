@@ -78,9 +78,9 @@ pub(crate) const SQRT_M1: FieldElement2625 = FieldElement2625::from_limbs([
 ///
 /// The Montgomery ladder used to multiply by this with the general field
 /// multiplication; it now calls `FieldElement2625::mul121666` instead, which
-/// computes the same thing without the twenty-odd multiplications by the
-/// zero limbs of this constant. The value is kept because the differential
-/// test for `mul121666` checks the two against each other.
+/// computes the same thing without the ninety zero-limb partial products the
+/// general 10x10 multiplication would perform. The value is kept because the
+/// differential test for `mul121666` checks the two against each other.
 #[cfg(test)]
 pub(crate) const APLUS2_OVER_FOUR: FieldElement2625 =
     FieldElement2625::from_limbs([121666, 0, 0, 0, 0, 0, 0, 0, 0, 0]);

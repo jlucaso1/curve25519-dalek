@@ -13,6 +13,8 @@
 //! uniformly available across targets.
 
 use curve25519_dalek::constants;
+use std::sync::OnceLock;
+
 use curve25519_dalek::edwards::{
     EdwardsBasepointTableRadix32, EdwardsBasepointTableRadix64, EdwardsPoint,
 };
@@ -36,6 +38,7 @@ pub const K_TO_MONTGOMERY: u32 = 7;
 pub const K_FE_INVERT: u32 = 8;
 pub const K_ED_MUL_BASE_R64: u32 = 9;
 pub const K_ED_MUL_BASE_R32: u32 = 10;
+pub const K_ED_VARTIME_DOUBLE: u32 = 11;
 
 pub const KERNELS: &[(u32, &str, u32)] = &[
     // (selector, name, field operations per iteration)
@@ -48,6 +51,7 @@ pub const KERNELS: &[(u32, &str, u32)] = &[
     (K_ED_MUL_BASE_R32, "edwards_mul_base_radix32", 1),
     (K_ED_MUL_BASE_R64, "edwards_mul_base_radix64", 1),
     (K_TO_MONTGOMERY, "edwards_to_montgomery", 1),
+    (K_ED_VARTIME_DOUBLE, "edwards_vartime_double_base", 1),
     (K_MUL_CLAMPED, "x25519_mul_clamped", 1),
     (K_MUL_BASE_CLAMPED, "x25519_mul_base_clamped", 1),
 ];
@@ -56,6 +60,22 @@ pub const KERNELS: &[(u32, &str, u32)] = &[
 /// `--cfg curve25519_dalek_bench_internals`, because `FieldElement` is
 /// `pub(crate)`.
 pub const HAS_FIELD_KERNELS: bool = cfg!(curve25519_dalek_bench_internals);
+
+/// The larger basepoint tables, built once. Constructing a radix-64 table costs
+/// on the order of a thousand point operations; leaving that inside the timed
+/// region would fold it into every repetition and inflate the very numbers the
+/// radix comparison exists to produce.
+fn table_radix32() -> &'static EdwardsBasepointTableRadix32 {
+    static TABLE: OnceLock<EdwardsBasepointTableRadix32> = OnceLock::new();
+    TABLE
+        .get_or_init(|| EdwardsBasepointTableRadix32::create(&EdwardsPoint::mul_base(&Scalar::ONE)))
+}
+
+fn table_radix64() -> &'static EdwardsBasepointTableRadix64 {
+    static TABLE: OnceLock<EdwardsBasepointTableRadix64> = OnceLock::new();
+    TABLE
+        .get_or_init(|| EdwardsBasepointTableRadix64::create(&EdwardsPoint::mul_base(&Scalar::ONE)))
+}
 
 /// Deterministic pseudo-random 32 bytes; fixed so that every target and every
 /// backend is fed identical input.
@@ -115,7 +135,7 @@ pub fn run_kernel(which: u32, iters: u32) -> u64 {
             sum.compress().to_bytes()[0] as u64
         }
         K_ED_MUL_BASE_R32 => {
-            let table = EdwardsBasepointTableRadix32::create(&EdwardsPoint::mul_base(&Scalar::ONE));
+            let table = table_radix32();
             let mut s = Scalar::from_bytes_mod_order(seed_bytes(5));
             let mut sum = EdwardsPoint::default();
             for _ in 0..iters {
@@ -129,12 +149,26 @@ pub fn run_kernel(which: u32, iters: u32) -> u64 {
             // additions) instead of the 30 KB radix-16 table `mul_base` uses.
             // The table is built once, outside the timed loop, the way a
             // consumer holding one in a static would.
-            let table = EdwardsBasepointTableRadix64::create(&EdwardsPoint::mul_base(&Scalar::ONE));
+            let table = table_radix64();
             let mut s = Scalar::from_bytes_mod_order(seed_bytes(5));
             let mut sum = EdwardsPoint::default();
             for _ in 0..iters {
                 sum += table.mul_base(&s);
                 s += Scalar::ONE;
+            }
+            sum.compress().to_bytes()[0] as u64
+        }
+        K_ED_VARTIME_DOUBLE => {
+            // The signature-verification shape (aA + bB). This is one of the
+            // few operations the vector backend actually covers, so it is the
+            // control for "does AVX2 do anything at all in this build".
+            let a = Scalar::from_bytes_mod_order(seed_bytes(7));
+            let mut b = Scalar::from_bytes_mod_order(seed_bytes(8));
+            let point_a = EdwardsPoint::mul_base(&a);
+            let mut sum = EdwardsPoint::default();
+            for _ in 0..iters {
+                sum += EdwardsPoint::vartime_double_scalar_mul_basepoint(&a, &point_a, &b);
+                b += Scalar::ONE;
             }
             sum.compress().to_bytes()[0] as u64
         }

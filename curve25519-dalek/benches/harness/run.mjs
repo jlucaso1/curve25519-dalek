@@ -25,6 +25,7 @@ const KERNELS = [
   [10, "edwards_mul_base_radix32", 1],
   [9, "edwards_mul_base_radix64", 1],
   [7, "edwards_to_montgomery", 1],
+  [11, "edwards_vartime_double_base", 1],
   [3, "x25519_mul_clamped", 1],
   [4, "x25519_mul_base_clamped", 1],
 ];

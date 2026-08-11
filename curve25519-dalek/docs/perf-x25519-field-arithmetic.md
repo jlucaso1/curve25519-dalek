@@ -49,10 +49,23 @@ changes neither X25519 operation (see §4.1, `serial` row) —
 `mul_clamped` 59.97 µs vs 59.84 µs and `mul_base_clamped` 18.81 µs vs 18.77 µs,
 both inside run-to-run noise.
 
-**Conclusion: on x86_64, the AVX2 backend accelerates ed25519/ristretto
-variable-base and multiscalar work, and does nothing at all for either X25519
-operation.** A binary with AVX2 compiled in spending its time in `serial::u64`
-is the expected behaviour, not a misconfiguration.
+And the other half of the claim, measured rather than assumed — the vector
+backend *is* live in this build and does deliver where it applies.
+`EdwardsPoint::vartime_double_scalar_mul_basepoint`, the
+signature-verification shape and one of the operations the vector backend does
+cover:
+
+| backend | `vartime_double_scalar_mul_basepoint` |
+| --- | ---: |
+| `"simd"` (AVX2, the default here) | **38 491 ns** |
+| `"serial"` | 47 949 ns (+24.6%) |
+
+**Conclusion: on x86_64, the AVX2 backend is working — it is worth ~20% on
+ed25519/ristretto variable-base and multiscalar work — and it does nothing at
+all for either X25519 operation.** A binary with AVX2 compiled in and 531 AVX2
+instructions present, spending its time in `serial::u64`, is the expected
+behaviour rather than a misconfiguration: runtime detection succeeds, the
+vectorized code runs, and the Montgomery ladder simply never calls it.
 
 ### Field operations per `mul_clamped`
 
@@ -624,6 +637,21 @@ addition for the batched form — comparable in size to `docs/parallel-formulas.
 Edwards work, and it would not speed up the single-exchange case this work is
 about.
 
+There is a related and more tractable gap worth recording, though. The vector
+backend covers `variable_base`, `straus`, `precomputed_straus` and `pippenger`,
+but **not** fixed-base multiplication: `EdwardsPoint::mul_base` is serial in
+every backend. That is 80% of `mul_base_clamped` (§7.4), i.e. of every ephemeral
+key generation. Whether vectorizing it would pay is genuinely unclear — §7.5
+shows the constant-time window scan, not the point additions, is what dominates
+there, and a scan is a different thing to vectorize than an addition chain — but
+it is the one place where the existing vector backend has an obvious hole on
+this hot path.
+
+For what it is worth, the vector backend demonstrably works where it is wired
+in: §1 measures `vartime_double_scalar_mul_basepoint` at 38 491 ns under
+`"simd"` against 47 949 ns under `"serial"`. So this is a coverage gap, not a
+dead backend.
+
 ---
 
 ### 7.4 Where `mul_base_clamped` spends its time
@@ -647,29 +675,38 @@ The inversion is not doing anything wasteful: `invert` is Fermat, 254 squarings
 and 11 multiplications, and 254 x 14.10 + 11 x 25.36 = 3 860 ns predicts the
 measured 3 766 to within 2.5%. It is optimal *as an exponentiation*.
 
-### 7.5 Bigger basepoint tables are slower, on both targets
+### 7.5 Bigger basepoint tables do not help, on either target
 
 `EdwardsPoint::mul_base` uses the 30 KB radix-16 table. The crate also exposes
 radix-32/64/128/256 tables as public API, documented as needing fewer additions
 (64 → 47 → 43), so a consumer chasing fixed-base throughput would reasonably try
-one. **On both targets that makes it slower**, monotonically:
+one. Best of three runs, minimum of 15 repetitions each, ns:
 
 | table | size | additions | x86_64 | wasm32 |
 | --- | ---: | ---: | ---: | ---: |
-| radix-16 (what `mul_base` uses) | 30 KB | 64 | **15 153** | **44 080** |
-| radix-32 | 60 KB | 47 | 16 416 (+8.3%) | 60 554 (+37%) |
-| radix-64 | 120 KB | 43 | 19 800 (+30.7%) | 94 636 (+115%) |
+| radix-16 (what `mul_base` uses) | 30 KB | 64 | **15 229** | **45 039** |
+| radix-32 | 60 KB | 47 | 15 369 (+0.9%) | 45 655 (+1.4%) |
+| radix-64 | 120 KB | 43 | 17 302 (+13.6%) | 54 066 (+20.0%) |
+
+Doubling the table to radix-32 is a wash — the difference is inside this host's
+run-to-run spread — and quadrupling it to radix-64 is clearly worse. So there is
+no reason to move off the default, and a consumer who does pays in binary size
+and, at radix-64, in time as well.
 
 The addition count is the wrong thing to optimize, because the lookup has to be
-constant time: selecting one of the entries in a window is a linear scan over
-all of them. Going from radix-16 to radix-64 cuts additions by a third but
-takes the scan from 64 x 8 = 512 conditional selects to 43 x 32 = 1376, each
-over a three-field-element `AffineNielsPoint`. The scan wins the trade, and the
-120 KB working set does not help either.
+constant time: selecting one entry from a window is a linear scan over all of
+them. Radix-64 cuts additions by a third but takes the scan from 64 × 8 = 512
+conditional selects to 43 × 32 = 1376, each over a three-field-element
+`AffineNielsPoint`. The scan wins the trade.
 
-Recorded because this is a plausible-sounding "optimization" that a downstream
-consumer might reach for; the crate's default is already the right choice, and
-on wasm32 the wrong choice costs 2.1x.
+> **Correction.** An earlier revision of this document reported these
+> differences as +8.3%/+30.7% on x86_64 and +37%/+115% on wasm32. Those figures
+> were an artifact of the harness: the radix-32 and radix-64 tables were being
+> constructed *inside* the timed kernel, so a table build — on the order of a
+> thousand point operations — was amortized into every repetition, and worst
+> where the calibrated iteration count was smallest. The tables are now built
+> once behind a `OnceLock`, outside the timing boundary. The ordering was
+> unaffected; the magnitudes were not. Thanks to CodeRabbit for catching it.
 
 ### 7.6 What is left, and why it was not attempted
 
@@ -789,5 +826,5 @@ is worth.
 | **D — ladder's multiply by 121666** | **Changed.** A specialized `mul121666` (fiat's verified `carry_scmul_121666` on the fiat backends) replaces a general multiplication whose operand had four zero limbs. Isolated 2.5x cheaper on x86_64, 3.8x on wasm32. `mul_clamped` −6.0% on a stock release build and −7.0% on wasm32; nothing under fat LTO, where the inliner already folded it. Complementary to C: between them every build profile improves. |
 | **Combined C + D** | x86_64 stock release **−9.3%**, fat LTO **−21.7%**, fat LTO + `+adx,+bmi2` **−24.2%**; wasm32 **−7.0%** (`serial::u32`) and **−8.5%** (`fiat_u32`). |
 | **Vector backend for Montgomery** | Viable but not worthwhile for single exchanges; the win would require a batched multi-exchange API. Not implemented. |
-| **Bigger basepoint tables** | **Measured and rejected.** radix-32 is 8% slower than the default radix-16 on x86_64 and 37% slower on wasm32; radix-64 is 31% and 115% slower. The constant-time window scan grows faster than the addition count falls. The crate's default is already right. |
+| **Bigger basepoint tables** | **Measured and rejected.** radix-32 is a wash against the default radix-16 (+0.9% x86_64, +1.4% wasm32) for twice the table size; radix-64 is +13.6% and +20.0% for four times. The constant-time window scan grows faster than the addition count falls. The crate's default is already right. |
 | **Faster field inversion (safegcd)** | **Not attempted.** The top remaining lever — the inversion is 8% of `mul_clamped` and 20% of `mul_base_clamped`, and a constant-time binary GCD would plausibly be 2–4x faster than Fermat. Deferred because its constant-time property is global to the iteration rather than local, unlike the two changes above, which are bit-for-bit verifiable against the code they replace. |
