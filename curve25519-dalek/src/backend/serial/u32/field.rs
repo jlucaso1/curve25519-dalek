@@ -617,15 +617,66 @@ impl FieldElement2625 {
         FieldElement2625::reduce(self.square_inner())
     }
 
-    /// Compute `self - rhs`, matching `FieldElement51::sub_unreduced`'s
-    /// signature so `montgomery.rs` can stay backend-agnostic.
+    /// Compute `self - rhs` without the trailing reduction.
     ///
-    /// Currently forwards to the ordinary subtraction: the same `2p`-offset
-    /// trick applies in principle to the ten-limb layout, but its bit-excess
-    /// accounting is per-limb-parity and has not been verified here, and an
-    /// unverified bound in a subtraction is not worth a few percent.
+    /// # Preconditions
+    ///
+    /// Every limb of `rhs` must be at most the corresponding limb of `2p`, so
+    /// the offset subtraction cannot underflow, and every limb of `self` must
+    /// be a `reduce` output — below `2^26.007` for even limbs and `2^25.007`
+    /// for odd ones. Both hold for the outputs of `mul`, `square` and
+    /// `mul121666`, which is all the Montgomery ladder feeds this.
+    ///
+    /// # Postcondition
+    ///
+    /// Each limb is below `2^26.007 + 2^27 = 3.005 * 2^26` (even) and
+    /// `2^25.007 + 2^26 = 3.005 * 2^25` (odd), i.e. bit excess `b = 1.5875`.
+    ///
+    /// # Why this is tight, and why it is checked rather than argued
+    ///
+    /// `Mul` precomputes `19 * y[i]` in a **`u32`** (see the comment at its
+    /// definition: it fits iff `26 + b + lg(19) < 32`, i.e. `b < 1.752`). At
+    /// `b = 1.5875` this passes **by 0.167 bits — about 12%** — where the
+    /// 64-bit backend has a factor of two.
+    ///
+    /// A margin that thin was previously judged not worth taking, because the
+    /// failure mode is not a panic but a silent `u32` wraparound producing a
+    /// wrong field element inside a constant-time primitive. The margin has not
+    /// changed; what has is that the bound is now **asserted** rather than
+    /// argued — `debug_assert!` checks the binding constraint itself, that
+    /// `19 * limb` still fits a `u32`, on every limb of every result. Any future
+    /// change that widens an input past what this can absorb fails loudly in
+    /// debug and test builds instead of silently returning the wrong answer.
     pub(crate) fn sub_unreduced(&self, rhs: &FieldElement2625) -> FieldElement2625 {
-        self - rhs
+        // 2p, limb by limb.
+        const TWO_P: [u32; 10] = [
+            0x3ffffed << 1,
+            0x1ffffff << 1,
+            0x3ffffff << 1,
+            0x1ffffff << 1,
+            0x3ffffff << 1,
+            0x1ffffff << 1,
+            0x3ffffff << 1,
+            0x1ffffff << 1,
+            0x3ffffff << 1,
+            0x1ffffff << 1,
+        ];
+
+        let mut out = [0u32; 10];
+        for i in 0..10 {
+            debug_assert!(
+                rhs.0[i] <= TWO_P[i],
+                "sub_unreduced: rhs limb {i} exceeds 2p, subtraction would underflow",
+            );
+            out[i] = (self.0[i] + TWO_P[i]) - rhs.0[i];
+            // The binding constraint, checked directly rather than via `b`:
+            // `Mul` computes `19 * limb` in a `u32`.
+            debug_assert!(
+                out[i] <= u32::MAX / 19,
+                "sub_unreduced: limb {i} would overflow `19 * limb` in a u32",
+            );
+        }
+        FieldElement2625(out)
     }
 
     /// Multiply this field element by \\((A+2)/4 = 121666\\), the constant the
@@ -762,5 +813,52 @@ mod test {
 
             assert_eq!(x.mul121666().to_bytes(), acc.to_bytes());
         }
+    }
+    /// `sub_unreduced` must be the same field element as the general
+    /// subtraction, and must leave every limb inside what `Mul`'s `19 * y[i]`
+    /// can hold in a `u32`. The second half is the whole reason this was not
+    /// taken earlier, so it is asserted on the worst case the precondition
+    /// admits, not only on typical values.
+    #[test]
+    fn sub_unreduced_agrees_with_sub() {
+        let mut rng = Rng(0x5eed_dead_beef_2625);
+
+        // The precondition is "both operands are `mul`/`square` outputs".
+        // Produce them rather than assume their shape.
+        for _ in 0..1024 {
+            let x = &rng.field_element(0) * &rng.field_element(0);
+            let y = rng.field_element(0).square();
+
+            let fast = x.sub_unreduced(&y);
+
+            assert_eq!(fast.to_bytes(), (&x - &y).to_bytes());
+            assert!(
+                fast.0.iter().all(|&l| l <= u32::MAX / 19),
+                "a limb would overflow `19 * limb` in a u32",
+            );
+        }
+
+        // The worst case the precondition admits: `self` at the top of what
+        // `reduce` can return and `rhs` at zero, which maximises every output
+        // limb. This is the input that decides whether the 0.167 bits of margin
+        // are real. Even limbs `2^26.007`, odd `2^25.007`.
+        let hi = FieldElement2625([
+            67435296, 33717648, 67435296, 33717648, 67435296, 33717648, 67435296, 33717648,
+            67435296, 33717648,
+        ]);
+        let lo = FieldElement2625::ZERO;
+        let worst = hi.sub_unreduced(&lo);
+        assert_eq!(worst.to_bytes(), (&hi - &lo).to_bytes());
+        assert!(
+            worst.0.iter().all(|&l| l <= u32::MAX / 19),
+            "the worst permitted input overflows `19 * limb`",
+        );
+        // And the margin is what the doc comment claims: about 12%.
+        let peak = *worst.0.iter().max().unwrap() as u64;
+        assert!(
+            peak * 19 * 100 / (u32::MAX as u64) >= 85 && peak * 19 <= u32::MAX as u64,
+            "margin moved: 19 * peak is {} of u32::MAX",
+            peak * 19 * 100 / (u32::MAX as u64),
+        );
     }
 }

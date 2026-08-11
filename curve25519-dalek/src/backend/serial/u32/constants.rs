@@ -80,8 +80,10 @@ pub(crate) const SQRT_M1: FieldElement2625 = FieldElement2625::from_limbs([
 /// multiplication; it now calls `FieldElement2625::mul121666` instead, which
 /// computes the same thing without the ninety zero-limb partial products the
 /// general 10x10 multiplication would perform. The value is kept because the
-/// differential test for `mul121666` checks the two against each other.
-#[cfg(test)]
+/// differential test for `mul121666` checks the two against each other — and
+/// that test lives in this backend's `field.rs`, which the `fiat` build does
+/// not compile, so the constant is not built there either.
+#[cfg(all(test, not(curve25519_dalek_backend = "fiat")))]
 pub(crate) const APLUS2_OVER_FOUR: FieldElement2625 =
     FieldElement2625::from_limbs([121666, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
