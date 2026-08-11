@@ -867,7 +867,52 @@ the scan exists to feed. This is the quantitative version of §8.5: the scan, no
 the addition count, is what dominates fixed-base multiplication, which is why
 larger tables lose.
 
-### 8.7 What is left, and why it was not attempted
+### 8.7 Reordering the ladder step: fewer instructions, slower where it counts
+
+§8.6 shows `differential_add_and_double`'s self cost is 966 instructions per
+step, while the arithmetic in it accounts for only about 820. The rest is
+register pressure: the step holds up to six live field elements, thirty `u64`,
+against sixteen general-purpose registers, so the allocator spills.
+
+The statements in the step are pure dataflow, so any topological order computes
+the same values — reordering is semantically free and therefore risk-free, and
+`callgrind` measures it exactly. Three schedules were tried, instructions for 20
+`mul_clamped`:
+
+| schedule | `differential_add_and_double` | program total |
+| --- | ---: | ---: |
+| as written (`t0..t3`, squarings, P+Q half, doubling tail) | 4 926 600 | 12 269 825 |
+| A: doubling half completed first, `t2`/`t3` still hoisted | 4 834 800 | 12 176 959 |
+| **B: doubling half first *and* `t2`/`t3` sunk to their use** | **4 753 200** | **12 095 359** |
+| C: both multiplications first, doubling tail last | 4 819 500 | 12 161 659 |
+
+B is the best: **−173 400 instructions, −1.42% of the program**, or 34 fewer per
+ladder step. A is worse than B because hoisting `t2`/`t3` merely trades `t4`/`t5`'s
+live range for theirs.
+
+**And then it loses on wasm32.** Five alternating paired runs, minimum of 13
+repetitions:
+
+| | `x25519_mul_clamped`, wasm32 |
+| --- | ---: |
+| as written | **124 359 ns** |
+| schedule B | 126 167 ns (**+1.5%**) |
+
+Slower in all five pairs. On x86_64 the 1.45% instruction reduction is below the
+2.5% noise floor and unmeasurable either way, so the change would buy nothing
+there and cost 1.5% on the target where instruction count was supposed to
+matter.
+
+Reverted. The lesson is worth keeping: **x86-64 instruction count is not a proxy
+for wasm32 time.** The two targets run different backends — `serial::u64` against
+`serial::u32` — with different liveness, and V8 does its own register allocation
+and scheduling on top. This is the same caution as §7 about `bits="64"`, arrived
+at from the opposite direction, and it is why the conditional-swap change in §6
+was accepted on a *measured* wasm32 win rather than on its instruction count
+alone.
+
+### 8.8 What is left, and why it was not attempted
+
 
 
 After §4, §5 and §6, both hot loops are at their published operation counts and
@@ -1032,4 +1077,5 @@ the trade can be re-made by someone who wants it.
 | **Combined C + D + E** | Certified against `origin/main` in one alternating session (§6.4): x86_64 stock release **−9.7%**, stock + `+adx,+bmi2` **−10.0%**, fat LTO **−25.0%**, fat LTO + `+adx,+bmi2` **−25.3%**; wasm32 **−8.8%**. `mul_base_clamped` unchanged in every cell. |
 | **Vector backend for Montgomery** | Viable but not worthwhile for single exchanges; the win would require a batched multi-exchange API. Not implemented. |
 | **Bigger basepoint tables** | **Measured and rejected.** radix-32 is a wash against the default radix-16 (+0.9% x86_64, +1.4% wasm32) for twice the table size; radix-64 is +13.6% and +20.0% for four times. The constant-time window scan grows faster than the addition count falls. The crate's default is already right. |
+| **Reordering the ladder step** | **Measured and reverted.** A pure-dataflow reschedule that shortens live ranges removes 1.42% of x86-64 instructions — and is 1.5% *slower* on wasm32 across five paired runs, while being below the noise floor on x86_64. Instruction count on one target is not a proxy for time on another (§8.7). |
 | **Faster field inversion (safegcd)** | **Not attempted.** The top remaining lever — the inversion is 8% of `mul_clamped` and 20% of `mul_base_clamped`, and a constant-time binary GCD would plausibly be 2–4x faster than Fermat. Deferred because its constant-time property is global to the iteration rather than local, unlike the two changes above, which are bit-for-bit verifiable against the code they replace. |
