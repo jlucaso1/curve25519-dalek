@@ -58,6 +58,14 @@ pub mod spec {
     }
 }
 
+// These call `spec_avx2` directly rather than through `backend::mul_base`, so
+// they bypass the runtime `cpuid` check that makes the shipped path safe.
+// `curve25519_dalek_backend = "simd"` only says a dispatched backend was
+// compiled in — an x86_64 host without AVX2 still compiles this module — so
+// without a `target_feature` gate these tests would `SIGILL` there. Same gate
+// as the AVX2 field and point tests. CI's stable `simd` job builds with
+// `-C target_feature=+avx2`, so they do run.
+#[cfg(target_feature = "avx2")]
 #[cfg(test)]
 mod test {
     use super::spec_avx2::mul_base;
