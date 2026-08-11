@@ -77,6 +77,9 @@ macro_rules! impl_lookup_table {
             }
         }
 
+        // Only the basepoint tables, which are `precomputed-tables`-gated, hold
+        // `AffineNielsPoint`s and call this.
+        #[cfg(feature = "precomputed-tables")]
         impl $name<AffineNielsPoint> {
             /// `select`, specialised for the type every basepoint table holds.
             ///
@@ -378,10 +381,13 @@ impl<'a> From<&'a EdwardsPoint> for NafLookupTable8<AffineNielsPoint> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::scalar::Scalar;
 
     /// `select_or` must agree with the generic `select` on every input in the
     /// documented range, for every table radix a basepoint table uses. It is a
     /// different formulation of the same selection, so agreement is exact.
+    // `select_or` exists only when the basepoint tables that call it do.
+    #[cfg(feature = "precomputed-tables")]
     #[test]
     fn select_or_matches_select() {
         use crate::constants::ED25519_BASEPOINT_POINT;
@@ -404,8 +410,6 @@ mod test {
             assert_eq!(want.xy2d.to_bytes(), got.xy2d.to_bytes(), "xy2d at x={x}");
         }
     }
-    use super::*;
-    use crate::scalar::Scalar;
 
     /// The pre-batch construction, kept verbatim so the batched one is checked
     /// against the code it replaced rather than against a re-derivation.

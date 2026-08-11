@@ -194,6 +194,7 @@ impl FieldElement2625 {
     /// `mask` must be all-ones or all-zeros. Used by the constant-time window
     /// scan in `window.rs`, which OR-accumulates masked table entries into a
     /// zeroed accumulator rather than conditionally assigning into a live one.
+    #[cfg(feature = "precomputed-tables")]
     #[inline(always)]
     pub(crate) fn or_masked_assign(&mut self, other: &Self, mask: u64) {
         let m = mask as u32;
