@@ -11,7 +11,7 @@
 //! and `="simd"`, because the vector backend had a variable-base path and no
 //! fixed-base one. This runs the same ladder — 64 additions and one
 //! `mul_by_pow_2(4)`, indexed identically — over `ExtendedPoint` and
-//! `CachedPoint`. See §13.11 of `docs/perf-x25519-field-arithmetic.md`.
+//! `CachedPoint`. See §13.12 of `docs/perf-x25519-field-arithmetic.md`.
 //!
 //! **AVX2 only.** `CachedPoint` has a different limb layout in the `ifma`
 //! backend, so a shipped table there would have to be a second constant with

@@ -9,6 +9,51 @@ major series.
 
 ### Other Changes
 
+* Perf: `EdwardsPoint::mul_base` runs on the vector backend when AVX2 is live.
+  The fixed-base ladder ran entirely in `serial::u64` even with the vector
+  backend selected -- `edwards_mul_base` cost an identical instruction count
+  under `curve25519_dalek_backend="serial"` and `="simd"` -- because the vector
+  backend had a variable-base path and no fixed-base one. The same radix-16
+  ladder now runs over the AVX2 point types: `mul_base` -45.1% in instructions
+  and -32.9% in wall clock, `x25519_mul_base_clamped` -24.0%. This adds a
+  40,960-byte basepoint table to AVX2 builds, alongside the existing 30 KB
+  serial table, which non-AVX2 builds and the public `EdwardsBasepointTable`
+  API still need; it is a size-for-speed trade rather than a replacement.
+  Dispatch is on the same runtime CPU check every other vector entry point
+  uses, so a machine without AVX2 keeps the serial ladder. The `avx512` backend
+  also keeps it, its `CachedPoint` having a different limb layout. The
+  generated table is verified entry by entry against the basepoint.
+* Perf: the AVX2 field multiply is instantiated once per call site. LLVM shared
+  one outlined body across the three `FieldElement2625x4` multiplies on the
+  verification path, where it cannot specialise on the operand shapes each site
+  has; an unused const generic gives each its own copy. `ed25519_verify` -3.21%
+  in instructions for +784 bytes of `.text`. Output is bit-for-bit identical --
+  all instantiations compute the same function -- and the change is inert, not
+  wrong, if a future compiler stops sharing the body.
+* Perf: `serial::u64`'s field multiply is emitted by operand scanning. Without
+  BMI2, `mul` writes `rdx:rax` and the register allocator spills: 234
+  instructions, 89 of them touching `%rsp`. Streaming one `a[i]` across five
+  long-lived accumulators -- the same 25 products and the same carry chain --
+  gives 212 instructions and 45 stack touches. Isolated `fe_mul` -3.40%,
+  `x25519_mul_clamped` -1.74%, `edwards_mul_base` 165,680 -> 161,920. Output is
+  bit-for-bit identical.
+* Perf: `serial::u32`'s ladder subtractions skip their reduction too, matching
+  `serial::u64`. This is the backend wasm32 uses, and it closes the bit-excess
+  bound with only 0.167 bits -- about 12% -- of margin, against a factor of two
+  for the 64-bit case. Because the failure mode of that margin is a silent
+  `u32` wraparound rather than a panic, the binding constraint is asserted
+  rather than argued: `debug_assert!` checks that `19 * limb` still fits a
+  `u32` on every limb of every result. `x25519_mul_clamped` -4.39% on the u32
+  backend. Congruent to but not limb-for-limb identical with `Sub`.
+* Perf: the Montgomery ladder indexes the scalar's bytes instead of walking an
+  iterator chain, removing two bounds checks from the binary.
+  `x25519_mul_clamped` -1.32%. Constant time is unaffected: the operation
+  sequence is identical and the index is a public loop counter.
+* Fix: `optional_multiscalar_mul` switched from Straus to Pippenger at 190
+  points, below where the two actually cross. Pippenger carries a large fixed
+  cost -- 43 digit columns, each summing 62 buckets regardless of input size --
+  so Straus is still ahead there. Measured instruction counts put the crossover
+  higher; at n = 200 the old threshold cost 3.63% more than Straus would have.
 * Perf: `serial::u64::FieldElement51::square` no longer goes through `pow2k(1)`.
   The squaring step is factored out of `pow2k`'s loop, so a single squaring no
   longer pays for the loop and call machinery it cannot amortize. X25519
@@ -41,7 +86,7 @@ major series.
   256 inversions — 91% of its cost. The multiples depend on each other's value,
   not on their affine form, so the chain now runs in extended coordinates and all
   eight conversions share a single inversion via Montgomery's trick. Table
-  creation improves 76%; the crate's own hot paths are unchanged, since it ships
+  creation improves 74.8% (3.97x); the crate's own hot paths are unchanged, since it ships
   its basepoint table as a constant. Uses a fixed-size batch, so it needs no
   `alloc`. The batch returns a different weakly-reduced representative than
   `invert` does, so the result is equal as a field element but not limb for limb;

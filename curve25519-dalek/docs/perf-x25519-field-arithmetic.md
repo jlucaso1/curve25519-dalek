@@ -2040,7 +2040,7 @@ number.
 
 Not implemented; the working tree was reverted to the serial chain.
 
-### 13.11 What is left, and why it was not attempted
+### 13.11 What is left, and why it was not attempted (one item since taken)
 
 
 
@@ -2065,6 +2065,19 @@ the *ratio* is the claim here, not the absolute figures):
   15.0 µs for `mul_base`, the remainder being the constant-time window scan and
   the four doublings — consistent with §13.5, where the scan is what makes the
   larger tables lose.
+
+  > **This bullet was wrong, and §13.12 is what it missed.** Every operation
+  > count in it is correct, and the conclusion drawn from them — that the
+  > fixed-base loop is at its floor — was off by **45%**. The error is in the
+  > `25.36 ns`: that is the cost of a `serial::u64` multiplication, and the
+  > analysis never asked whether that was the multiplication being used. It was,
+  > and it did not have to be. Pricing 7M per window at the serial rate assumes
+  > the backend the loop happens to run on, and an operation count cannot see an
+  > assumption like that — it prices the operations it is given.
+  >
+  > Worth keeping as written, because "both hot loops are at their published
+  > operation counts" was true the whole time and is exactly why this went
+  > unexamined for eleven sections.
 
 The one substantial remaining lever is the **field inversion**: 3 766 ns on
 x86_64 and 9 280 ns on wasm32, which §13.6 pins down exactly as 5.3% of a
@@ -2117,7 +2130,7 @@ so the trade could be re-made — and one of them since has been.
 
 ---
 
-### 13.11 `mul_base` now reaches the vector backend: −45.1%
+### 13.12 `mul_base` now reaches the vector backend: −45.1%
 
 `edwards_mul_base` used to cost an identical 153 913 instructions under
 `curve25519_dalek_backend = "serial"` and `= "simd"` — not close, identical. The
@@ -2193,6 +2206,48 @@ Who benefits is worth stating plainly, because it is not verification:
 clamping. Verification goes through `vartime_double_scalar_mul_basepoint`, which
 was already vectorised. A workload dominated by verification does not notice
 this.
+
+### 13.13 The whole branch, end to end
+
+§6.4 certified §4 + §5 + §6 and said so explicitly; §7 onwards were each
+measured against the tree in front of them. Nine more changes landed after that,
+so the cumulative claim is worth taking once more, directly rather than
+assembled from per-change deltas.
+
+Both arms use the **same harness**, differing only in the library: the base
+restored with `git checkout a3549477 -- curve25519-dalek/src`, `HEAD` for the
+branch, `-C target-feature=+avx2` on both. Instruction counts are exact, with
+fixed setup differenced out by the usual long-run-against-short-run subtraction.
+
+| kernel | `main` (a3549477) | this branch | change |
+| --- | ---: | ---: | ---: |
+| `x25519_mul_clamped` — DH | 662 659 | **449 330** | **−32.2%** |
+| `x25519_mul_base_clamped` — keygen | 179 696 | **116 266** | **−35.3%** |
+| `edwards_mul_base` — fixed base | 146 601 | **84 546** | **−42.3%** |
+| `ed25519_verify` — verification | 331 696 | **306 124** | **−7.7%** |
+| `edwards_vartime_double_base` | 289 626 | **265 538** | **−8.3%** |
+| `edwards_table_create` | 10 011 269 | **2 641 096** | **−73.6%** |
+| `edwards_to_montgomery` | 37 789 | **36 312** | −3.9% |
+
+Wall clock, minimum of 15 repetitions, best of five alternating rounds:
+
+| | `main` | this branch | change |
+| --- | ---: | ---: | ---: |
+| DH | 58 188 ns | **38 095 ns** | **−34.5%** |
+| keygen | 16 222 ns | **12 276 ns** | **−24.3%** |
+| verification | 33 230 ns | **31 727 ns** | −4.5% |
+
+**Verification moves least, and that is the honest shape of the result.** It was
+already the best-served path in the crate — 87.4% AVX2, with the vector backend
+wired in — so what was left there was the backend's own inefficiencies (§10) and
+nothing structural. DH, keygen and fixed base moved most because they were not
+served at all: the ladder never reaches the vector backend by construction
+(§13.3), and `mul_base` did not reach it for no reason other than that nobody
+had written the path (§13.12).
+
+These numbers do not compose with the per-change figures elsewhere in this
+document and should not be added to them. Several were measured on different
+hosts across several sessions; this table is one host, one session, two binaries.
 
 ## 14. Validation
 
@@ -2415,7 +2470,7 @@ the step, which is what makes §4 and §7 pay.
 | **G — the ladder's subtractions** | **Changed.** `Sub` adds `16p` and must then `reduce`, because it has to accept anything at the crate-wide `b < 3`. The ladder's four subtractions all take `mul`/`square` outputs, which are far narrower, so a separate `sub_unreduced` offsets by `2p` and needs no reduction — a new operation with its own stated precondition, not a change to `Sub`'s contract. `mul_clamped` **−6.1%** on baseline `x86-64` and **−3.7%** with `+avx2,+bmi2`, 3/3 paired runs each, −6.58% instructions; `mul_base_clamped` unchanged. Not limb-for-limb identical — a different representative — so it is checked on field equality, the limb bound, debug-assertions across the whole suite, and the 1000-iteration RFC 7748 ladder vector. `serial::u32` takes the same offset, where the bound closes with only **0.167 bits** (12%) of margin against a silent `u32` overflow, so `debug_assert!` checks that `19 * limb` still fits on every limb of every result rather than arguing it: **−4.39%** on `mul_clamped` there, the backend wasm32 uses (§8.4). |
 | **H — batching the affine table conversions** | **Changed.** `LookupTable<AffineNielsPoint>::from` converted eight multiples one at a time, one field inversion each, so `EdwardsBasepointTable::create` did **256** — 91% of its cost. The chain depends on the previous multiple's *value*, not its affine form, so it runs in extended coordinates and converts all eight at the end with Montgomery's trick. `create` **−74.8% (3.97×)**, 7/7 paired runs, −72.1% instructions. Both hot paths unchanged: the crate ships its table as a constant. Not limb-for-limb identical — the batch returns a different weakly-reduced representative — so it is checked on canonical bytes against a verbatim copy of the old code, on the identity, and against the precomputed table (§9.3). |
 | **I — tagging the AVX2 multiply per call site** | **Changed.** LLVM emitted one shared outlined body for the three `FieldElement2625x4` multiplies on the verification path; an unused `const N: u8` gives each site its own instantiation. `ed25519_verify` **−3.21% instructions** (316 280 → 306 124, callgrind, exact) for **+784 bytes** of `.text`. Wall-clock cannot resolve it — the host's spread was five times the effect — so the instruction count is the claim. The `Mul` operator stays as the untagged spelling; the tags are inert if a future LLVM stops sharing. A paired `negate_lazy` substitution was **refused** separately: −0.015%, and it would invalidate a documented `b < 0.007` bound (§10.5). |
-| **J — vectorising `mul_base`** | **Changed.** `edwards_mul_base` cost an identical 153 913 instructions under the serial and simd backends: the fixed-base ladder never reached the vector backend, which had no fixed-base path. It now runs the same radix-16 ladder over `ExtendedPoint`/`CachedPoint`, against a new 40 960-byte `BASEPOINT_TABLE`. **−45.1% instructions** (153 910 → 84 546), **−32.9%** wall clock (12 579 → 8 444 ns), and `x25519_mul_base_clamped` **−24.0%**. Dispatched through `get_selected_backend()`'s runtime `cpuid`, not the backend cfg, which denotes a dispatched backend and not AVX2 hardware. Costs 40 KB of `.rodata` alongside the serial table, which the public API still needs; `avx512` keeps the serial ladder, its `CachedPoint` layout differing. The generated table is checked entry by entry against the basepoint (§13.11). |
+| **J — vectorising `mul_base`** | **Changed.** `edwards_mul_base` cost an identical 153 913 instructions under the serial and simd backends: the fixed-base ladder never reached the vector backend, which had no fixed-base path. It now runs the same radix-16 ladder over `ExtendedPoint`/`CachedPoint`, against a new 40 960-byte `BASEPOINT_TABLE`. **−45.1% instructions** (153 910 → 84 546), **−32.9%** wall clock (12 579 → 8 444 ns), and `x25519_mul_base_clamped` **−24.0%**. Dispatched through `get_selected_backend()`'s runtime `cpuid`, not the backend cfg, which denotes a dispatched backend and not AVX2 hardware. Costs 40 KB of `.rodata` alongside the serial table, which the public API still needs; `avx512` keeps the serial ladder, its `CachedPoint` layout differing. The generated table is checked entry by entry against the basepoint (§13.12). |
 | **The verify kernel measured the wrong crate** | **Found and fixed (§9.7).** `ed25519-dalek` depends on `curve25519-dalek` by version, and the harness patched only `curve25519-dalek-derive`, so the binary linked two copies and `ed25519_verify` profiled the published 5.0.0 rather than this tree. It was blind to every change here — reporting "unchanged" for a regression as readily as for a win. Corrected: **354 575 → 330 457 Ir**, AVX2 87.8% → **87.4%**, the inversion 10.0% → **10.2%**. No conclusion in §9 changes, because they rest on the call graph rather than on these totals. The first attempt at the correction was itself contaminated by an uncommitted experiment and had to be re-taken in a pristine worktree; §9.7 records that too. |
 | **Batching verification's inversions** | **Refused: there is nothing to batch.** An Ed25519 verification performs **exactly one** field inversion, in `compress`; the vector table build and the wNAF loop perform none, and the vector backend contains no runtime `invert` at all. The profile's sixteen `as_affine` cannot be in verification, and cannot be sixteen X25519 operations either — that would be four times the whole message's cycle budget (§9.2). |
 | **safegcd, second look** | **Refused again.** Worth more here than in §13.11 — 10.0% of a verification, ~4% of the group client — but a 2–4× inversion caps the win at 2–3% of the client, while the crate's *existing* batch inversion is worth 6–10× wherever inversions co-occur. It also cannot be the variable-time kind, because `compress` is shared with secret-derived callers (§9.5). |

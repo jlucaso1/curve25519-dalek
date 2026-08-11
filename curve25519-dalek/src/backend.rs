@@ -259,7 +259,7 @@ where
 /// Perform constant-time fixed-base scalar multiplication against the Ed25519
 /// basepoint.
 ///
-/// The AVX2 arm runs the ladder over the vector point types (§13.11); every
+/// The AVX2 arm runs the ladder over the vector point types (§13.12); every
 /// other arm uses the serial radix-16 table, including `avx512`, whose
 /// `CachedPoint` has a different limb layout and so would need a second
 /// generated constant.
