@@ -310,7 +310,6 @@ impl<'a> From<&'a EdwardsPoint> for NafLookupTable8<AffineNielsPoint> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::constants;
     use crate::scalar::Scalar;
 
     /// The pre-batch construction, kept verbatim so the batched one is checked
@@ -376,6 +375,8 @@ mod test {
     #[cfg(feature = "precomputed-tables")]
     fn created_table_agrees_with_precomputed() {
         use crate::traits::BasepointTable;
+
+        use crate::constants;
 
         let created =
             crate::edwards::EdwardsBasepointTable::create(&constants::ED25519_BASEPOINT_POINT);
