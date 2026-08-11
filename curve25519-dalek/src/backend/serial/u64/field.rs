@@ -472,6 +472,68 @@ impl FieldElement51 {
         FieldElement51(square_limbs(self.0))
     }
 
+    /// Multiply this field element by \\((A+2)/4 = 121666\\), the constant the
+    /// Montgomery ladder needs once per step.
+    ///
+    /// `&x * &constants::APLUS2_OVER_FOUR` gives the same answer, but that
+    /// constant is `[121666, 0, 0, 0, 0]`, so twenty of the twenty-five partial
+    /// products in the general multiplication are multiplications by zero, and
+    /// the four `b[i] * 19` precomputations are `0 * 19`. The compiler cannot
+    /// fold them away because `mul` is not inlined into the ladder.
+    ///
+    /// Only the five surviving products are computed here. The carry chain is
+    /// the same one `mul` uses, so the result is bit-for-bit identical to the
+    /// general multiplication; `mul121666_matches_general_mul` checks that.
+    #[rustfmt::skip] // keep alignment of c* calculations
+    pub fn mul121666(&self) -> FieldElement51 {
+        /// \\((A+2)/4\\), the only value this is ever called with.
+        const APLUS2_OVER_FOUR: u128 = 121666;
+
+        let a: &[u64; 5] = &self.0;
+
+        // Precondition, as for `mul`: a[i] < 2^(51 + b) with b < 3.
+        debug_assert!(a[0] < (1 << 54));
+        debug_assert!(a[1] < (1 << 54));
+        debug_assert!(a[2] < (1 << 54));
+        debug_assert!(a[3] < (1 << 54));
+        debug_assert!(a[4] < (1 << 54));
+
+        // c[i] = a[i] * 121666 < 2^54 * 2^16.9 = 2^70.9, so the carries
+        // c[i] >> 51 are below 2^20 and everything below stays far inside its
+        // type. This is the same shape as `mul`'s coefficients, just smaller.
+        let     c0: u128 = (a[0] as u128) * APLUS2_OVER_FOUR;
+        let mut c1: u128 = (a[1] as u128) * APLUS2_OVER_FOUR;
+        let mut c2: u128 = (a[2] as u128) * APLUS2_OVER_FOUR;
+        let mut c3: u128 = (a[3] as u128) * APLUS2_OVER_FOUR;
+        let mut c4: u128 = (a[4] as u128) * APLUS2_OVER_FOUR;
+
+        const LOW_51_BIT_MASK: u64 = (1u64 << 51) - 1;
+        let mut out = [0u64; 5];
+
+        c1 += ((c0 >> 51) as u64) as u128;
+        out[0] = (c0 as u64) & LOW_51_BIT_MASK;
+
+        c2 += ((c1 >> 51) as u64) as u128;
+        out[1] = (c1 as u64) & LOW_51_BIT_MASK;
+
+        c3 += ((c2 >> 51) as u64) as u128;
+        out[2] = (c2 as u64) & LOW_51_BIT_MASK;
+
+        c4 += ((c3 >> 51) as u64) as u128;
+        out[3] = (c3 as u64) & LOW_51_BIT_MASK;
+
+        let carry: u64 = (c4 >> 51) as u64;
+        out[4] = (c4 as u64) & LOW_51_BIT_MASK;
+
+        // carry < 2^20, so out[0] + carry * 19 < 2^51 + 2^24.3, no overflow.
+        out[0] += carry * 19;
+
+        out[1] += out[0] >> 51;
+        out[0] &= LOW_51_BIT_MASK;
+
+        FieldElement51(out)
+    }
+
     /// Returns 2 times the square of this field element.
     pub fn square2(&self) -> FieldElement51 {
         let mut square = square_limbs(self.0);
@@ -773,6 +835,64 @@ mod test {
                 };
                 assert_eq!(x.square2().to_bytes(), two_x_sq.to_bytes());
             }
+        }
+    }
+
+    /// `mul121666` must agree with the general multiplication by
+    /// `APLUS2_OVER_FOUR` limb for limb: it is a specialization of exactly that
+    /// product, and the ladder feeds its output straight into the next
+    /// operation's bit-excess accounting.
+    #[test]
+    fn mul121666_matches_general_mul() {
+        use crate::backend::serial::u64::constants::APLUS2_OVER_FOUR;
+
+        let mut rng = Rng(0xc0ff_ee00_c0ff_ee00);
+
+        for bits in [51u32, 52, 53, 54] {
+            for _ in 0..512 {
+                let x = rng.field_element(bits);
+                assert_eq!(x.mul121666().0, (&x * &APLUS2_OVER_FOUR).0);
+            }
+        }
+
+        // Top of the documented bit excess, and the degenerate inputs.
+        let edge = FieldElement51([(1u64 << 54) - 1; 5]);
+        assert_eq!(edge.mul121666().0, (&edge * &APLUS2_OVER_FOUR).0);
+
+        for limbs in [
+            [0u64; 5],
+            [1, 0, 0, 0, 0],
+            [0, 0, 0, 0, 1],
+            [(1 << 54) - 1, 0, 0, 0, 0],
+        ] {
+            let x = FieldElement51(limbs);
+            assert_eq!(x.mul121666().0, (&x * &APLUS2_OVER_FOUR).0);
+        }
+    }
+
+    /// Independent of the limb comparison above: `mul121666` must equal
+    /// multiplying by 121666 built only out of `add`, which shares no code with
+    /// either `mul121666` or `mul`. This is what catches the two of them being
+    /// wrong in the same way.
+    #[test]
+    fn mul121666_is_multiplication_by_121666() {
+        let mut rng = Rng(0x1357_9bdf_1357_9bdf);
+
+        for _ in 0..64 {
+            let x = rng.field_element(51);
+
+            // Double-and-add over the bits of 121666, reducing after every step
+            // so the limbs never leave the documented bit excess. `reduce` is
+            // the same carry chain `add`'s callers rely on.
+            let mut acc = FieldElement51::ZERO;
+            for i in (0..17).rev() {
+                acc = FieldElement51::reduce((&acc + &acc).0);
+                if (121666u32 >> i) & 1 == 1 {
+                    acc = FieldElement51::reduce((&acc + &x).0);
+                }
+            }
+
+            assert_eq!(x.mul121666().to_bytes(), acc.to_bytes());
         }
     }
 

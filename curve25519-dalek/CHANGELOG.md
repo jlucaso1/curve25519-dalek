@@ -15,6 +15,12 @@ major series.
   `mul_clamped` improves by ~3.5% in a stock release build and ~22% with fat
   LTO; the output is bit-for-bit identical and the 5x51 limb representation and
   its bit-excess preconditions are unchanged.
+* Perf: the Montgomery ladder's multiplication by `(A+2)/4 = 121666` no longer
+  goes through the general field multiplication, whose second operand had four
+  zero limbs. Each backend gains a `mul121666`; the fiat backends use
+  fiat-crypto's own verified `carry_scmul_121666`. X25519 `mul_clamped` improves
+  by ~6% in a stock release build and ~7-8.5% on wasm32, with bit-for-bit
+  identical output on the hand-written backends.
 * Docs: `docs/perf-x25519-field-arithmetic.md` records a measurement pass over
   the X25519 field arithmetic on x86_64 (ADX/BMI2) and wasm32, including why an
   ADX assembly path was not added and why wasm32 keeps the 32-bit backend. This

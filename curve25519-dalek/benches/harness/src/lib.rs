@@ -25,12 +25,14 @@ pub const K_FE_SQUARE: u32 = 1;
 pub const K_FE_POW2K50: u32 = 2;
 pub const K_MUL_CLAMPED: u32 = 3;
 pub const K_MUL_BASE_CLAMPED: u32 = 4;
+pub const K_FE_MUL121666: u32 = 5;
 
 pub const KERNELS: &[(u32, &str, u32)] = &[
     // (selector, name, field operations per iteration)
     (K_FE_MUL, "fe_mul", 1),
     (K_FE_SQUARE, "fe_square", 1),
     (K_FE_POW2K50, "fe_pow2k50", 50),
+    (K_FE_MUL121666, "fe_mul121666", 1),
     (K_MUL_CLAMPED, "x25519_mul_clamped", 1),
     (K_MUL_BASE_CLAMPED, "x25519_mul_base_clamped", 1),
 ];
@@ -109,6 +111,11 @@ fn run_field_kernel(which: u32, iters: u32) -> u64 {
         K_FE_POW2K50 => {
             for _ in 0..iters {
                 x = x.pow2k(50);
+            }
+        }
+        K_FE_MUL121666 => {
+            for _ in 0..iters {
+                x = x.mul121666();
             }
         }
         _ => return 0,

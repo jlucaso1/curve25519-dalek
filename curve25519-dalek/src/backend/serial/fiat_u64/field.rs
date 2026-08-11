@@ -247,6 +247,20 @@ impl FieldElement51 {
         output
     }
 
+    /// Multiply this field element by \\((A+2)/4 = 121666\\), the constant the
+    /// Montgomery ladder needs once per step.
+    ///
+    /// fiat-crypto generates a dedicated, formally verified routine for exactly
+    /// this constant, so the ladder does not have to pay for a general
+    /// multiplication whose second operand is `[121666, 0, ...]`.
+    pub fn mul121666(&self) -> FieldElement51 {
+        let mut self_loose = fiat_25519_loose_field_element([0; 5]);
+        fiat_25519_relax(&mut self_loose, &self.0);
+        let mut output = FieldElement51::ZERO;
+        fiat_25519_carry_scmul_121666(&mut output.0, &self_loose);
+        output
+    }
+
     /// Returns 2 times the square of this field element.
     pub fn square2(&self) -> FieldElement51 {
         let mut self_loose = fiat_25519_loose_field_element([0; 5]);

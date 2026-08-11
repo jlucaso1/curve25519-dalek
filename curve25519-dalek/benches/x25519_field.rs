@@ -75,7 +75,8 @@ mod x25519_benches {
 mod field_benches {
     use super::*;
     use curve25519_dalek::bench_internals::{
-        FieldElement, MULS_PER_MUL_CLAMPED, SQUARES_PER_MUL_CLAMPED, invert,
+        FieldElement, MUL121666_PER_MUL_CLAMPED, MULS_PER_MUL_CLAMPED, SQUARES_PER_MUL_CLAMPED,
+        invert, mul121666,
     };
 
     fn fe(seed: u8) -> FieldElement {
@@ -92,6 +93,12 @@ mod field_benches {
 
         g.bench_function("FieldElement::mul", |b| {
             b.iter(|| black_box(&a) * black_box(&b_))
+        });
+
+        // The ladder's one multiplication by (A+2)/4 = 121666 per step. The
+        // ratio against `FieldElement::mul` is what this specialization buys.
+        g.bench_function("FieldElement::mul121666", |b| {
+            b.iter(|| mul121666(black_box(&a)))
         });
 
         g.bench_function("FieldElement::square", |b| {
@@ -149,6 +156,9 @@ mod field_benches {
                 let y = *black_box(&b_);
                 for _ in 0..MULS_PER_MUL_CLAMPED {
                     x = &x * &y;
+                }
+                for _ in 0..MUL121666_PER_MUL_CLAMPED {
+                    x = mul121666(&x);
                 }
                 for _ in 0..SQUARES_PER_MUL_CLAMPED {
                     x = x.square();

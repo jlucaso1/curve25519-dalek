@@ -54,7 +54,6 @@ use core::{
     ops::{Mul, MulAssign},
 };
 
-use crate::constants::APLUS2_OVER_FOUR;
 #[cfg(feature = "digest")]
 use crate::constants::{MONTGOMERY_A, MONTGOMERY_A_NEG, SQRT_M1};
 use crate::edwards::{CompressedEdwardsY, EdwardsPoint};
@@ -451,7 +450,7 @@ fn differential_add_and_double(
     let t11 =  t9.square(); // 4 (U_P U_Q - W_P W_Q)^2
     let t12 = t10.square(); // 4 (W_P U_Q - U_P W_Q)^2
 
-    let t13 = &APLUS2_OVER_FOUR * &t6; // (A + 2) U_P U_Q
+    let t13 = t6.mul121666();          // (A + 2) U_P U_Q
 
     let t14 = &t4 * &t5;    // ((U_P + W_P)(U_P - W_P))^2 = (U_P^2 - W_P^2)^2
     let t15 = &t13 + &t5;   // (U_P - W_P)^2 + (A + 2) U_P W_P

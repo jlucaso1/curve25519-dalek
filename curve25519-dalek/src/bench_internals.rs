@@ -58,26 +58,44 @@ pub fn invert(x: &FieldElement) -> FieldElement {
     x.invert()
 }
 
+/// Multiply a field element by \\((A+2)/4 = 121666\\), the specialized product
+/// the ladder uses once per step in place of a general multiplication.
+pub fn mul121666(x: &FieldElement) -> FieldElement {
+    x.mul121666()
+}
+
 /// Number of `differential_add_and_double` steps performed by one
 /// `MontgomeryPoint::mul_clamped` (255 bits, the MSB is skipped).
 pub const LADDER_STEPS: usize = 255;
 
-/// Field multiplications performed by one `differential_add_and_double`.
-pub const MULS_PER_LADDER_STEP: usize = 6;
+/// General field multiplications performed by one
+/// `differential_add_and_double`: `t7`, `t8`, `t14`, `t16`, `t17`.
+pub const MULS_PER_LADDER_STEP: usize = 5;
+
+/// Multiplications by 121666 performed by one `differential_add_and_double`:
+/// `t13`. Counted separately because it is a specialized product costing about
+/// a fifth of a general one, not a general multiplication.
+pub const MUL121666_PER_LADDER_STEP: usize = 1;
 
 /// Field squarings performed by one `differential_add_and_double`.
 pub const SQUARES_PER_LADDER_STEP: usize = 4;
 
 /// Field multiplications performed by `FieldElement::invert` plus the final
 /// `ProjectivePoint::as_affine` multiplication.
-pub const MULS_PER_FINAL_INVERSION: usize = 13;
+///
+/// `pow22501` does 10 (`self * &t1`, then nine `&t_i * &t_j`), `invert` adds
+/// one more, and `as_affine` multiplies by the inverse: 12.
+pub const MULS_PER_FINAL_INVERSION: usize = 12;
 
 /// Field squarings performed by `FieldElement::invert`.
 pub const SQUARES_PER_FINAL_INVERSION: usize = 254;
 
-/// Total field multiplications in one `MontgomeryPoint::mul_clamped`.
+/// Total general field multiplications in one `MontgomeryPoint::mul_clamped`.
 pub const MULS_PER_MUL_CLAMPED: usize =
     LADDER_STEPS * MULS_PER_LADDER_STEP + MULS_PER_FINAL_INVERSION;
+
+/// Total multiplications by 121666 in one `MontgomeryPoint::mul_clamped`.
+pub const MUL121666_PER_MUL_CLAMPED: usize = LADDER_STEPS * MUL121666_PER_LADDER_STEP;
 
 /// Total field squarings in one `MontgomeryPoint::mul_clamped`.
 pub const SQUARES_PER_MUL_CLAMPED: usize =

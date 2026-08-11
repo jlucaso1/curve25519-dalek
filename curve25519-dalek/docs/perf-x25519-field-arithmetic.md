@@ -60,33 +60,38 @@ Counted from `src/montgomery.rs`. One `differential_add_and_double`
 (`montgomery.rs:428`) performs:
 
 * squarings: `t4`, `t5`, `t11`, `t12` → **4**
-* multiplications: `t7`, `t8`, `t13` (`APLUS2_OVER_FOUR * t6`, a full field
-  `mul`), `t14`, `t16`, `t17` → **6**
+* multiplications: `t7`, `t8`, `t13` (`APLUS2_OVER_FOUR * t6`), `t14`, `t16`,
+  `t17` → **6**
 * additions/subtractions: `t0`, `t1`, `t2`, `t3`, `t6`, `t9`, `t10`, `t15` → 8
+
+(`t13` multiplies by the constant 121666. It was a full field multiplication
+when this was counted; §5 replaces it with a specialized one costing about a
+fifth as much. The tables in this section describe the code as it was at the
+start of the work.)
 
 `mul_clamped` → `Mul<&Scalar> for &MontgomeryPoint` → `mul_bits_be(bits_le().rev().skip(1))`
 = **255** steps. The tail is `ProjectivePoint::as_affine`, which is one `invert`
-plus one `mul`; `invert` is `pow22501` (249 squarings via `pow2k`, 11 muls) plus
-`pow2k(5)` and one mul.
+plus one `mul`; `invert` is `pow22501` (249 squarings via `pow2k`, 10 muls —
+`self * &t1` and nine `&t_i * &t_j`) plus `pow2k(5)` and one mul.
 
 | | multiplications | squarings |
 | --- | ---: | ---: |
 | ladder, 255 × `differential_add_and_double` | 1530 | 1020 |
-| final `invert` + `as_affine` | 13 | 254 |
-| **total per `mul_clamped`** | **1543** | **1274** |
+| final `invert` + `as_affine` | 12 | 254 |
+| **total per `mul_clamped`** | **1542** | **1274** |
 
 These are exposed as constants in `src/bench_internals.rs` so the benchmarks can
 use them.
 
 **Cross-check against measurement.** Using the pre-change numbers from §4.1
 (default flags): 1530 × 26.11 ns + 1020 × 22.51 ns = 62.9 µs for the ladder, plus
-254 × 14.37 ns + 13 × 26.11 ns = 4.0 µs for the inversion, giving a predicted
+254 × 14.37 ns + 12 × 26.11 ns = 3.9 µs for the inversion, giving a predicted
 66.9 µs against a measured 59.8 µs. The model is 12% high, which is the expected
 sign and magnitude: within one ladder step the two squarings `t4`/`t5` are
 independent of each other, as are the two multiplications `t7`/`t8`, so the real
 step is faster than a strictly serial sum of latencies. The op count is
 therefore corroborated, and it is what turns "25% of the client in `mul`" into
-"1543 `mul` per X25519".
+"1542 `mul` per X25519".
 
 ---
 
@@ -385,7 +390,107 @@ should set `lto = "fat"` and `-C target-feature=+bmi2`: together those take
 
 ---
 
-## 5. Front B — wasm32 with 64-bit limbs: **refused**
+## 5. Second change: the ladder's multiplication by 121666
+
+### 5.1 The observation
+
+`differential_add_and_double` computed `t13` as
+
+```rust
+let t13 = &APLUS2_OVER_FOUR * &t6;   // (A + 2)/4 = 121666
+```
+
+`APLUS2_OVER_FOUR` is `FieldElement51([121666, 0, 0, 0, 0])` — a 17-bit value in
+limb 0 and four zero limbs. Run through the general 5x5 schoolbook that is
+**twenty of the twenty-five partial products multiplying by zero**, plus four
+`b[i] * 19` precomputations of `0 * 19`.
+
+The compiler does not fix this for you. Disassembling the ladder in a stock
+release build (`+adx,+bmi2`):
+
+```text
+differential_add_and_double   instrs=774  mulx=60  calls=6
+```
+
+The 60 inlined `mulx` are the four squarings (15 each, from §4); all six
+multiplications — including the one whose operand is a compile-time constant
+with four zero limbs — are real calls into the general `mul`, where the zeros
+are invisible. This is exactly what `fe_mul121666` exists for in ref10, donna
+and BoringSSL.
+
+### 5.2 The change
+
+A `mul121666` method on each backend's field element, called by the ladder in
+place of the general multiplication:
+
+* **`serial::u64`** — the five surviving products and the same carry chain
+  `mul` uses. `c[i] = a[i] * 121666 < 2^54 * 2^16.9 = 2^70.9`, so the carries
+  are below `2^20` and every bound in `mul`'s commentary holds with room to
+  spare.
+* **`serial::u32`** — the ten surviving products fed to the existing shared
+  `reduce`. Limb 0 of the constant is even-indexed, so none of the
+  radix-2^25.5 doubling factors that apply to odd-by-odd products come into
+  play.
+* **`fiat_u64` / `fiat_u32`** — `fiat_25519_carry_scmul_121666`, which
+  fiat-crypto already generates for exactly this constant. The verified
+  backends get a verified fast path rather than hand-written arithmetic.
+
+Both hand-written versions are bit-for-bit identical to the general
+multiplication by construction, and the differential tests in §8 check it.
+`APLUS2_OVER_FOUR` is now `#[cfg(test)]`: the only remaining use is the test
+that compares the two against each other.
+
+After the change, the same disassembly:
+
+```text
+differential_add_and_double   instrs=824  mulx=65  calls=5  branches=[]
+```
+
+One fewer call, and the 25-`mulx` general multiply is replaced by five inlined
+`mulx` — precisely the intended transformation. Still no branches.
+
+### 5.3 Results
+
+Isolated, ns per operation, minimum of 15 repetitions:
+
+| target | `mul` | `mul121666` | ratio |
+| --- | ---: | ---: | ---: |
+| x86_64, `serial::u64` | 25.24 | **9.91** | 2.5x cheaper |
+| wasm32, `serial::u32` | 53.74 | **14.04** | 3.8x cheaper |
+| wasm32, `fiat_u32` | 53.45 | **16.33** | 3.3x cheaper |
+
+End-to-end `mul_clamped`, ns, minimum of 15 repetitions:
+
+| target / profile | before 5.2 | after 5.2 | change |
+| --- | ---: | ---: | ---: |
+| x86_64, `lto=off`, `cgu=16` (cargo `--release` default) | 57 380 | **53 935** | **-6.0%** |
+| x86_64, `lto=thin`, `cgu=16` | 57 372 | **53 376** | **-7.0%** |
+| x86_64, `lto=fat`, `cgu=1` | 46 755 | 46 860 | +0.2% (nothing) |
+| x86_64, `lto=fat`, `cgu=1`, `+adx,+bmi2` | 41 242 | **40 857** | -0.9% |
+| wasm32, `serial::u32` | 149 607 | **139 100** | **-7.0%** |
+| wasm32, `fiat_u32` | 139 752 | **127 942** | **-8.5%** |
+
+**This change and the one in §4 are complementary, and that is the useful part.**
+Under fat LTO the inliner already inlines `mul` into the ladder and folds the
+zero limbs itself, so §5 buys nothing there — but that is exactly the profile
+where §4 is worth 22%. Under a stock release build LTO does neither, so §4 is
+worth only 3.5% and §5 picks up another 6%. Neither profile regresses under
+either change, and every profile is now meaningfully faster than the base:
+
+| profile | base | after §4 + §5 | total |
+| --- | ---: | ---: | ---: |
+| x86_64, cargo `--release` default | 59 447 | **53 935** | **-9.3%** |
+| x86_64, `lto=fat` | 59 841 | **46 860** | **-21.7%** |
+| x86_64, `lto=fat`, `+adx,+bmi2` | 53 930 | **40 857** | **-24.2%** |
+| wasm32, `serial::u32` | 149 607 | **139 100** | **-7.0%** |
+| wasm32, `fiat_u32` | 139 752 | **127 942** | **-8.5%** |
+
+wasm32 gains here where it gained nothing from §4, because `serial::u32`
+already had a dedicated `square` and never had the `pow2k(1)` defect.
+
+---
+
+## 6. Front B — wasm32 with 64-bit limbs: **refused**
 
 `build.rs` picks `curve25519_dalek_bits` from `target_pointer_width`, so wasm32
 gets `DalekBits::Dalek32` (`serial::u32::FieldElement2625`), carrying the note:
@@ -451,7 +556,7 @@ behaviour change: the code path it documents is the one that was already taken.
 
 ---
 
-## 6. The rest of the inventory
+## 7. The rest of the inventory
 
 ### 6.1 `pow2k` versus repeated `square`
 
@@ -521,7 +626,7 @@ about.
 
 ---
 
-## 7. Validation
+## 8. Validation
 
 * **Full test suite**, `--all-features`, on every backend path — with and
   without the new cfg, since a path only tested when enabled is not tested:
@@ -558,13 +663,33 @@ about.
     `mul` and `square` against each other. `mul` is unchanged here, so this is a
     regression guard for any future change to the multiplication.
 
-* **Constant time.** `square_limbs` is straight-line code: no branch, no
-  data-dependent memory index, no early return. Verified in the generated
+  For `mul121666` (§5), in both `serial::u64` and `serial::u32`:
+
+  * `mul121666_matches_general_mul` — limb for limb against
+    `&x * &APLUS2_OVER_FOUR` on 512 random elements at each width up to the top
+    of the documented bit excess, plus the all-ones and degenerate limb
+    patterns. This is the specialization's correctness condition.
+  * `mul121666_is_multiplication_by_121666` — double-and-add over the bits of
+    121666 using only `add` and `reduce`, which share no code with either
+    `mul121666` or `mul`. This is what would catch the two being wrong the same
+    way.
+
+* **RFC 7748 known-answer tests.** `montgomery.rs` changed, so the ladder's own
+  vectors were run from the dependent crate: `x25519-dalek`'s
+  `rfc7748_ladder_test1_vectorset1`/`vectorset2` and the four
+  `rfc7748_diffie_hellman` vectors pass, and so does `rfc7748_ladder_test2` —
+  the 1000-iteration iterated-ladder vector that is `#[ignore]`d for cost — run
+  explicitly in release (56.8 s). `ed25519-dalek`'s suite passes too.
+
+* **Constant time.** `square_limbs` and `mul121666` are straight-line code: no
+  branch, no data-dependent memory index, no early return. Verified in the generated
   assembly — the emitted `mul` contains zero `j*`/`cmov`/`set*`; `pow2k` retains
   exactly one `jne`, which is its `k` loop, and `k` is a public exponent-chain
   constant, never secret. `square` no longer appears as an outlined symbol
   because it is a single squaring the optimizer folds into its callers. The
-  refactor moves existing arithmetic without adding a conditional.
+  refactor moves existing arithmetic without adding a conditional. After §5 the
+  whole of `differential_add_and_double` still disassembles with an empty
+  branch/`cmov`/`set*` set.
 
 * **wasm32 builds**: `cargo build --target wasm32-unknown-unknown` succeeds for
   the default, for `--cfg curve25519_dalek_bits="64"`, and for
@@ -579,7 +704,7 @@ about.
 
 ---
 
-## 8. Summary
+## 9. Summary
 
 | front | outcome |
 | --- | --- |
@@ -587,4 +712,6 @@ about.
 | **A′ — build flags (no code)** | `-C target-feature=+adx,+bmi2` is worth −10% to −12% on `mul_clamped`. Deployment finding for consumers. |
 | **B — wasm32 `bits="64"`** | **Refused.** 2.31× slower than the current default. wasm has no 64×64→128 multiply, so `u128` products are emulated. `build.rs`'s `TODO(Wasm32)` closed with evidence; behaviour unchanged. |
 | **C — `square` via `pow2k(1)`** | **Changed.** `mul_clamped` −3.5% on a stock release build, −21.9% with fat LTO, −23.5% with fat LTO and `+adx,+bmi2`. Bit-for-bit identical output, no `unsafe`, no representation change, no API change, `serial::u32`/`fiat` untouched. |
+| **D — ladder's multiply by 121666** | **Changed.** A specialized `mul121666` (fiat's verified `carry_scmul_121666` on the fiat backends) replaces a general multiplication whose operand had four zero limbs. Isolated 2.5x cheaper on x86_64, 3.8x on wasm32. `mul_clamped` −6.0% on a stock release build and −7.0% on wasm32; nothing under fat LTO, where the inliner already folded it. Complementary to C: between them every build profile improves. |
+| **Combined C + D** | x86_64 stock release **−9.3%**, fat LTO **−21.7%**, fat LTO + `+adx,+bmi2` **−24.2%**; wasm32 **−7.0%** (`serial::u32`) and **−8.5%** (`fiat_u32`). |
 | **Vector backend for Montgomery** | Viable but not worthwhile for single exchanges; the win would require a batched multi-exchange API. Not implemented. |

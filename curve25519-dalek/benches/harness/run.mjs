@@ -19,6 +19,7 @@ const KERNELS = [
   [0, "fe_mul", 1],
   [1, "fe_square", 1],
   [2, "fe_pow2k50", 50],
+  [5, "fe_mul121666", 1],
   [3, "x25519_mul_clamped", 1],
   [4, "x25519_mul_base_clamped", 1],
 ];
