@@ -1216,6 +1216,35 @@ macro_rules! impl_basepoint_table {
             ///
             /// The above algorithm is trivially generalised to other powers-of-2 radices.
             fn mul_base(&self, scalar: &Scalar) -> $point {
+                // `EdwardsPoint::mul_base` reaches the vector fixed-base
+                // ladder through `backend::mul_base` (§13.12). This is the
+                // *other* spelling of the same operation — `&scalar *
+                // ED25519_BASEPOINT_TABLE`, which the crate's own docs and
+                // README use — and it lands here, on the serial ladder: 153 910
+                // instructions against 84 546 for the identical result.
+                //
+                // When `self` is the crate's own basepoint table the two
+                // compute the same point by construction, so hand it over. The
+                // comparison is on addresses, which is the only way to
+                // recognise it without changing a public signature: a table a
+                // caller built for some other point cannot alias a `static`,
+                // and falls through to the serial ladder as before. Both
+                // pointers are cast to `*const u8` because the other radices
+                // instantiate this macro with their own table types.
+                //
+                // `RistrettoBasepointTable` wraps this same static (see
+                // `constants.rs`), so it is caught here too, correctly — it is
+                // the same table over the same basepoint.
+                #[cfg(curve25519_dalek_backend = "simd")]
+                {
+                    let this = self as *const $name as *const u8;
+                    let std = crate::constants::ED25519_BASEPOINT_TABLE
+                        as *const EdwardsBasepointTable as *const u8;
+                    if core::ptr::eq(this, std) {
+                        return crate::backend::mul_base(scalar);
+                    }
+                }
+
                 let a = scalar.as_radix_2w($radix);
 
                 let tables = &self.0;
@@ -1985,6 +2014,45 @@ mod test {
     }
 
     /// Test mul_base versus a known scalar multiple from ed25519.py
+    /// The two spellings of a fixed-base multiplication — `EdwardsPoint::mul_base`
+    /// and `&scalar * ED25519_BASEPOINT_TABLE` — reach different ladders when the
+    /// vector backend is live. They must still agree exactly.
+    #[test]
+    #[cfg(feature = "precomputed-tables")]
+    fn table_mul_agrees_with_mul_base() {
+        let mut s = Scalar::ONE;
+        for _ in 0..32 {
+            assert_eq!(
+                (&s * ED25519_BASEPOINT_TABLE).compress(),
+                EdwardsPoint::mul_base(&s).compress()
+            );
+            s += Scalar::ONE;
+        }
+        for s in [
+            Scalar::ZERO,
+            -Scalar::ONE,
+            Scalar::from_bytes_mod_order([0xff; 32]),
+        ] {
+            assert_eq!(
+                (&s * ED25519_BASEPOINT_TABLE).compress(),
+                EdwardsPoint::mul_base(&s).compress()
+            );
+        }
+    }
+
+    /// A table a caller builds for the *same* basepoint is a different object, so
+    /// it must fall through to the serial ladder and still be correct.
+    #[test]
+    #[cfg(feature = "precomputed-tables")]
+    fn caller_built_table_falls_through_and_agrees() {
+        let built = EdwardsBasepointTable::create(&constants::ED25519_BASEPOINT_POINT);
+        let s = Scalar::from_bytes_mod_order([7u8; 32]);
+        assert_eq!(
+            built.mul_base(&s).compress(),
+            EdwardsPoint::mul_base(&s).compress()
+        );
+    }
+
     #[test]
     fn basepoint_mult_vs_ed25519py() {
         let aB = EdwardsPoint::mul_base(&A_SCALAR);

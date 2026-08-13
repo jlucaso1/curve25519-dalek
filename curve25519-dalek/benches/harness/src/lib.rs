@@ -48,6 +48,7 @@ pub const K_FE_BATCH_INVERT_8: u32 = 14;
 pub const K_FE_INVERT_X16: u32 = 15;
 pub const K_FE_BATCH_INVERT_16: u32 = 16;
 pub const K_ED_TABLE_CREATE: u32 = 17;
+pub const K_ED_MUL_BASE_TABLE: u32 = 18;
 
 pub const KERNELS: &[(u32, &str, u32)] = &[
     // (selector, name, field operations per iteration)
@@ -69,6 +70,7 @@ pub const KERNELS: &[(u32, &str, u32)] = &[
     (K_FE_INVERT_X16, "fe_invert_x16", 16),
     (K_FE_BATCH_INVERT_16, "fe_batch_invert_16", 16),
     (K_ED_TABLE_CREATE, "edwards_table_create", 1),
+    (K_ED_MUL_BASE_TABLE, "edwards_mul_base_table", 1),
 ];
 
 /// Whether the field-level kernels were compiled in. They need
@@ -222,6 +224,21 @@ pub fn run_kernel(which: u32, iters: u32) -> u64 {
             }
             // Compressed once, outside the timed loop, only to consume `last`.
             last.compress().to_bytes()[0] as u64
+        }
+        K_ED_MUL_BASE_TABLE => {
+            // The *other* spelling of a fixed-base multiplication:
+            // `&scalar * ED25519_BASEPOINT_TABLE`, which the crate's README and
+            // libsignal both use. It reached the serial ladder while
+            // `EdwardsPoint::mul_base` reached the vector one; this kernel
+            // exists so that divergence cannot recur silently. It should track
+            // `edwards_mul_base` exactly.
+            let mut s = Scalar::from_bytes_mod_order(seed_bytes(5));
+            let mut sum = EdwardsPoint::default();
+            for _ in 0..iters {
+                sum += &s * curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
+                s += Scalar::ONE;
+            }
+            sum.compress().to_bytes()[0] as u64
         }
         K_ED25519_VERIFY => {
             // A full Ed25519 signature verification: SHA-512 over the message,
