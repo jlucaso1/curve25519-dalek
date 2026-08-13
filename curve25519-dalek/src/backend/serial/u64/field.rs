@@ -708,12 +708,39 @@ fn square_limbs(mut a: [u64; 5]) -> [u64; 5] {
     let a2_2 = 2 * a[2];
     let a3_19_2 = 2 * a3_19;
 
-    // Multiply to get 128-bit coefficients of output.
-    let     c0: u128 = m(a[0], a[0]) + m(a1_2, a4_19) + m(a2_2, a3_19);
-    let mut c1: u128 = m(a[3], a3_19) + m(a0_2,  a[1]) + m(a2_2, a4_19);
-    let mut c2: u128 = m(a[1], a[1])  + m(a0_2,  a[2]) + m(a[4], a3_19_2);
-    let mut c3: u128 = m(a[4], a4_19) + m(a0_2,  a[3]) + m(a1_2, a[2]);
-    let mut c4: u128 = m(a[2], a[2])  + m(a0_2,  a[4]) + m(a1_2, a[3]);
+    // Multiply to get 128-bit coefficients of output, by operand scanning.
+    //
+    // Written as five sums of three products, the way this read before, every
+    // partial product has to exist before any accumulator can retire — the
+    // same shape `mul` was moved off in the operand-scanning change, and for
+    // the same cost: the products get parked on the stack and reloaded. Here
+    // each group streams one `a[i]` across the accumulators it contributes to,
+    // so a product is consumed as soon as it is formed. The `a0` group births
+    // all five accumulators; everything after is `+=`.
+    //
+    // Identical output: the same fifteen products land in the same five
+    // accumulators, and `u128` addition is associative and commutative. Only
+    // the summation order within each `c_i` changes, so this is bit-for-bit
+    // equal even outside the documented bounds.
+    let mut c0: u128 = m(a[0], a[0]);
+    let mut c1: u128 = m(a0_2, a[1]);
+    let mut c2: u128 = m(a0_2, a[2]);
+    let mut c3: u128 = m(a0_2, a[3]);
+    let mut c4: u128 = m(a0_2, a[4]);
+
+    c0 += m(a1_2, a4_19);
+    c2 += m(a[1], a[1]);
+    c3 += m(a1_2, a[2]);
+    c4 += m(a1_2, a[3]);
+
+    c0 += m(a2_2, a3_19);
+    c1 += m(a2_2, a4_19);
+    c4 += m(a[2], a[2]);
+
+    c1 += m(a[3], a3_19);
+
+    c2 += m(a[4], a3_19_2);
+    c3 += m(a[4], a4_19);
 
     // Same bound as in multiply:
     //    c[i] < 2^(102 + 2*b) * (1+i + (4-i)*19)
