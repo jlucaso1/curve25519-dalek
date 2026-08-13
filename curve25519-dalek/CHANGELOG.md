@@ -9,6 +9,16 @@ major series.
 
 ### Other Changes
 
+* Perf: `MontgomeryPoint::to_edwards` no longer performs two field
+  exponentiations. It formed the Edwards `y` with a full inversion and then
+  called `decompress`, whose `sqrt_ratio_i` runs the same 250-squaring chain
+  again. Decompression uses `y` only as a ratio, so substituting `y = yn/yd`
+  removes the division, and `EdwardsPoint` is projective, so `yn` and `yd`
+  become its `Y` and `Z`: two squarings and three multiplications replace an
+  inversion and a byte round trip, -31.29%. This is the XEdDSA verification
+  entry point. The result is equal as a point but not limb for limb -- `Z` is
+  now `u+1` rather than `1` -- and is tested against the previous
+  implementation on canonical bytes across 256 inputs and both signs.
 * Perf: `&scalar * ED25519_BASEPOINT_TABLE` reaches the vector fixed-base ladder
   too. Only `EdwardsPoint::mul_base` did; the table spelling -- which this
   crate's own README and docs use -- went through the macro-generated serial
