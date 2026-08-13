@@ -56,13 +56,14 @@ use core::{
 
 #[cfg(feature = "digest")]
 use crate::constants::{MONTGOMERY_A, MONTGOMERY_A_NEG, SQRT_M1};
-use crate::edwards::{CompressedEdwardsY, EdwardsPoint};
+use crate::edwards::EdwardsPoint;
 use crate::field::FieldElement;
 use crate::scalar::{Scalar, clamp_integer};
 
 use crate::traits::Identity;
 
 use subtle::Choice;
+use subtle::ConditionallyNegatable;
 use subtle::ConditionallySelectable;
 use subtle::ConstantTimeEq;
 
@@ -301,12 +302,49 @@ impl MontgomeryPoint {
 
         let one = FieldElement::ONE;
 
-        let y = &(&u - &one) * &(&u + &one).invert();
+        // The Edwards `y` is the ratio `yn/yd`, and decompression only ever
+        // uses `y` through that ratio: it needs `x` with
+        // `x^2 = (y^2 - 1)/(d*y^2 + 1)`, and substituting `y = yn/yd` scales
+        // numerator and denominator alike by `yd^2`:
+        //
+        //     x^2 = (yn^2 - yd^2) / (d*yn^2 + yd^2)
+        //
+        // So the division is unnecessary. Forming `y` explicitly cost a full
+        // Fermat inversion — the same 250-squaring chain `sqrt_ratio_i` is
+        // about to run — plus a `to_bytes`/`from_bytes` round trip, to produce
+        // a value that is immediately taken apart again. Two squarings and
+        // three multiplications replace it, and `EdwardsPoint` is projective,
+        // so `yn` and `yd` can be its `Y` and `Z` directly.
+        //
+        // `d*yn^2 + yd^2` is never zero: it would need `(yn/yd)^2 = -1/d`, and
+        // `-1/d` is a nonsquare (`-1` is square mod p, `d` is not). `yd = 0`
+        // means `u = -1`, rejected above.
+        let yn = &u - &one;
+        let yd = &u + &one;
+        let yn2 = yn.square();
+        let yd2 = yd.square();
 
-        let mut y_bytes = y.to_bytes();
-        y_bytes[31] ^= sign << 7;
+        let (is_valid_y_coord, mut X) = FieldElement::sqrt_ratio_i(
+            &(&yn2 - &yd2),
+            &(&(&yn2 * &crate::constants::EDWARDS_D) + &yd2),
+        );
 
-        CompressedEdwardsY(y_bytes).decompress()
+        if !bool::from(is_valid_y_coord) {
+            return None;
+        }
+
+        // `sqrt_ratio_i` returns the nonnegative root, so apply the caller's
+        // sign — the same thing `decompress` does with bit 255 of the encoding,
+        // which is where this `sign` was being smuggled through.
+        X.conditional_negate(Choice::from(sign));
+
+        // (x, yn/yd) in projective coordinates, with T satisfying T*Z = X*Y.
+        Some(EdwardsPoint {
+            X: &X * &yd,
+            Y: yn,
+            Z: yd,
+            T: &X * &yn,
+        })
     }
 }
 
@@ -573,6 +611,69 @@ impl Mul<&MontgomeryPoint> for &Scalar {
 
 #[cfg(test)]
 mod test {
+
+    /// The pre-change `to_edwards`, kept verbatim so the rewrite is checked
+    /// against the code it replaced rather than against a re-derivation.
+    fn reference_to_edwards(m: &MontgomeryPoint, sign: u8) -> Option<EdwardsPoint> {
+        let u = FieldElement::from_bytes(&m.0);
+        if u == FieldElement::MINUS_ONE {
+            return None;
+        }
+        let one = FieldElement::ONE;
+        let y = &(&u - &one) * &(&u + &one).invert();
+        let mut y_bytes = y.to_bytes();
+        y_bytes[31] ^= sign << 7;
+        crate::edwards::CompressedEdwardsY(y_bytes).decompress()
+    }
+
+    /// `to_edwards` no longer forms `y` explicitly, so it is congruent by
+    /// construction rather than by inspection. Compared on canonical bytes,
+    /// including the on-twist inputs that must still return `None`, over both
+    /// signs — the sign is the part the rewrite moves from bit 255 of an
+    /// encoding to an explicit `conditional_negate`.
+    #[test]
+    fn to_edwards_matches_reference() {
+        let mut n_some = 0u32;
+        let mut n_none = 0u32;
+        for i in 0..256u32 {
+            let mut bytes = [0u8; 32];
+            bytes[0..4].copy_from_slice(&i.to_le_bytes());
+            let m = MontgomeryPoint(bytes);
+            for sign in 0..2u8 {
+                match (m.to_edwards(sign), reference_to_edwards(&m, sign)) {
+                    (Some(a), Some(b)) => {
+                        assert_eq!(a.compress(), b.compress(), "u = {i}, sign = {sign}");
+                        n_some += 1;
+                    }
+                    (None, None) => n_none += 1,
+                    (a, b) => panic!(
+                        "disagree on validity: u = {i}, sign = {sign}, {} vs {}",
+                        a.is_some(),
+                        b.is_some()
+                    ),
+                }
+            }
+        }
+        // Both outcomes must actually occur, or the test proves nothing.
+        assert!(
+            n_some > 0 && n_none > 0,
+            "{n_some} valid, {n_none} rejected"
+        );
+    }
+
+    /// Round trip through the real basepoint-derived points, which is what the
+    /// XEdDSA path actually feeds it.
+    #[test]
+    fn to_edwards_round_trips_real_points() {
+        let mut s = Scalar::ONE;
+        for _ in 0..32 {
+            let ed = EdwardsPoint::mul_base(&s);
+            let mont = ed.to_montgomery();
+            let sign = ed.compress().as_bytes()[31] >> 7;
+            assert_eq!(mont.to_edwards(sign).unwrap().compress(), ed.compress());
+            s += Scalar::ONE;
+        }
+    }
     use super::*;
     use crate::constants;
     use getrandom::{

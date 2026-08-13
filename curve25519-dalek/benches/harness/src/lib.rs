@@ -49,6 +49,7 @@ pub const K_FE_INVERT_X16: u32 = 15;
 pub const K_FE_BATCH_INVERT_16: u32 = 16;
 pub const K_ED_TABLE_CREATE: u32 = 17;
 pub const K_ED_MUL_BASE_TABLE: u32 = 18;
+pub const K_MONT_TO_EDWARDS: u32 = 19;
 
 pub const KERNELS: &[(u32, &str, u32)] = &[
     // (selector, name, field operations per iteration)
@@ -71,6 +72,7 @@ pub const KERNELS: &[(u32, &str, u32)] = &[
     (K_FE_BATCH_INVERT_16, "fe_batch_invert_16", 16),
     (K_ED_TABLE_CREATE, "edwards_table_create", 1),
     (K_ED_MUL_BASE_TABLE, "edwards_mul_base_table", 1),
+    (K_MONT_TO_EDWARDS, "montgomery_to_edwards", 1),
 ];
 
 /// Whether the field-level kernels were compiled in. They need
@@ -239,6 +241,24 @@ pub fn run_kernel(which: u32, iters: u32) -> u64 {
                 s += Scalar::ONE;
             }
             sum.compress().to_bytes()[0] as u64
+        }
+        K_MONT_TO_EDWARDS => {
+            // `MontgomeryPoint::to_edwards`, the XEdDSA verification entry
+            // point. Distinct from `edwards_to_montgomery`, which is the other
+            // direction; nothing measured this one before.
+            let pts: Vec<MontgomeryPoint> = (0..16u8)
+                .map(|k| EdwardsPoint::mul_base(&Scalar::from_bytes_mod_order(seed_bytes(k))).to_montgomery())
+                .collect();
+            let mut acc = 0u64;
+            for i in 0..iters {
+                let p = &pts[(i as usize) % pts.len()];
+                let e = black_box(p).to_edwards((i & 1) as u8);
+                acc = acc.wrapping_add(match e {
+                    Some(q) => q.compress().to_bytes()[0] as u64,
+                    None => 1,
+                });
+            }
+            acc
         }
         K_ED25519_VERIFY => {
             // A full Ed25519 signature verification: SHA-512 over the message,
