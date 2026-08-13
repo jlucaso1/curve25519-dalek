@@ -986,7 +986,7 @@ all of the same shape:
 | --- | ---: | --- |
 | `LookupTable<AffineNielsPoint>::from` | 8 | `BasepointTable::create`, ×32 |
 | `NafLookupTable5<AffineNielsPoint>::from` | 8 | **none** |
-| `NafLookupTable8<AffineNielsPoint>::from` | 64 | none directly |
+| `NafLookupTable8<AffineNielsPoint>::from` | 64 | **`serial::scalar_mul::precomputed_straus.rs:44`** — see the correction below |
 
 Each is written as a chain — convert, add, convert, add — and in that form the
 conversions really are sequential: `points[j+1]` is computed from `points[j]`,
@@ -1276,8 +1276,16 @@ tmp0 = tmp0 + zero.blend(S_2.negate_lazy(), Lanes::BC);
 
 The lane sets are disjoint and the quantity is the same, so one signed blend
 carries both — `(S2, 2p-S2, 2p-S2, S2)` — for one blend and one add per limb
-instead of two of each, 9 ops/limb down to 7. **The `ifma` backend already did
-it this way**; AVX2 was the odd one out. Comparing the two vector backends
+instead of two of each, 9 ops/limb down to 7.
+
+> **This section claimed the wrong provenance.** It said "the `ifma` backend
+> already did it this way; AVX2 was the odd one out." It does not.
+> `ifma/edwards.rs` fuses a *different* pair — `-S2` with `-S4`, via
+> `S2_S2_S2_S4` — in two blend-and-adds, and is still at **9 ops/limb**. The
+> fusion taken here, `+S2` with `-S2` in one signed blend, is not present
+> there. The change is right; the claim that someone else had already made it
+> was not, and the practical cost of the error is that a live back-port to
+> `ifma` went unnoticed for want of anyone checking. Comparing the two vector backends
 against each other, rather than each against its own history, is what surfaced
 it.
 
@@ -1298,8 +1306,22 @@ which roughly a quarter was spill traffic: 30 stack stores and 64 stack loads.
 Emitting it **column-major over `rhs`** instead — column `j` contributing one
 product to each of the ten accumulators — lets `y_j` and `y_j_19` be born and die
 inside their column, and unpacks `rhs.0[j/2]` only when its column needs it.
-Peak liveness drops to about 27, and the `x_i`, invariant across all ten columns,
-fold into `vpmuludq mem, ymm, ymm` rather than being reloaded.
+Peak liveness drops to about 27.
+
+> **The mechanism stated here was wrong, and the result is unaffected.** This
+> section said the `x_i`, invariant across all ten columns, "fold into
+> `vpmuludq mem, ymm, ymm` rather than being reloaded." Measured on the shipped
+> binary, **36 of 417 `vpmuludq` take a memory operand — 8.6%.** The `x_i` are
+> largely *not* folding. What does fold is the accumulator reload, into
+> `vpaddq mem, ymm, ymm`: **122 of 508, 24%**.
+>
+> The −4.23% and the 416 → 388 instructions per call reproduce and are not in
+> question; only the explanation of *why* was. It matters because "peak
+> liveness drops to 27" reads as though the spilling problem were solved, and
+> 27 against 16 registers is still eleven over. The successor question — why
+> the `x_i` do not fold — is open, and the answer is not visible from the
+> source: `vpunpckldq`, which builds them, requires its data operand in a
+> register, so the unpacked form cannot be rematerialised from memory.
 
 The mapping is mechanical: in column `j`, accumulator `z_k` takes `x_i` with
 `i = (k - j) mod 10`; the multiplier is `y_j` when `k >= j` and `y_j_19` when
@@ -1488,6 +1510,20 @@ The last two rows are the scope check: the Montgomery ladder uses no lookup
 table, and verification's `NafLookupTable5::select` is a direct index, so
 neither should move, and neither does.
 
+> **The ladder row is a correct measurement behind an incorrect reason.** "The
+> Montgomery ladder uses no lookup table" is true and is not why it did not
+> move. This section's subject is *barrier crossings under high liveness*, and
+> the ladder has **255 of them per DH** — more than any other kernel in the
+> crate — at `montgomery.rs:241`, where `choice.into()` is a `Choice::from`
+> around `subtle`'s `#[inline(never)]` volatile read. The profile prices it
+> exactly: `subtle::black_box` self cost is 46 080 over ~60 operations, i.e.
+> three instructions × 255 calls per `mul_clamped`.
+>
+> Scoping by *where the crossings came from* rather than by *whether there were
+> any* is what let the ladder fall through. Hoisting them there is a real, if
+> small, candidate — see §11.7, which also records why it is smaller than this
+> section's numbers would suggest.
+
 ### 11.5 A and B — **refused**
 
 **A, `subtle/core_hint_black_box`**, swaps the `read_volatile` barrier for
@@ -1542,6 +1578,52 @@ using. Found by an independent audit that measured the same comparison under
 `+avx2` and got the opposite sign.
 
 ---
+
+### 11.7 The same hoist on the *vector* scan — **refused, measured**
+
+§13.12 moved the fixed base onto `LookupTable<CachedPoint>::select`, the
+generic scan, which never received §11.4's fix — `select_or` is
+`impl LookupTable<AffineNielsPoint>` only. An independent audit found this
+three times over, from three different angles, and predicted **−5% to −8%** on
+`edwards_mul_base` from porting §11.4 across. The diagnosis was right and the
+prediction was wrong.
+
+The scan really is ~21% of the vectorised `edwards_mul_base`, and the
+disassembly really does show the five-`ymm` accumulator spilled around each of
+the nine `subtle` crossings. Two implementations were written and measured:
+
+| | `edwards_mul_base` | |
+| --- | ---: | ---: |
+| generic `select` (shipped) | 84 546 | — |
+| hoisted, masks kept as `[u32x8; 9]` | 89 602 | **+5.98%** |
+| hoisted, masks kept as `[u32; 9]`, broadcast at use | 86 658 | **+2.50%** |
+
+Both are worse. The first is easy to explain — nine `u32x8` masks are 288 bytes
+of stack, and their reloads cost more than the accumulator spills being removed.
+The second removes that and is still worse, which is the interesting half.
+
+The arithmetic says the hoisted version should win: `or_masked_assign` is two
+vector ops per limb against `conditional_assign`'s three, so 9 entries × 5 limbs
+× 2 = 90 against 8 × 5 × 3 = 120. What eats the 30-op saving is the bookkeeping
+the hoist requires and the generic version does not: nine mask stores, nine
+reloads, nine `vpbroadcastd`, and a ninth entry for the identity — which
+`select` gets free by initialising its accumulator to it, and an OR-accumulator
+cannot.
+
+**This is §11.3 repeating.** There, the control (B′) showed the OR-accumulate
+*algorithm* was worth nothing on its own and the entire win was the hoist. Here
+the hoist is worth nothing on its own, because the serial case's premise does
+not transfer: on the serial path the accumulator was fifteen GPRs the compiler
+could not keep, and hoisting freed them; on the vector path five `ymm` out of
+sixteen fit comfortably, and the crossings were not what was costing.
+
+Recorded rather than dropped, because the analysis is most of the work and
+because three independent readings of the disassembly reached the opposite
+conclusion. **The spilling is visible and real; removing it this way costs more
+than it saves.** Anyone attacking it again should start from the measurement
+that the barrier crossings are not the binding constraint here, and should be
+sceptical of any prediction — including this document's — that is not a paired
+measurement.
 
 ## 12. Front B — wasm32 with 64-bit limbs: **refused**
 
@@ -2249,6 +2331,24 @@ These numbers do not compose with the per-change figures elsewhere in this
 document and should not be added to them. Several were measured on different
 hosts across several sessions; this table is one host, one session, two binaries.
 
+> **Two properties of the build these were taken under, both worth stating.**
+>
+> It carries `+avx2` but **not `+bmi2`**, so the binary contains **zero `mulx`**
+> — 1002 plain `mul`. §3.1 measures `+bmi2` at `mul` 221 → 188 and `pow2k`
+> 152 → 129, and every AVX2-capable CPU has BMI2, so the absolute figures here
+> are roughly 15% above what the build this document *recommends* produces. The
+> relative comparisons are unaffected — both arms carry the same flags.
+>
+> More consequentially, compile-time `+avx2` makes `cpufeatures`' check
+> const-fold, so `backend::mul_base`'s serial arm is dead-code-eliminated:
+> `nm` on the binary shows the vector `BASEPOINT_TABLE` and **no**
+> `ED25519_BASEPOINT_TABLE`, and `mul_base` contains no `cpuid`. The −45.1% in
+> §13.12 was therefore measured with the dispatch free. A consumer building for
+> runtime dispatch — which is the point of the vector backend — pays for the
+> check and links both tables. That cuts both ways: it means the speed figure
+> is a mild overstatement and the **size** figure is a large one, since `+avx2`
+> drops the 30 720-byte serial table outright.
+
 ## 14. Validation
 
 * **A 12-cell feature x backend matrix, under `-D warnings`.** Three feature
@@ -2471,6 +2571,9 @@ the step, which is what makes §4 and §7 pay.
 | **H — batching the affine table conversions** | **Changed.** `LookupTable<AffineNielsPoint>::from` converted eight multiples one at a time, one field inversion each, so `EdwardsBasepointTable::create` did **256** — 91% of its cost. The chain depends on the previous multiple's *value*, not its affine form, so it runs in extended coordinates and converts all eight at the end with Montgomery's trick. `create` **−74.8% (3.97×)**, 7/7 paired runs, −72.1% instructions. Both hot paths unchanged: the crate ships its table as a constant. Not limb-for-limb identical — the batch returns a different weakly-reduced representative — so it is checked on canonical bytes against a verbatim copy of the old code, on the identity, and against the precomputed table (§9.3). |
 | **I — tagging the AVX2 multiply per call site** | **Changed.** LLVM emitted one shared outlined body for the three `FieldElement2625x4` multiplies on the verification path; an unused `const N: u8` gives each site its own instantiation. `ed25519_verify` **−3.21% instructions** (316 280 → 306 124, callgrind, exact) for **+784 bytes** of `.text`. Wall-clock cannot resolve it — the host's spread was five times the effect — so the instruction count is the claim. The `Mul` operator stays as the untagged spelling; the tags are inert if a future LLVM stops sharing. A paired `negate_lazy` substitution was **refused** separately: −0.015%, and it would invalidate a documented `b < 0.007` bound (§10.5). |
 | **J — vectorising `mul_base`** | **Changed.** `edwards_mul_base` cost an identical 153 913 instructions under the serial and simd backends: the fixed-base ladder never reached the vector backend, which had no fixed-base path. It now runs the same radix-16 ladder over `ExtendedPoint`/`CachedPoint`, against a new 40 960-byte `BASEPOINT_TABLE`. **−45.1% instructions** (153 910 → 84 546), **−32.9%** wall clock (12 579 → 8 444 ns), and `x25519_mul_base_clamped` **−24.0%**. Dispatched through `get_selected_backend()`'s runtime `cpuid`, not the backend cfg, which denotes a dispatched backend and not AVX2 hardware. Costs 40 KB of `.rodata` alongside the serial table, which the public API still needs; `avx512` keeps the serial ladder, its `CachedPoint` layout differing. The generated table is checked entry by entry against the basepoint (§13.12). |
+| **K — the basepoint-table API missed the vector ladder** | **Changed.** `fc70cc9` wired the AVX2 fixed base into `backend::mul_base`, which only `EdwardsPoint::mul_base` calls; `&scalar * ED25519_BASEPOINT_TABLE`, the spelling this crate's own docs and `wacore-libsignal` use, kept the serial ladder at **153 910** instructions against **84 546**. §13.12's claim that signing benefits was false for the consumer that motivated it. `mul_base` now hands over when the table is the crate's own, recognised by address. `edwards_mul_base_table` is a permanent harness kernel so the two spellings cannot diverge silently again. |
+| **L — operand-scanning the serial squaring** | **Changed.** `714dee6` did this for `mul` and left `square_limbs` grouped by output coefficient, where sixteen of eighteen spill stores are raw products. `fe_invert` **−3.83%**, `x25519_mul_base_clamped` −1.11%, `edwards_table_create` −1.75%, and **the ladder unchanged** — inlined there, the squaring was already well scheduled. Bit-for-bit identical; the differential test that certifies it already existed. |
+| **M — hoisting the barrier on the *vector* scan** | **Refused, measured.** The vector scan never received §11.4's fix and is ~21% of `edwards_mul_base`; three independent readings of the disassembly predicted −5% to −8%. Two implementations measured **+5.98%** and **+2.50%**. The serial premise does not transfer: five `ymm` out of sixteen fit, so the crossings were not the binding constraint, and the hoist's bookkeeping costs more than it saves (§11.7). |
 | **The verify kernel measured the wrong crate** | **Found and fixed (§9.7).** `ed25519-dalek` depends on `curve25519-dalek` by version, and the harness patched only `curve25519-dalek-derive`, so the binary linked two copies and `ed25519_verify` profiled the published 5.0.0 rather than this tree. It was blind to every change here — reporting "unchanged" for a regression as readily as for a win. Corrected: **354 575 → 330 457 Ir**, AVX2 87.8% → **87.4%**, the inversion 10.0% → **10.2%**. No conclusion in §9 changes, because they rest on the call graph rather than on these totals. The first attempt at the correction was itself contaminated by an uncommitted experiment and had to be re-taken in a pristine worktree; §9.7 records that too. |
 | **Batching verification's inversions** | **Refused: there is nothing to batch.** An Ed25519 verification performs **exactly one** field inversion, in `compress`; the vector table build and the wNAF loop perform none, and the vector backend contains no runtime `invert` at all. The profile's sixteen `as_affine` cannot be in verification, and cannot be sixteen X25519 operations either — that would be four times the whole message's cycle budget (§9.2). |
 | **safegcd, second look** | **Refused again.** Worth more here than in §13.11 — 10.0% of a verification, ~4% of the group client — but a 2–4× inversion caps the win at 2–3% of the client, while the crate's *existing* batch inversion is worth 6–10× wherever inversions co-occur. It also cannot be the variable-time kind, because `compress` is shared with secret-derived callers (§9.5). |

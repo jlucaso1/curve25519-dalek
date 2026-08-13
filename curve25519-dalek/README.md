@@ -327,6 +327,16 @@ is which before reading a profile:
 Dispatch is on a runtime CPU check, so a machine without AVX2 keeps the serial
 path either way; nothing here requires the `-C target-feature` flags above.
 
+**`+avx2` is also a binary-size win, which is worth knowing if you are counting
+bytes.** The AVX2 fixed-base ladder ships a 40 960-byte basepoint table, and the
+serial ladder ships a 30 720-byte one. In a runtime-dispatched build both are
+linked, because either may run. Under `-C target-feature=+avx2` the CPU check
+const-folds, the serial arm becomes dead code, and **the serial table is
+dropped entirely** — verified with `nm` on a release binary, which contains the
+vector table and no `ED25519_BASEPOINT_TABLE`. The net cost of the vector
+ladder is then about **+10 KB, not +40 KB**. That trade is only available if you
+are willing to require AVX2 of the machines you ship to.
+
 On **wasm32**, the equivalent free win is `simd128`, which is stable but not
 enabled by default:
 

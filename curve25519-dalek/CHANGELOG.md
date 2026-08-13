@@ -9,6 +9,22 @@ major series.
 
 ### Other Changes
 
+* Perf: `&scalar * ED25519_BASEPOINT_TABLE` reaches the vector fixed-base ladder
+  too. Only `EdwardsPoint::mul_base` did; the table spelling -- which this
+  crate's own README and docs use -- went through the macro-generated serial
+  ladder, at 153,910 instructions against 84,546 for the identical result.
+  `BasepointTable::mul_base` now hands over to the dispatcher when the table is
+  the crate's own basepoint table, recognised by address; a table a caller built
+  for another point cannot alias a `static` and takes the serial path as before.
+  `RistrettoBasepointTable` wraps the same static and is caught too.
+* Perf: `serial::u64` field squaring is emitted by operand scanning, as the
+  field multiply already was. Written as five sums of three products, every
+  partial product had to exist before any accumulator could retire, and sixteen
+  of the eighteen spill stores in the emitted code were raw products. Regrouped
+  by first operand: `fe_invert` -3.83%, `x25519_mul_base_clamped` -1.11%,
+  `EdwardsBasepointTable::create` -1.75%. The Montgomery ladder is unchanged --
+  inlined there, the squaring was already scheduled well. Output is bit-for-bit
+  identical, including outside the documented bounds.
 * Perf: `EdwardsPoint::mul_base` runs on the vector backend when AVX2 is live.
   The fixed-base ladder ran entirely in `serial::u64` even with the vector
   backend selected -- `edwards_mul_base` cost an identical instruction count
