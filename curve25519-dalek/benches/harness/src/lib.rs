@@ -434,8 +434,14 @@ pub fn config_code_impl() -> u32 {
         if bi::BACKEND == "fiat" {
             code |= 2;
         }
-        if bi::BACKEND == "simd" || bi::BACKEND == "avx512" {
+        if bi::BACKEND == "simd" {
             code |= 4;
+        }
+        // A separate bit: collapsing `avx512` into `simd` would attribute an
+        // AVX-512 record to the AVX2 backend, and a record that names the wrong
+        // configuration is worse than no record.
+        if bi::BACKEND == "avx512" {
+            code |= 16;
         }
         code |= 8;
     }

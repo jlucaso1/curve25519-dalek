@@ -89,9 +89,11 @@ const backend = !hasFieldKernels
   ? "unknown"
   : code & 2
     ? "fiat"
-    : code & 4
-      ? "simd"
-      : "serial";
+    : code & 16
+      ? "avx512"
+      : code & 4
+        ? "simd"
+        : "serial";
 console.log(
   `# limb_bits=${limbBits} backend=${backend} ` +
     `field_kernels=${hasFieldKernels} (config_code=${code})`,

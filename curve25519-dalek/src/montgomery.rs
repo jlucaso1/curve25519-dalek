@@ -336,7 +336,14 @@ impl MontgomeryPoint {
         // `sqrt_ratio_i` returns the nonnegative root, so apply the caller's
         // sign — the same thing `decompress` does with bit 255 of the encoding,
         // which is where this `sign` was being smuggled through.
-        X.conditional_negate(Choice::from(sign));
+        // `sign & 1`, not `sign`: this is a public entry point, and the
+        // previous implementation reached the sign through `y_bytes[31] ^=
+        // sign << 7`, where the shift discards every bit but the lowest. So a
+        // caller passing 2 got the same answer as 0. `Choice::from` requires
+        // 0 or 1 — it debug-asserts, and in release a value of 2 would make
+        // `conditional_negate` compute a mask of `-2` and return a wrong
+        // point — so the mask has to be explicit rather than assumed.
+        X.conditional_negate(Choice::from(sign & 1));
 
         // (x, yn/yd) in projective coordinates, with T satisfying T*Z = X*Y.
         Some(EdwardsPoint {
@@ -659,6 +666,27 @@ mod test {
             n_some > 0 && n_none > 0,
             "{n_some} valid, {n_none} rejected"
         );
+    }
+
+    /// `sign` is a `u8` on a public entry point and only its low bit is
+    /// meaningful — the previous implementation reached it through a `<< 7`,
+    /// which discards the rest. A caller passing 2 must still get what 0 gives,
+    /// not a debug panic or a wrongly negated point.
+    #[test]
+    fn to_edwards_uses_only_the_low_bit_of_sign() {
+        let m = EdwardsPoint::mul_base(&Scalar::from_bytes_mod_order([3u8; 32])).to_montgomery();
+        let zero = m.to_edwards(0).unwrap().compress();
+        let one = m.to_edwards(1).unwrap().compress();
+        assert_ne!(
+            zero, one,
+            "the two signs must differ, or this proves nothing"
+        );
+        for s in [2u8, 4, 0x80, 0xfe] {
+            assert_eq!(m.to_edwards(s).unwrap().compress(), zero, "sign = {s}");
+        }
+        for s in [3u8, 5, 0x81, 0xff] {
+            assert_eq!(m.to_edwards(s).unwrap().compress(), one, "sign = {s}");
+        }
     }
 
     /// Round trip through the real basepoint-derived points, which is what the
