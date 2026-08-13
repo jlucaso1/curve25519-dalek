@@ -1220,8 +1220,9 @@ macro_rules! impl_basepoint_table {
                 // ladder through `backend::mul_base` (§13.12). This is the
                 // *other* spelling of the same operation — `&scalar *
                 // ED25519_BASEPOINT_TABLE`, which the crate's own docs and
-                // README use — and it lands here, on the serial ladder: 153 910
-                // instructions against 84 546 for the identical result.
+                // README use — and it landed here, on the serial ladder:
+                // 153 910 instructions against 84 546 for the identical
+                // result.
                 //
                 // When `self` is the crate's own basepoint table the two
                 // compute the same point by construction, so hand it over. The
@@ -1235,6 +1236,11 @@ macro_rules! impl_basepoint_table {
                 // `RistrettoBasepointTable` wraps this same static (see
                 // `constants.rs`), so it is caught here too, correctly — it is
                 // the same table over the same basepoint.
+                //
+                // `backend::mul_base`'s non-AVX2 arms must call
+                // `mul_base_serial` and **not** this function, or they arrive
+                // back here and recurse until the stack is gone. That is why
+                // the ladder below is a separate entry point.
                 #[cfg(curve25519_dalek_backend = "simd")]
                 {
                     let this = self as *const $name as *const u8;
@@ -1245,6 +1251,16 @@ macro_rules! impl_basepoint_table {
                     }
                 }
 
+                self.mul_base_serial(scalar)
+            }
+        }
+
+        impl $name {
+            /// The serial radix-16 ladder, with no dispatch in front of it.
+            ///
+            /// `backend::mul_base`'s serial and `avx512` arms call this rather
+            /// than `mul_base`, which would hand straight back to them.
+            pub(crate) fn mul_base_serial(&self, scalar: &Scalar) -> $point {
                 let a = scalar.as_radix_2w($radix);
 
                 let tables = &self.0;
@@ -2035,6 +2051,30 @@ mod test {
         ] {
             assert_eq!(
                 (&s * ED25519_BASEPOINT_TABLE).compress(),
+                EdwardsPoint::mul_base(&s).compress()
+            );
+        }
+    }
+
+    /// `backend::mul_base`'s non-AVX2 arms call `mul_base_serial`, not the `Mul`
+    /// operator: the operator recognises this very table and hands it back to
+    /// `backend::mul_base`, which on a `simd` build running without AVX2 is an
+    /// unbounded recursion. No CI job exercises that combination — every host
+    /// here has AVX2 — so the serial ladder is called directly.
+    #[test]
+    #[cfg(feature = "precomputed-tables")]
+    fn mul_base_serial_agrees_and_bypasses_dispatch() {
+        let mut s = Scalar::ONE;
+        for _ in 0..16 {
+            assert_eq!(
+                ED25519_BASEPOINT_TABLE.mul_base_serial(&s).compress(),
+                EdwardsPoint::mul_base(&s).compress()
+            );
+            s += Scalar::ONE;
+        }
+        for s in [Scalar::ZERO, -Scalar::ONE] {
+            assert_eq!(
+                ED25519_BASEPOINT_TABLE.mul_base_serial(&s).compress(),
                 EdwardsPoint::mul_base(&s).compress()
             );
         }

@@ -268,9 +268,14 @@ pub fn mul_base(scalar: &Scalar) -> EdwardsPoint {
     match get_selected_backend() {
         #[cfg(curve25519_dalek_backend = "simd")]
         BackendKind::Avx2 => vector::scalar_mul::fixed_base::spec_avx2::mul_base(scalar),
+        // `mul_base_serial`, not the `Mul` operator: the operator goes through
+        // `BasepointTable::mul_base`, which recognises this very table and
+        // hands it back here. That is an unbounded recursion on exactly the
+        // configuration this arm exists to serve — a `simd` build running on a
+        // CPU without AVX2.
         #[cfg(curve25519_dalek_backend = "avx512")]
-        BackendKind::Avx512 => scalar * crate::constants::ED25519_BASEPOINT_TABLE,
-        BackendKind::Serial => scalar * crate::constants::ED25519_BASEPOINT_TABLE,
+        BackendKind::Avx512 => crate::constants::ED25519_BASEPOINT_TABLE.mul_base_serial(scalar),
+        BackendKind::Serial => crate::constants::ED25519_BASEPOINT_TABLE.mul_base_serial(scalar),
     }
 }
 
