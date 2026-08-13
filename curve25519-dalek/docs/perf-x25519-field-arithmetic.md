@@ -2369,13 +2369,22 @@ denominator by `yd²` gives `x² = (yn²−yd²)/(d·yn²+yd²)` with no divisio
 
 | | instructions |
 | --- | ---: |
-| before | 103 616 |
-| after | **71 191** |
-| | **−31.29%** |
+| before | 72 650 |
+| after | **40 225** |
+| | **−44.63%** |
 
 Nothing had measured this: `edwards_to_montgomery` is the *other* direction, and
 the profile set contained no kernel for this one. `montgomery_to_edwards` now
 exists so it cannot drift unwatched.
+
+> **First published as −31.29%, from 103 616 → 71 191.** That kernel consumed
+> its result with `compress`, which performs a field inversion — most of what
+> this change removes — inside every timed iteration, so both arms carried
+> ~33 000 instructions of work `to_edwards` does not do. It is the same defect
+> §9.3's kernel had, found the same way, and it biased in the same direction:
+> a constant added to both arms pulls a ratio toward 1, so the published figure
+> **understated** the change. The kernel now accumulates with Edwards addition,
+> as `edwards_mul_base` does, and compresses once outside the loop.
 
 **Why the earlier audit missed it.** §9.2's sentence generalises past its
 evidence. It asks whether the inversion can be *batched* — correctly answering
@@ -2618,7 +2627,7 @@ the step, which is what makes §4 and §7 pay.
 | **K — the basepoint-table API missed the vector ladder** | **Changed.** `fc70cc9` wired the AVX2 fixed base into `backend::mul_base`, which only `EdwardsPoint::mul_base` calls; `&scalar * ED25519_BASEPOINT_TABLE`, the spelling this crate's own docs and `wacore-libsignal` use, kept the serial ladder at **153 910** instructions against **84 546**. §13.12's claim that signing benefits was false for the consumer that motivated it. `mul_base` now hands over when the table is the crate's own, recognised by address. `edwards_mul_base_table` is a permanent harness kernel so the two spellings cannot diverge silently again. |
 | **L — operand-scanning the serial squaring** | **Changed.** `714dee6` did this for `mul` and left `square_limbs` grouped by output coefficient, where sixteen of eighteen spill stores are raw products. `fe_invert` **−3.83%**, `x25519_mul_base_clamped` −1.11%, `edwards_table_create` −1.75%, and **the ladder unchanged** — inlined there, the squaring was already well scheduled. Bit-for-bit identical; the differential test that certifies it already existed. |
 | **M — hoisting the barrier on the *vector* scan** | **Refused, measured.** The vector scan never received §11.4's fix and is ~21% of `edwards_mul_base`; three independent readings of the disassembly predicted −5% to −8%. Two implementations measured **+5.98%** and **+2.50%**. The serial premise does not transfer: five `ymm` out of sixteen fit, so the crossings were not the binding constraint, and the hoist's bookkeeping costs more than it saves (§11.7). |
-| **N — `to_edwards`'s second exponentiation** | **Changed.** `MontgomeryPoint::to_edwards` formed the Edwards `y` with a full Fermat inversion and then handed it to `decompress`, whose `sqrt_ratio_i` runs the same chain again. Decompression needs only the ratio, and `EdwardsPoint` is projective, so `yn`/`yd` become `Y`/`Z` and two squarings plus three multiplications replace the inversion: **103 616 → 71 191, −31.29%** on the XEdDSA verification entry point. Congruent, not limb-identical; checked against a verbatim copy of the old code over 256 inputs and both signs (§13.14). |
+| **N — `to_edwards`'s second exponentiation** | **Changed.** `MontgomeryPoint::to_edwards` formed the Edwards `y` with a full Fermat inversion and then handed it to `decompress`, whose `sqrt_ratio_i` runs the same chain again. Decompression needs only the ratio, and `EdwardsPoint` is projective, so `yn`/`yd` become `Y`/`Z` and two squarings plus three multiplications replace the inversion: **72 650 → 40 225, −44.63%** on the XEdDSA verification entry point. Congruent, not limb-identical; checked against a verbatim copy of the old code over 256 inputs and both signs (§13.14). |
 | **The verify kernel measured the wrong crate** | **Found and fixed (§9.7).** `ed25519-dalek` depends on `curve25519-dalek` by version, and the harness patched only `curve25519-dalek-derive`, so the binary linked two copies and `ed25519_verify` profiled the published 5.0.0 rather than this tree. It was blind to every change here — reporting "unchanged" for a regression as readily as for a win. Corrected: **354 575 → 330 457 Ir**, AVX2 87.8% → **87.4%**, the inversion 10.0% → **10.2%**. No conclusion in §9 changes, because they rest on the call graph rather than on these totals. The first attempt at the correction was itself contaminated by an uncommitted experiment and had to be re-taken in a pristine worktree; §9.7 records that too. |
 | **Batching verification's inversions** | **Refused: there is nothing to batch.** An Ed25519 verification performs **exactly one** field inversion, in `compress`; the vector table build and the wNAF loop perform none, and the vector backend contains no runtime `invert` at all. The profile's sixteen `as_affine` cannot be in verification, and cannot be sixteen X25519 operations either — that would be four times the whole message's cycle budget (§9.2). |
 | **safegcd, second look** | **Refused again.** Worth more here than in §13.11 — 10.0% of a verification, ~4% of the group client — but a 2–4× inversion caps the win at 2–3% of the client, while the crate's *existing* batch inversion is worth 6–10× wherever inversions co-occur. It also cannot be the variable-time kind, because `compress` is shared with secret-derived callers (§9.5). |

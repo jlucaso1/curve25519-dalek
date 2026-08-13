@@ -249,16 +249,20 @@ pub fn run_kernel(which: u32, iters: u32) -> u64 {
             let pts: Vec<MontgomeryPoint> = (0..16u8)
                 .map(|k| EdwardsPoint::mul_base(&Scalar::from_bytes_mod_order(seed_bytes(k))).to_montgomery())
                 .collect();
-            let mut acc = 0u64;
+            // Accumulated with Edwards addition, not compressed: `compress`
+            // performs a field inversion, which is most of what this kernel is
+            // trying to measure and would be charged to `to_edwards` on every
+            // iteration. Same reason `edwards_mul_base` accumulates this way.
+            let mut sum = EdwardsPoint::default();
+            let mut misses = 0u64;
             for i in 0..iters {
                 let p = &pts[(i as usize) % pts.len()];
-                let e = black_box(p).to_edwards((i & 1) as u8);
-                acc = acc.wrapping_add(match e {
-                    Some(q) => q.compress().to_bytes()[0] as u64,
-                    None => 1,
-                });
+                match black_box(p).to_edwards((i & 1) as u8) {
+                    Some(q) => sum += q,
+                    None => misses += 1,
+                }
             }
-            acc
+            sum.compress().to_bytes()[0] as u64 ^ misses
         }
         K_ED25519_VERIFY => {
             // A full Ed25519 signature verification: SHA-512 over the message,
