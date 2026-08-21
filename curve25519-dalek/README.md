@@ -128,6 +128,10 @@ in `~/.cargo/config`.
 
 Note: The [SIMD backend] requires a word size of 64 bits. Attempting to set bits=32 and backend=`simd` will yield a compile error.
 
+On `wasm32` the automatic 32-bit choice is the right one: forcing
+`bits="64"` measures 1.6-1.9x slower for X25519, because wasm has no
+64x64->128 multiply, so the 64-bit backend's `u128` products are emulated.
+
 ### Cross-compilation
 
 Because backend selection is done by target, cross-compiling will select the correct word size automatically. For example, if a x86-64 Linux machine runs the following commands, `curve25519-dalek` will be compiled with the 32-bit `serial` backend.
@@ -147,6 +151,11 @@ For a given CPU feature, you can also specify an appropriate `-C target_feature`
 | :---    | :---                                      | :---              |
 | AVX2    | `-C target_feature=+avx2`                 | no                |
 | AVX512  | `-C target_feature=+avx512ifma,+avx512vl` | yes if `<= 1.89`  |
+
+The vector backends implement Edwards and Ristretto point arithmetic. X25519 is
+unaffected by backend selection: `FieldElement` always resolves to a serial
+implementation, so `MontgomeryPoint`'s ladder executes the same instructions
+under `simd` as under `serial`.
 
 # Documentation
 
