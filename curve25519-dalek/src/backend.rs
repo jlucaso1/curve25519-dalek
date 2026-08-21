@@ -54,6 +54,9 @@ enum BackendKind {
     Serial,
 }
 
+// `cpufeatures::new!` expands to `u8::max_value()`, which rustc 1.99 deprecates.
+// Remove once a `cpufeatures` release stops using it.
+#[allow(deprecated)]
 #[inline]
 fn get_selected_backend() -> BackendKind {
     #[cfg(curve25519_dalek_backend = "avx512")]
