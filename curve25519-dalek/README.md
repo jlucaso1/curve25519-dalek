@@ -152,10 +152,17 @@ For a given CPU feature, you can also specify an appropriate `-C target_feature`
 | AVX2    | `-C target_feature=+avx2`                 | no                |
 | AVX512  | `-C target_feature=+avx512ifma,+avx512vl` | yes if `<= 1.89`  |
 
-The vector backends implement Edwards and Ristretto point arithmetic. X25519 is
-unaffected by backend selection: `FieldElement` always resolves to a serial
-implementation, so `MontgomeryPoint`'s ladder executes the same instructions
-under `simd` as under `serial`.
+Not everything the crate does is covered by the vector backends. The current
+caveats:
+
+* `EdwardsPoint::mul_base(_clamped)` only has `serial` support and is unaffected
+  by `simd`: the basepoint tables are precomputed in the serial representation.
+* `MontgomeryPoint` only has `serial` support and is unaffected by `simd`. Its
+  `mul_base(_clamped)` goes through `EdwardsPoint::mul_base` above, and its
+  `mul_clamped` runs a ladder over the field arithmetic below.
+* The `FieldElement` type used by those paths has no SIMD implementation, though
+  `curve25519-dalek` does contain SIMD field arithmetic internally, used by the
+  vectorized point types.
 
 # Documentation
 
