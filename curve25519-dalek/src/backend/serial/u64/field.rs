@@ -24,6 +24,15 @@ use subtle::ConditionallySelectable;
 #[cfg(feature = "zeroize")]
 use zeroize::Zeroize;
 
+/// Limbs representing the integer 16p, where p is 2^255 - 19. Used in subtraction routines.
+const SIXTEEN_P: [u64; 5] = [
+    36028797018963664u64,
+    36028797018963952u64,
+    36028797018963952u64,
+    36028797018963952u64,
+    36028797018963952u64,
+];
+
 /// A `FieldElement51` represents an element of the field
 /// \\( \mathbb Z / (2\^{255} - 19)\\).
 ///
@@ -123,13 +132,9 @@ impl<'a> Sub<&'a FieldElement51> for &FieldElement51 {
         //
         // Note the constant added in limb 0 is 2^55 - 304, hence our
         // precondition
-        FieldElement51::reduce([
-            (self.0[0] + 36028797018963664u64) - _rhs.0[0],
-            (self.0[1] + 36028797018963952u64) - _rhs.0[1],
-            (self.0[2] + 36028797018963952u64) - _rhs.0[2],
-            (self.0[3] + 36028797018963952u64) - _rhs.0[3],
-            (self.0[4] + 36028797018963952u64) - _rhs.0[4],
-        ])
+        FieldElement51::reduce(core::array::from_fn(|i| {
+            self.0[i] + SIXTEEN_P[i] - _rhs.0[i]
+        }))
     }
 }
 
@@ -335,13 +340,7 @@ impl FieldElement51 {
     /// Each limb of the output is < 2^(51 + epsilon) where epsilon = 1e-10
     pub fn negate(&mut self) {
         // See commentary in the Sub impl
-        let neg = FieldElement51::reduce([
-            36028797018963664u64 - self.0[0],
-            36028797018963952u64 - self.0[1],
-            36028797018963952u64 - self.0[2],
-            36028797018963952u64 - self.0[3],
-            36028797018963952u64 - self.0[4],
-        ]);
+        let neg = FieldElement51::reduce(core::array::from_fn(|i| SIXTEEN_P[i] - self.0[i]));
         self.0 = neg.0;
     }
 
