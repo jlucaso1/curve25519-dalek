@@ -676,40 +676,32 @@ fn square_limbs(mut a: [u64; 5]) -> [u64; 5] {
 mod test {
     use super::*;
 
-    /// `square` and `square2` must agree with `mul` on all valid inputs
-    #[test]
-    fn square_agrees_with_mul() {
-        // xorshift64, so this needs no dependency and is reproducible.
-        let mut s = 0x1234_5678_9abc_def1u64;
-        let mut next = move || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            s
-        };
-
-        // We test field elements with limbs up to the 2^54-1 limit
-        for bits in [51, 52, 53, 54] {
+    proptest::proptest! {
+        /// `square` and `square2` must agree with `mul` on all valid inputs.
+        #[test]
+        fn proptest_square_agrees_with_mul(
+            bits in 50u32..=54, // Go up to the max allowable input to square* functions, 2^54-1
+            limbs in proptest::array::uniform5(proptest::num::u64::ANY),
+        ) {
+            // Sample uniform limbs and then mask to `bits`, so that we explore various bitlengths
             let mask = (1u64 << bits) - 1;
-            for _ in 0..256 {
-                let x = FieldElement51([
-                    next() & mask,
-                    next() & mask,
-                    next() & mask,
-                    next() & mask,
-                    next() & mask,
-                ]);
-                assert_eq!(x.square().to_bytes(), (&x * &x).to_bytes());
-                let sq = x.square();
-                assert_eq!(x.square2().to_bytes(), (&sq + &sq).to_bytes());
-            }
-        }
+            let x = FieldElement51(limbs.map(|limb| limb & mask));
+            let sq = x.square();
 
-        // Test 0, 1, and the max allowed input to square
+            proptest::prop_assert_eq!(sq.to_bytes(), (&x * &x).to_bytes());
+            proptest::prop_assert_eq!(x.square2().to_bytes(), (&sq + &sq).to_bytes());
+        }
+    }
+
+    /// `square` and `square2` must agree with `mul` at the edges of the valid input range:
+    /// zero, one, and the largest limbs `square` accepts
+    #[test]
+    fn square_agrees_with_mul_at_bounds() {
         for limbs in [[0; 5], [1, 0, 0, 0, 0], [(1 << 54) - 1; 5]] {
             let x = FieldElement51(limbs);
-            assert_eq!(x.square().to_bytes(), (&x * &x).to_bytes());
             let sq = x.square();
+
+            assert_eq!(sq.to_bytes(), (&x * &x).to_bytes());
             assert_eq!(x.square2().to_bytes(), (&sq + &sq).to_bytes());
         }
     }
