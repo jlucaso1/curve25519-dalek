@@ -56,6 +56,13 @@ impl Zeroize for FieldElement51 {
 }
 
 impl<'a> AddAssign<&'a FieldElement51> for FieldElement51 {
+    /// Given `self` and `_rhs`, set `self` to `self + _rhs`
+    ///
+    /// # Requires
+    /// `self.0[i] + _rhs.0[i]` MUST be < 2^64 for all `i`
+    ///
+    /// # Postcondition
+    /// `out.0[i] == self.0 + _rhs.0[i]` for all `i`
     fn add_assign(&mut self, _rhs: &'a FieldElement51) {
         for i in 0..5 {
             self.0[i] += _rhs.0[i];
@@ -65,6 +72,11 @@ impl<'a> AddAssign<&'a FieldElement51> for FieldElement51 {
 
 impl<'a> Add<&'a FieldElement51> for &FieldElement51 {
     type Output = FieldElement51;
+
+    /// Given `self` and `_rhs`, return `self + _rhs`
+    ///
+    /// # Requires
+    /// `self.0[i] + _rhs.[i]` MUST be < 2^64 for all `i`
     fn add(self, _rhs: &'a FieldElement51) -> FieldElement51 {
         let mut output = *self;
         output += _rhs;
@@ -73,6 +85,14 @@ impl<'a> Add<&'a FieldElement51> for &FieldElement51 {
 }
 
 impl<'a> SubAssign<&'a FieldElement51> for FieldElement51 {
+    /// Given \\(x,y\\), return \\(x - y\\).
+    ///
+    /// # Requires
+    /// Each limb of `self` must be < 2^64 - 2^55. And each limb of `rhs`
+    /// MUST be ≤ 2^55 - 304.
+    ///
+    /// # Postcondition
+    /// Each limb of the output is < 2^(51 + epsilon) where epsilon = 1e-10
     fn sub_assign(&mut self, _rhs: &'a FieldElement51) {
         let result = (self as &FieldElement51) - _rhs;
         self.0 = result.0;
@@ -81,6 +101,15 @@ impl<'a> SubAssign<&'a FieldElement51> for FieldElement51 {
 
 impl<'a> Sub<&'a FieldElement51> for &FieldElement51 {
     type Output = FieldElement51;
+
+    /// Given \\(x,y\\), return \\(x - y\\).
+    ///
+    /// # Requires
+    /// Each limb of `self` must be < 2^64 - 2^55. And each limb of `rhs`
+    /// MUST be ≤ 2^55 - 304.
+    ///
+    /// # Postcondition
+    /// Each limb of the output is < 2^(51 + epsilon) where epsilon = 1e-10
     fn sub(self, _rhs: &'a FieldElement51) -> FieldElement51 {
         // To avoid underflow, first add a multiple of p.
         // Choose 16*p = p << 4 to be larger than 54-bit _rhs.
@@ -91,6 +120,9 @@ impl<'a> Sub<&'a FieldElement51> for &FieldElement51 {
         //
         // Since we don't yet have type-level integers to do this, we
         // have to add an explicit reduction call here.
+        //
+        // Note the constant added in limb 0 is 2^55 - 304, hence our
+        // precondition
         FieldElement51::reduce([
             (self.0[0] + 36028797018963664u64) - _rhs.0[0],
             (self.0[1] + 36028797018963952u64) - _rhs.0[1],
@@ -102,6 +134,13 @@ impl<'a> Sub<&'a FieldElement51> for &FieldElement51 {
 }
 
 impl<'a> MulAssign<&'a FieldElement51> for FieldElement51 {
+    /// Given `self` and `_rhs`, set `self` to `self * _rhs`
+    ///
+    /// # Requires
+    /// Each limb in `self` and `_rhs` MUST be < 2^54
+    ///
+    /// # Postcondition
+    /// The limbs of the output are all < 2^(51 + epsilon) where epsilon is 1e-11
     fn mul_assign(&mut self, _rhs: &'a FieldElement51) {
         let result = (self as &FieldElement51) * _rhs;
         self.0 = result.0;
@@ -111,6 +150,13 @@ impl<'a> MulAssign<&'a FieldElement51> for FieldElement51 {
 impl<'a> Mul<&'a FieldElement51> for &FieldElement51 {
     type Output = FieldElement51;
 
+    /// Given `self` and `_rhs`, return `self * _rhs`
+    ///
+    /// # Requires
+    /// Each limb in `self` and `_rhs` MUST be < 2^54
+    ///
+    /// # Postcondition
+    /// The limbs of the output are all < 2^(51 + epsilon) where epsilon is 1e-11
     #[rustfmt::skip] // keep alignment of c* calculations
     fn mul(self, _rhs: &'a FieldElement51) -> FieldElement51 {
         /// Helper function to multiply two 64-bit integers with 128
@@ -215,6 +261,14 @@ impl<'a> Mul<&'a FieldElement51> for &FieldElement51 {
 
 impl Neg for &FieldElement51 {
     type Output = FieldElement51;
+
+    /// Given \\(x\\), return \\(-x\\).
+    ///
+    /// # Requires
+    /// Each limb of `self` MUST be ≤ 2^55 - 304
+    ///
+    /// # Postcondition
+    /// Each limb of the output is < 2^(51 + epsilon) where epsilon = 1e-10
     fn neg(self) -> FieldElement51 {
         let mut output = *self;
         output.negate();
@@ -273,6 +327,12 @@ impl FieldElement51 {
     ]);
 
     /// Invert the sign of this field element
+    ///
+    /// # Requires
+    /// Each limb of `self` MUST be ≤ 2^55 - 304
+    ///
+    /// # Postcondition
+    /// Each limb of the output is < 2^(51 + epsilon) where epsilon = 1e-10
     pub fn negate(&mut self) {
         // See commentary in the Sub impl
         let neg = FieldElement51::reduce([
@@ -285,7 +345,8 @@ impl FieldElement51 {
         self.0 = neg.0;
     }
 
-    /// Given 64-bit input limbs, reduce to enforce the bound 2^(51 + epsilon).
+    /// Given 64-bit input limbs, reduce to enforce the bound 2^(51 + epsilon) for all
+    /// limbs, where epsilon = 1e-10.
     #[inline(always)]
     fn reduce(mut limbs: [u64; 5]) -> FieldElement51 {
         const LOW_51_BIT_MASK: u64 = (1u64 << 51) - 1;
@@ -334,6 +395,8 @@ impl FieldElement51 {
     /// the canonical encoding, and check that the input was
     /// canonical.
     ///
+    /// # Postcondition
+    /// The limbs of the output are all < 2^51
     #[rustfmt::skip] // keep alignment of bit shifts
     pub const fn from_bytes(bytes: &[u8; 32]) -> FieldElement51 {
         const fn load8_at(input: &[u8], i: usize) -> u64 {
@@ -450,12 +513,21 @@ impl FieldElement51 {
     }
 
     /// Given `k > 0`, return `self^(2^k)`.
+    ///
+    /// # Requires
+    /// Each limb in `self` MUST be < 2^54
+    ///
+    /// # Postcondition
+    /// The entries of the output are all < 2^(51 + epsilon), where epsilon = 1e-9
     pub fn pow2k(&self, mut k: u32) -> FieldElement51 {
         debug_assert!(k > 0);
 
         let mut a: [u64; 5] = self.0;
 
         loop {
+            // square_limbs has the same precondition and postcondition as this function.
+            // Also its precondition is satisfied by its postcondition, so we can feed the
+            // output into itself.
             a = square_limbs(a);
 
             k -= 1;
@@ -468,26 +540,42 @@ impl FieldElement51 {
     }
 
     /// Returns the square of this field element.
+    ///
+    /// # Requires
+    /// Each limb in `self` MUST be < 2^54
+    ///
+    /// # Postcondition
+    /// Each limb of the output is < 2^(51 + epsilon) where epsilon = 1e-11
     pub fn square(&self) -> FieldElement51 {
         FieldElement51(square_limbs(self.0))
     }
 
     /// Returns 2 times the square of this field element.
+    ///
+    /// # Requires
+    /// Each limb in `self` MUST be < 2^54
+    ///
+    /// # Postcondition
+    /// Each limb of the output is < 2^(51 + epsilon) where epsilon = 1e-11
     pub fn square2(&self) -> FieldElement51 {
         let mut square = square_limbs(self.0);
         for limb in &mut square {
             *limb *= 2;
         }
 
+        // square_limbs returns limbs less than 2^(51 + epsilon). Multiplying by 2 gives
+        // us our postcondition
         FieldElement51(square)
     }
 }
 
-/// One squaring step in radix \\(2^{51}\\): given the limbs of \\(x\\), return
-/// the limbs of \\(x^2\\).
+/// Given the limbs of \\(x\\), return the limbs of \\(x^2\\).
 ///
-/// This is `pow2k`'s loop body, unchanged, so that `square` need not enter the
-/// loop to square once.
+/// # Requires
+/// Each entry in `a` MUST be < 2^54
+///
+/// # Postcondition
+/// Each entry of the output is < 2^(51 + epsilon) where epsilon = 1e-11
 #[rustfmt::skip] // keep alignment of c* calculations
 #[inline(always)]
 fn square_limbs(mut a: [u64; 5]) -> [u64; 5] {
@@ -589,9 +677,7 @@ fn square_limbs(mut a: [u64; 5]) -> [u64; 5] {
 mod test {
     use super::*;
 
-    /// `square` and `square2` must agree with `mul` across the documented bit
-    /// excess (`b < 3`, i.e. limbs below 2^54), which the curve-level tests do
-    /// not reach: they only ever square reduced elements.
+    /// `square` and `square2` must agree with `mul` on all valid inputs
     #[test]
     fn square_agrees_with_mul() {
         // xorshift64, so this needs no dependency and is reproducible.
@@ -603,6 +689,7 @@ mod test {
             s
         };
 
+        // We test field elements with limbs up to the 2^54-1 limit
         for bits in [51, 52, 53, 54] {
             let mask = (1u64 << bits) - 1;
             for _ in 0..256 {
@@ -619,9 +706,12 @@ mod test {
             }
         }
 
+        // Test 0, 1, and the max allowed input to square
         for limbs in [[0; 5], [1, 0, 0, 0, 0], [(1 << 54) - 1; 5]] {
             let x = FieldElement51(limbs);
             assert_eq!(x.square().to_bytes(), (&x * &x).to_bytes());
+            let sq = x.square();
+            assert_eq!(x.square2().to_bytes(), (&sq + &sq).to_bytes());
         }
     }
 }
