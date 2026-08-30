@@ -131,7 +131,7 @@ use zeroize::Zeroize;
 use crate::constants;
 
 use crate::field::FieldElement;
-use crate::scalar::{Scalar, clamp_integer};
+use crate::scalar::{HalfWidthScalar, Scalar, clamp_integer};
 
 use crate::montgomery::MontgomeryPoint;
 
@@ -1109,6 +1109,45 @@ impl EdwardsPoint {
         b: &Scalar,
     ) -> EdwardsPoint {
         crate::backend::vartime_double_base_mul(a, A, b)
+    }
+
+    /// Compute \\(a_1 A_1 + a_2 A_2 + b B\\) in variable time, where \\(B\\) is the Ed25519 basepoint.
+    ///
+    /// Taking \\(a_1\\) and \\(a_2\\) as [`HalfWidthScalar`]s — scalars known to be less than
+    /// \\(2^{128}\\) — lets this run in roughly half the doublings of the general case.
+    ///
+    /// [`HalfWidthScalar`]: crate::scalar::HalfWidthScalar
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use curve25519_dalek::scalar::{HalfWidthScalar, Scalar};
+    /// use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
+    /// use curve25519_dalek::edwards::EdwardsPoint;
+    ///
+    /// let a1 = HalfWidthScalar::from(123u64);
+    /// let a2 = HalfWidthScalar::from(456u64);
+    /// let b = Scalar::from(789u64);
+    ///
+    /// let A1 = &ED25519_BASEPOINT_POINT * &Scalar::from(2u64);
+    /// let A2 = &ED25519_BASEPOINT_POINT * &Scalar::from(3u64);
+    ///
+    /// // Compute a1*A1 + a2*A2 + b*B efficiently
+    /// let result = EdwardsPoint::vartime_triple_scalar_mul_basepoint(&a1, &A1, &a2, &A2, &b);
+    ///
+    /// // An arbitrary `Scalar` has to be narrowed first, which fails if it is too large.
+    /// assert!(HalfWidthScalar::try_from(Scalar::from(789u64)).is_ok());
+    /// assert!(HalfWidthScalar::try_from(-Scalar::ONE).is_err());
+    /// ```
+    #[allow(non_snake_case)]
+    pub fn vartime_triple_scalar_mul_basepoint(
+        a1: &HalfWidthScalar,
+        A1: &EdwardsPoint,
+        a2: &HalfWidthScalar,
+        A2: &EdwardsPoint,
+        b: &Scalar,
+    ) -> EdwardsPoint {
+        crate::backend::vartime_triple_base_mul_128_128_256(a1, A1, a2, A2, b)
     }
 }
 

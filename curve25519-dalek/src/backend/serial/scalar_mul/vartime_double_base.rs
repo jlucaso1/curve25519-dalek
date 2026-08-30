@@ -10,9 +10,8 @@
 // - Henry de Valence <hdevalence@hdevalence.ca>
 #![allow(non_snake_case)]
 
-use core::cmp::Ordering;
-
 use crate::backend::serial::curve_models::{ProjectiveNielsPoint, ProjectivePoint};
+use crate::backend::util::add_naf_digit;
 use crate::constants;
 use crate::edwards::EdwardsPoint;
 use crate::scalar::Scalar;
@@ -48,17 +47,8 @@ pub fn mul(a: &Scalar, A: &EdwardsPoint, b: &Scalar) -> EdwardsPoint {
     loop {
         let mut t = r.double();
 
-        match a_naf[i].cmp(&0) {
-            Ordering::Greater => t = &t.as_extended() + &table_A.select(a_naf[i] as usize),
-            Ordering::Less => t = &t.as_extended() - &table_A.select(-a_naf[i] as usize),
-            Ordering::Equal => {}
-        }
-
-        match b_naf[i].cmp(&0) {
-            Ordering::Greater => t = &t.as_extended() + &table_B.select(b_naf[i] as usize),
-            Ordering::Less => t = &t.as_extended() - &table_B.select(-b_naf[i] as usize),
-            Ordering::Equal => {}
-        }
+        add_naf_digit!(t.as_extended(), a_naf[i], table_A);
+        add_naf_digit!(t.as_extended(), b_naf[i], table_B);
 
         r = t.as_projective();
 

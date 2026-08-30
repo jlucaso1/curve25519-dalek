@@ -16,8 +16,8 @@
 use alloc::vec::Vec;
 
 use core::borrow::Borrow;
-use core::cmp::Ordering;
 
+use crate::backend::util::add_naf_digit;
 use crate::edwards::EdwardsPoint;
 use crate::scalar::Scalar;
 use crate::traits::MultiscalarMul;
@@ -184,13 +184,7 @@ impl VartimeMultiscalarMul for Straus {
             let mut t: CompletedPoint = r.double();
 
             for (naf, lookup_table) in nafs.iter().zip(lookup_tables.iter()) {
-                match naf[i].cmp(&0) {
-                    Ordering::Greater => {
-                        t = &t.as_extended() + &lookup_table.select(naf[i] as usize)
-                    }
-                    Ordering::Less => t = &t.as_extended() - &lookup_table.select(-naf[i] as usize),
-                    Ordering::Equal => {}
-                }
+                add_naf_digit!(t.as_extended(), naf[i], lookup_table);
             }
 
             r = t.as_projective();

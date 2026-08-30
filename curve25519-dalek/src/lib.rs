@@ -104,7 +104,10 @@ pub mod bench_internals;
 mod lizard;
 
 pub use crate::{
-    edwards::EdwardsPoint, montgomery::MontgomeryPoint, ristretto::RistrettoPoint, scalar::Scalar,
+    edwards::EdwardsPoint,
+    montgomery::MontgomeryPoint,
+    ristretto::RistrettoPoint,
+    scalar::{HalfWidthScalar, Scalar},
 };
 
 // Build time diagnostics for validation

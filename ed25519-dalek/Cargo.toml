@@ -44,11 +44,11 @@ zeroize = { version = "1.5", default-features = false, optional = true }
 strobe-rs = { version = "0.13", optional = true }
 
 [dev-dependencies]
-curve25519-dalek = { version = "5.0.0", default-features = false, features = [
+curve25519-dalek = { version = "5", default-features = false, features = [
     "digest",
     "rand_core",
 ] }
-x25519-dalek = { version = "3.0.0", default-features = false, features = [
+x25519-dalek = { version = "3", default-features = false, features = [
     "static_secrets",
 ] }
 blake2 = "=0.11.0-rc.6"

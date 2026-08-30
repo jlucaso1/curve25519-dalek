@@ -20,7 +20,6 @@ pub mod spec {
     use alloc::vec::Vec;
 
     use core::borrow::Borrow;
-    use core::cmp::Ordering;
 
     #[for_target_feature("avx2")]
     use crate::backend::vector::avx2::{CachedPoint, ExtendedPoint};
@@ -28,6 +27,7 @@ pub mod spec {
     #[for_target_feature("avx512ifma")]
     use crate::backend::vector::ifma::{CachedPoint, ExtendedPoint};
 
+    use crate::backend::util::add_naf_digit;
     use crate::edwards::EdwardsPoint;
     use crate::scalar::Scalar;
     use crate::traits::Identity;
@@ -102,30 +102,12 @@ pub mod spec {
                 R = R.double();
 
                 for i in 0..dp {
-                    let t_ij = dynamic_nafs[i][j];
-                    match t_ij.cmp(&0) {
-                        Ordering::Greater => {
-                            R = &R + &dynamic_lookup_tables[i].select(t_ij as usize);
-                        }
-                        Ordering::Less => {
-                            R = &R - &dynamic_lookup_tables[i].select(-t_ij as usize);
-                        }
-                        Ordering::Equal => {}
-                    }
+                    add_naf_digit!(R, dynamic_nafs[i][j], dynamic_lookup_tables[i]);
                 }
 
                 #[allow(clippy::needless_range_loop)]
                 for i in 0..static_nafs.len() {
-                    let t_ij = static_nafs[i][j];
-                    match t_ij.cmp(&0) {
-                        Ordering::Greater => {
-                            R = &R + &self.static_lookup_tables[i].select(t_ij as usize);
-                        }
-                        Ordering::Less => {
-                            R = &R - &self.static_lookup_tables[i].select(-t_ij as usize);
-                        }
-                        Ordering::Equal => {}
-                    }
+                    add_naf_digit!(R, static_nafs[i][j], self.static_lookup_tables[i]);
                 }
             }
 

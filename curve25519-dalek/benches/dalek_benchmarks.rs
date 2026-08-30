@@ -10,7 +10,7 @@ use criterion::{
 use sha2::Sha512;
 
 use curve25519_dalek::constants;
-use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::scalar::{HalfWidthScalar, Scalar};
 
 static BATCH_SIZES: [usize; 5] = [1, 2, 4, 8, 16];
 static MULTISCALAR_SIZES: [usize; 13] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768, 1024];
@@ -75,6 +75,65 @@ mod edwards_benches {
         });
     }
 
+    fn vartime_triple_base_scalar_mul_128<M: Measurement>(c: &mut BenchmarkGroup<M>) {
+        use curve25519_dalek::traits::VartimeMultiscalarMul;
+
+        let sample_a1_a2_b = |rng: &mut UnwrapErr<SysRng>| {
+            // Generate 128-bit scalars for a1 and a2
+            let mut a1_bytes = [0u8; 16];
+            let mut a2_bytes = [0u8; 16];
+            rng.fill_bytes(&mut a1_bytes);
+            rng.fill_bytes(&mut a2_bytes);
+
+            let a1 = HalfWidthScalar::from_bytes(a1_bytes);
+            let a2 = HalfWidthScalar::from_bytes(a2_bytes);
+            let b = Scalar::random(rng);
+
+            (a1, a2, b)
+        };
+
+        c.bench_function(
+            "Optimized variable-time a1*A1+a2*A2+b*B (128-bit a1,a2)",
+            |bench| {
+                let mut rng = UnwrapErr(SysRng);
+                let A1 = EdwardsPoint::mul_base(&Scalar::random(&mut rng));
+                let A2 = EdwardsPoint::mul_base(&Scalar::random(&mut rng));
+
+                bench.iter_batched(
+                    || sample_a1_a2_b(&mut rng),
+                    |(a1, a2, b)| {
+                        EdwardsPoint::vartime_triple_scalar_mul_basepoint(&a1, &A1, &a2, &A2, &b)
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+
+        // Do the same `a1*A1 + a2*A2 + b*B` comptuation, but using a plain variable-time
+        // multiscalar multiplication over full 256-bit scalars
+        c.bench_function(
+            "Naive variable-time a1*A1+a2*A2+b*B (128-bit a1,a2)",
+            |bench| {
+                let mut rng = UnwrapErr(SysRng);
+                let A1 = EdwardsPoint::mul_base(&Scalar::random(&mut rng));
+                let A2 = EdwardsPoint::mul_base(&Scalar::random(&mut rng));
+                let B = curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
+
+                bench.iter_batched(
+                    || sample_a1_a2_b(&mut rng),
+                    |(a1, a2, b)| {
+                        // Widen the half-width scalars back to full `Scalar`s and combine
+                        // all three terms with a generic variable-time multiscalar mul.
+                        let scalars = [Scalar::from(a1), Scalar::from(a2), b];
+                        let points = [A1, A2, B];
+                        EdwardsPoint::vartime_multiscalar_mul(&scalars, &points)
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
     #[cfg(feature = "digest")]
     fn encode_to_curve<M: Measurement>(c: &mut BenchmarkGroup<M>) {
         let mut rng = UnwrapErr(SysRng);
@@ -106,7 +165,7 @@ mod edwards_benches {
     }
 
     pub(crate) fn edwards_benches() {
-        let mut c = Criterion::default();
+        let mut c = Criterion::default().configure_from_args();
         let mut g = c.benchmark_group("edwards benches");
 
         compress(&mut g);
@@ -116,6 +175,8 @@ mod edwards_benches {
         consttime_fixed_base_scalar_mul(&mut g);
         consttime_variable_base_scalar_mul(&mut g);
         vartime_double_base_scalar_mul(&mut g);
+        #[cfg(feature = "alloc")]
+        vartime_triple_base_scalar_mul_128(&mut g);
         encode_to_curve(&mut g);
         hash_to_curve(&mut g);
     }
@@ -263,7 +324,7 @@ mod multiscalar_benches {
     }
 
     pub(crate) fn multiscalar_benches() {
-        let mut c = Criterion::default();
+        let mut c = Criterion::default().configure_from_args();
         let mut g = c.benchmark_group("multiscalar benches");
 
         consttime_multiscalar_mul(&mut g);
@@ -313,7 +374,7 @@ mod ristretto_benches {
     }
 
     pub(crate) fn ristretto_benches() {
-        let mut c = Criterion::default();
+        let mut c = Criterion::default().configure_from_args();
         let mut g = c.benchmark_group("ristretto benches");
 
         compress(&mut g);
@@ -342,7 +403,7 @@ mod montgomery_benches {
     }
 
     pub(crate) fn montgomery_benches() {
-        let mut c = Criterion::default();
+        let mut c = Criterion::default().configure_from_args();
         let mut g = c.benchmark_group("montgomery benches");
 
         montgomery_ladder(&mut g);
@@ -402,7 +463,7 @@ mod scalar_benches {
     }
 
     pub(crate) fn scalar_benches() {
-        let mut c = Criterion::default();
+        let mut c = Criterion::default().configure_from_args();
         let mut g = c.benchmark_group("scalar benches");
 
         scalar_arith(&mut g);

@@ -7,6 +7,10 @@ major series.
 
 ## Unreleased
 
+* Add `EdwardsPoint::vartime_triple_scalar_mul_basepoint`, computing `a1*A1 + a2*A2 + b*B` in roughly half the doublings of the naive approach when `a1` and `a2` are less than 2^128 ([#858](https://github.com/dalek-cryptography/curve25519-dalek/pull/858))
+* Add `HalfWidthScalar`, a `Scalar` that is known to be less than 2^128 ([#858](https://github.com/dalek-cryptography/curve25519-dalek/pull/858))
+* Perf: Square `FieldElement51` directly rather than through `pow2k(1)` ([#922](https://github.com/dalek-cryptography/curve25519-dalek/pull/922))
+
 ### Other Changes
 
 * Perf: `MontgomeryPoint::to_edwards` no longer performs two field
@@ -80,12 +84,6 @@ major series.
   cost -- 43 digit columns, each summing 62 buckets regardless of input size --
   so Straus is still ahead there. Measured instruction counts put the crossover
   higher; at n = 200 the old threshold cost 3.63% more than Straus would have.
-* Perf: `serial::u64::FieldElement51::square` no longer goes through `pow2k(1)`.
-  The squaring step is factored out of `pow2k`'s loop, so a single squaring no
-  longer pays for the loop and call machinery it cannot amortize. X25519
-  `mul_clamped` improves measurably in every build profile; the output is
-  bit-for-bit identical and the 5x51 limb representation and its bit-excess
-  preconditions are unchanged.
 * Perf: `serial::u64` field squaring now doubles its 64-bit inputs rather than
   its 128-bit output coefficients. Ten of the twenty-five partial products
   appear twice, so they are computed once and doubled; since `2*(x*y)` equals

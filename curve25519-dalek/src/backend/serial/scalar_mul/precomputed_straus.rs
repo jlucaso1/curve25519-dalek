@@ -14,11 +14,11 @@
 use alloc::vec::Vec;
 
 use core::borrow::Borrow;
-use core::cmp::Ordering;
 
 use crate::backend::serial::curve_models::{
     AffineNielsPoint, CompletedPoint, ProjectiveNielsPoint, ProjectivePoint,
 };
+use crate::backend::util::add_naf_digit;
 use crate::edwards::EdwardsPoint;
 use crate::scalar::Scalar;
 use crate::traits::Identity;
@@ -94,30 +94,20 @@ impl VartimePrecomputedMultiscalarMul for VartimePrecomputedStraus {
             let mut R: CompletedPoint = S.double();
 
             for i in 0..dp {
-                let t_ij = dynamic_nafs[i][j];
-                match t_ij.cmp(&0) {
-                    Ordering::Greater => {
-                        R = &R.as_extended() + &dynamic_lookup_tables[i].select(t_ij as usize)
-                    }
-                    Ordering::Less => {
-                        R = &R.as_extended() - &dynamic_lookup_tables[i].select(-t_ij as usize)
-                    }
-                    Ordering::Equal => {}
-                }
+                add_naf_digit!(
+                    R.as_extended(),
+                    dynamic_nafs[i][j],
+                    dynamic_lookup_tables[i]
+                );
             }
 
             #[allow(clippy::needless_range_loop)]
             for i in 0..static_nafs.len() {
-                let t_ij = static_nafs[i][j];
-                match t_ij.cmp(&0) {
-                    Ordering::Greater => {
-                        R = &R.as_extended() + &self.static_lookup_tables[i].select(t_ij as usize)
-                    }
-                    Ordering::Less => {
-                        R = &R.as_extended() - &self.static_lookup_tables[i].select(-t_ij as usize)
-                    }
-                    Ordering::Equal => {}
-                }
+                add_naf_digit!(
+                    R.as_extended(),
+                    static_nafs[i][j],
+                    self.static_lookup_tables[i]
+                );
             }
 
             S = R.as_projective();
