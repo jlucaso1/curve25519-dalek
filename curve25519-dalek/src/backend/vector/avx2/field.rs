@@ -1079,37 +1079,29 @@ mod test {
     /// input — not merely as field elements, and not merely on inputs that
     /// respect the documented bounds. That is the strongest statement available
     /// here, so it is the one asserted.
-    #[test]
-    fn mul_matches_row_major() {
-        let mut rng_state: u64 = 0x1234_5678_9abc_def0;
-        let mut next = || {
-            // xorshift64*, so the test is deterministic and needs no dev-dep.
-            rng_state ^= rng_state >> 12;
-            rng_state ^= rng_state << 25;
-            rng_state ^= rng_state >> 27;
-            rng_state.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        };
-
-        for _ in 0..512 {
-            // Build inputs directly in the packed representation, at the top of
-            // the documented ranges (b < 2.5 for lhs, b < 1.75 for rhs) so the
-            // carry behaviour is exercised, not just small values.
-            let mut mk = |bits: u32| {
+    proptest::proptest! {
+        #[test]
+        fn mul_matches_row_major(
+            al in proptest::array::uniform5(proptest::array::uniform8(proptest::num::u32::ANY)),
+            bl in proptest::array::uniform5(proptest::array::uniform8(proptest::num::u32::ANY)),
+        ) {
+            // Inputs are built directly in the packed representation, at the
+            // top of the documented ranges (b < 2.5 for lhs, b < 1.75 for rhs),
+            // so the carry behaviour is exercised and not just small values.
+            let mk = |raw: [[u32; 8]; 5], bits: u32| {
+                let mask = (1u32 << bits) - 1;
                 let mut limbs = [u32x8::splat(0); 5];
-                for limb in limbs.iter_mut() {
-                    let mut lanes = [0u32; 8];
-                    for lane in lanes.iter_mut() {
-                        *lane = (next() as u32) & ((1u32 << bits) - 1);
-                    }
+                for (i, limb) in limbs.iter_mut().enumerate() {
+                    let l = raw[i];
                     *limb = u32x8::new(
-                        lanes[0], lanes[1], lanes[2], lanes[3], lanes[4], lanes[5], lanes[6],
-                        lanes[7],
+                        l[0] & mask, l[1] & mask, l[2] & mask, l[3] & mask,
+                        l[4] & mask, l[5] & mask, l[6] & mask, l[7] & mask,
                     );
                 }
                 FieldElement2625x4(limbs)
             };
-            let a = mk(28);
-            let b = mk(27);
+            let a = mk(al, 28);
+            let b = mk(bl, 27);
 
             let got = &a * &b;
             let want = reference_row_major_mul(&a, &b);
@@ -1118,14 +1110,14 @@ mod test {
             // limb equality, which is strictly stronger than field equality.
             for i in 0..5 {
                 let (g, w) = (got.0[i], want.0[i]);
-                assert_eq!(g.extract::<0>(), w.extract::<0>(), "limb {i} lane 0");
-                assert_eq!(g.extract::<1>(), w.extract::<1>(), "limb {i} lane 1");
-                assert_eq!(g.extract::<2>(), w.extract::<2>(), "limb {i} lane 2");
-                assert_eq!(g.extract::<3>(), w.extract::<3>(), "limb {i} lane 3");
-                assert_eq!(g.extract::<4>(), w.extract::<4>(), "limb {i} lane 4");
-                assert_eq!(g.extract::<5>(), w.extract::<5>(), "limb {i} lane 5");
-                assert_eq!(g.extract::<6>(), w.extract::<6>(), "limb {i} lane 6");
-                assert_eq!(g.extract::<7>(), w.extract::<7>(), "limb {i} lane 7");
+                proptest::prop_assert_eq!(g.extract::<0>(), w.extract::<0>(), "limb {} lane 0", i);
+                proptest::prop_assert_eq!(g.extract::<1>(), w.extract::<1>(), "limb {} lane 1", i);
+                proptest::prop_assert_eq!(g.extract::<2>(), w.extract::<2>(), "limb {} lane 2", i);
+                proptest::prop_assert_eq!(g.extract::<3>(), w.extract::<3>(), "limb {} lane 3", i);
+                proptest::prop_assert_eq!(g.extract::<4>(), w.extract::<4>(), "limb {} lane 4", i);
+                proptest::prop_assert_eq!(g.extract::<5>(), w.extract::<5>(), "limb {} lane 5", i);
+                proptest::prop_assert_eq!(g.extract::<6>(), w.extract::<6>(), "limb {} lane 6", i);
+                proptest::prop_assert_eq!(g.extract::<7>(), w.extract::<7>(), "limb {} lane 7", i);
             }
         }
     }

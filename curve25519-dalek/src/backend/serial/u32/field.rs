@@ -728,51 +728,84 @@ impl FieldElement2625 {
 #[cfg(test)]
 mod test {
     use super::*;
+    use proptest::prelude::*;
 
-    /// Deterministic xorshift64, so the differential tests are reproducible and
-    /// need no dependencies.
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u32 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0 as u32
-        }
-
-        /// A field element with `excess` extra bits above the radix-2^25.5
-        /// limb widths. `mul` documents a precondition of `b < 1.75`, so
-        /// `excess == 1` stays inside the supported range.
-        fn field_element(&mut self, excess: u32) -> FieldElement2625 {
-            let mut limbs = [0u32; 10];
+    /// A field element whose limbs carry `excess` bits above the radix-2^25.5
+    /// widths. `mul` documents a precondition of `b < 1.75`, so `excess == 1`
+    /// stays inside the supported range.
+    fn fe(excess: u32) -> impl Strategy<Value = FieldElement2625> {
+        proptest::array::uniform10(any::<u32>()).prop_map(move |mut limbs| {
             for (i, limb) in limbs.iter_mut().enumerate() {
                 let width = if i % 2 == 0 { 26 } else { 25 } + excess;
-                *limb = self.next() & ((1u32 << width) - 1);
+                *limb &= (1u32 << width) - 1;
             }
             FieldElement2625(limbs)
+        })
+    }
+
+    /// Either bit excess the `mul` precondition admits.
+    fn fe_in_range() -> impl Strategy<Value = FieldElement2625> {
+        (0u32..=1).prop_flat_map(fe)
+    }
+
+    proptest! {
+        /// `mul121666` must agree with the general multiplication by
+        /// `APLUS2_OVER_FOUR` limb for limb: it is a specialization of exactly
+        /// that product, and the ladder feeds its output straight into the next
+        /// operation's bit-excess accounting.
+        #[test]
+        fn mul121666_matches_general_mul(x in fe_in_range()) {
+            use crate::backend::serial::u32::constants::APLUS2_OVER_FOUR;
+            prop_assert_eq!(x.mul121666().0, (&x * &APLUS2_OVER_FOUR).0);
+        }
+
+        /// Independent of the limb comparison above: `mul121666` must equal
+        /// multiplying by 121666 built only out of `add`, which shares no code
+        /// with either `mul121666` or `mul`.
+        #[test]
+        fn mul121666_is_multiplication_by_121666(x in fe(0)) {
+            // Double-and-add over the bits of 121666, reducing after every
+            // step so the limbs never leave the range `mul` documents: `add`
+            // itself does not carry.
+            let mut acc = FieldElement2625::ZERO;
+            for i in (0..17).rev() {
+                acc = FieldElement2625::reduce((&acc + &acc).0.map(u64::from));
+                if (121666u32 >> i) & 1 == 1 {
+                    acc = FieldElement2625::reduce((&acc + &x).0.map(u64::from));
+                }
+            }
+            prop_assert_eq!(x.mul121666().to_bytes(), acc.to_bytes());
+        }
+
+        /// `sub_unreduced` must be the same field element as the general
+        /// subtraction, and must leave every limb inside what `Mul`'s
+        /// `19 * y[i]` can hold in a `u32`.
+        ///
+        /// The precondition is "both operands are `mul`/`square` outputs", so
+        /// the inputs are produced that way rather than assumed to have that
+        /// shape.
+        #[test]
+        fn sub_unreduced_agrees_with_sub(a in fe(0), b in fe(0), c in fe(0)) {
+            let x = &a * &b;
+            let y = c.square();
+
+            let fast = x.sub_unreduced(&y);
+
+            prop_assert_eq!(fast.to_bytes(), (&x - &y).to_bytes());
+            prop_assert!(
+                fast.0.iter().all(|&l| l <= u32::MAX / 19),
+                "a limb would overflow `19 * limb` in a u32",
+            );
         }
     }
 
-    /// `mul121666` must agree with the general multiplication by
-    /// `APLUS2_OVER_FOUR` limb for limb: it is a specialization of exactly that
-    /// product, and the ladder feeds its output straight into the next
-    /// operation's bit-excess accounting.
+    /// The limb bounds themselves, which a random search reaches only by
+    /// accident: the top of the range each limb may hold, and the degenerate
+    /// inputs.
     #[test]
-    fn mul121666_matches_general_mul() {
+    fn mul121666_matches_general_mul_at_limb_bounds() {
         use crate::backend::serial::u32::constants::APLUS2_OVER_FOUR;
 
-        let mut rng = Rng(0xc0ff_ee00_c0ff_ee00);
-
-        for excess in [0u32, 1] {
-            for _ in 0..512 {
-                let x = rng.field_element(excess);
-                assert_eq!(x.mul121666().0, (&x * &APLUS2_OVER_FOUR).0);
-            }
-        }
-
-        // Top of the range each limb is allowed to hold, and the degenerate
-        // inputs.
         let mut edge = [0u32; 10];
         for (i, limb) in edge.iter_mut().enumerate() {
             *limb = if i % 2 == 0 {
@@ -790,58 +823,13 @@ mod test {
         }
     }
 
-    /// Independent of the limb comparison above: `mul121666` must equal
-    /// multiplying by 121666 built only out of `add`, which shares no code with
-    /// either `mul121666` or `mul`.
+    /// The worst case `sub_unreduced`'s precondition admits: `self` at the top
+    /// of what `reduce` can return and `rhs` at zero, which maximises every
+    /// output limb. This is the input that decides whether the 0.167 bits of
+    /// margin are real, and no random search will find it.
     #[test]
-    fn mul121666_is_multiplication_by_121666() {
-        let mut rng = Rng(0x1357_9bdf_1357_9bdf);
-
-        for _ in 0..64 {
-            let x = rng.field_element(0);
-
-            // Double-and-add over the bits of 121666, reducing after every
-            // step so the limbs never leave the range `mul` documents: `add`
-            // itself does not carry.
-            let mut acc = FieldElement2625::ZERO;
-            for i in (0..17).rev() {
-                acc = FieldElement2625::reduce((&acc + &acc).0.map(u64::from));
-                if (121666u32 >> i) & 1 == 1 {
-                    acc = FieldElement2625::reduce((&acc + &x).0.map(u64::from));
-                }
-            }
-
-            assert_eq!(x.mul121666().to_bytes(), acc.to_bytes());
-        }
-    }
-    /// `sub_unreduced` must be the same field element as the general
-    /// subtraction, and must leave every limb inside what `Mul`'s `19 * y[i]`
-    /// can hold in a `u32`. The second half is the whole reason this was not
-    /// taken earlier, so it is asserted on the worst case the precondition
-    /// admits, not only on typical values.
-    #[test]
-    fn sub_unreduced_agrees_with_sub() {
-        let mut rng = Rng(0x5eed_dead_beef_2625);
-
-        // The precondition is "both operands are `mul`/`square` outputs".
-        // Produce them rather than assume their shape.
-        for _ in 0..1024 {
-            let x = &rng.field_element(0) * &rng.field_element(0);
-            let y = rng.field_element(0).square();
-
-            let fast = x.sub_unreduced(&y);
-
-            assert_eq!(fast.to_bytes(), (&x - &y).to_bytes());
-            assert!(
-                fast.0.iter().all(|&l| l <= u32::MAX / 19),
-                "a limb would overflow `19 * limb` in a u32",
-            );
-        }
-
-        // The worst case the precondition admits: `self` at the top of what
-        // `reduce` can return and `rhs` at zero, which maximises every output
-        // limb. This is the input that decides whether the 0.167 bits of margin
-        // are real. Even limbs `2^26.007`, odd `2^25.007`.
+    fn sub_unreduced_worst_permitted_input() {
+        // Even limbs `2^26.007`, odd `2^25.007`.
         let hi = FieldElement2625([
             67435296, 33717648, 67435296, 33717648, 67435296, 33717648, 67435296, 33717648,
             67435296, 33717648,

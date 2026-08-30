@@ -970,58 +970,145 @@ mod test {
         square
     }
 
-    /// Deterministic xorshift64, so the differential tests are reproducible and
-    /// need no dependencies.
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
+    proptest::proptest! {
+        /// The refactored `square` must agree with the old `pow2k(1)` **limb
+        /// for limb**, not merely as a field element: the limbs are an input to
+        /// the next operation's bit-excess accounting. This is what certifies
+        /// the change as a pure refactor; `proptest_square_agrees_with_mul`
+        /// above checks the weaker, independent property.
+        #[test]
+        fn square_matches_reference_bit_for_bit(
+            bits in 51u32..=54,
+            limbs in proptest::array::uniform5(proptest::num::u64::ANY),
+        ) {
+            let x = FieldElement51(limbs.map(|l| l & ((1u64 << bits) - 1)));
+            proptest::prop_assert_eq!(x.square().0, reference_pow2k(&x, 1).0);
+            proptest::prop_assert_eq!(x.square2().0, reference_square2(&x).0);
         }
 
-        /// A field element whose limbs are uniform below `2^bits`.
-        ///
-        /// The documented precondition of `mul`/`pow2k` is a bit excess
-        /// `b < 3`, i.e. limbs below `2^54`, so `bits == 54` is exactly the
-        /// upper edge of the supported input range.
-        fn field_element(&mut self, bits: u32) -> FieldElement51 {
-            let mask = (1u64 << bits) - 1;
-            FieldElement51([
-                self.next() & mask,
-                self.next() & mask,
-                self.next() & mask,
-                self.next() & mask,
-                self.next() & mask,
-            ])
+        /// `pow2k(k)` is a loop over the same factored-out step, so it must
+        /// still agree with the old monolithic loop for every `k` — including
+        /// the values the X25519 inversion path actually uses.
+        #[test]
+        fn pow2k_matches_reference_bit_for_bit(
+            bits in 51u32..=54,
+            limbs in proptest::array::uniform5(proptest::num::u64::ANY),
+            k in proptest::prop_oneof![1u32..=8, proptest::strategy::Just(10),
+                                       proptest::strategy::Just(20),
+                                       proptest::strategy::Just(50),
+                                       proptest::strategy::Just(100)],
+        ) {
+            let x = FieldElement51(limbs.map(|l| l & ((1u64 << bits) - 1)));
+            proptest::prop_assert_eq!(x.pow2k(k).0, reference_pow2k(&x, k).0);
         }
-    }
 
-    /// The refactored `square` must agree with the old `pow2k(1)` limb for
-    /// limb, not merely as a field element: the limbs are an input to the next
-    /// operation's bit-excess accounting.
-    #[test]
-    fn square_matches_reference_bit_for_bit() {
-        let mut rng = Rng(0x1234_5678_9abc_def1);
-
-        // 51 bits is the reduced case; 54 bits is the documented upper edge of
-        // the bit excess.
-        for bits in [51u32, 52, 53, 54] {
-            for _ in 0..512 {
-                let x = rng.field_element(bits);
-                assert_eq!(x.square().0, reference_pow2k(&x, 1).0);
-                assert_eq!(x.square2().0, reference_square2(&x).0);
+        /// `k` chained squarings must equal one `pow2k(k)`: the property that
+        /// lets the ladder use `square()` and the inversion use `pow2k`.
+        #[test]
+        fn chained_square_matches_pow2k(
+            limbs in proptest::array::uniform5(proptest::num::u64::ANY),
+        ) {
+            let x = FieldElement51(limbs.map(|l| l & ((1u64 << 54) - 1)));
+            let mut chained = x;
+            for k in 1..=16u32 {
+                chained = chained.square();
+                proptest::prop_assert_eq!(chained.0, x.pow2k(k).0);
             }
         }
 
-        // The all-ones limbs at the top of the documented range.
+        /// `mul121666` must agree with the general multiplication by
+        /// `APLUS2_OVER_FOUR` limb for limb: it is a specialization of exactly
+        /// that product, and the ladder feeds its output straight into the next
+        /// operation's bit-excess accounting.
+        #[test]
+        fn mul121666_matches_general_mul(
+            bits in 51u32..=54,
+            limbs in proptest::array::uniform5(proptest::num::u64::ANY),
+        ) {
+            use crate::backend::serial::u64::constants::APLUS2_OVER_FOUR;
+            let x = FieldElement51(limbs.map(|l| l & ((1u64 << bits) - 1)));
+            proptest::prop_assert_eq!(x.mul121666().0, (&x * &APLUS2_OVER_FOUR).0);
+        }
+
+        /// Independent of the limb comparison above: `mul121666` must equal
+        /// multiplying by 121666 built only out of `add`, which shares no code
+        /// with either `mul121666` or `mul`. This is what catches the two of
+        /// them being wrong in the same way.
+        #[test]
+        fn mul121666_is_multiplication_by_121666(
+            limbs in proptest::array::uniform5(proptest::num::u64::ANY),
+        ) {
+            let x = FieldElement51(limbs.map(|l| l & ((1u64 << 51) - 1)));
+
+            // Double-and-add over the bits of 121666, reducing after every step
+            // so the limbs never leave the documented bit excess.
+            let mut acc = FieldElement51::ZERO;
+            for i in (0..17).rev() {
+                acc = FieldElement51::reduce((&acc + &acc).0);
+                if (121666u32 >> i) & 1 == 1 {
+                    acc = FieldElement51::reduce((&acc + &x).0);
+                }
+            }
+            proptest::prop_assert_eq!(x.mul121666().to_bytes(), acc.to_bytes());
+        }
+
+        /// `(x + y)^2 == x^2 + 2xy + y^2` exercises `mul` and `square` against
+        /// each other, so a future change to either has a differential test
+        /// waiting for it.
+        #[test]
+        fn mul_and_square_are_consistent(
+            xl in proptest::array::uniform5(proptest::num::u64::ANY),
+            yl in proptest::array::uniform5(proptest::num::u64::ANY),
+        ) {
+            // Keep the sum inside the documented bit excess: two 53-bit limbs
+            // add to at most 2^54.
+            let mask = (1u64 << 53) - 1;
+            let x = FieldElement51(xl.map(|l| l & mask));
+            let y = FieldElement51(yl.map(|l| l & mask));
+
+            let lhs = (&x + &y).square();
+            let xy = &x * &y;
+            let rhs = &(&x.square() + &y.square()) + &(&xy + &xy);
+
+            proptest::prop_assert_eq!(lhs.to_bytes(), rhs.to_bytes());
+        }
+
+        /// `sub_unreduced` is not limb-for-limb equal to `Sub` — it returns a
+        /// different representative of the same field element — so it is checked
+        /// on the two properties the ladder depends on: the value is right, and
+        /// the limbs land inside the bit excess the next operation requires.
+        ///
+        /// The precondition is "both operands are `mul`/`square` outputs", so
+        /// the inputs are produced that way rather than assumed to have that
+        /// shape.
+        #[test]
+        fn sub_unreduced_agrees_with_sub(
+            al in proptest::array::uniform5(proptest::num::u64::ANY),
+            bl in proptest::array::uniform5(proptest::num::u64::ANY),
+            cl in proptest::array::uniform5(proptest::num::u64::ANY),
+        ) {
+            let mask = (1u64 << 51) - 1;
+            let x = &FieldElement51(al.map(|l| l & mask)) * &FieldElement51(bl.map(|l| l & mask));
+            let y = FieldElement51(cl.map(|l| l & mask)).square();
+
+            let fast = x.sub_unreduced(&y);
+
+            proptest::prop_assert_eq!(fast.to_bytes(), (&x - &y).to_bytes());
+            // The documented postcondition is the tighter `< 2^53`; `b < 3`
+            // would only require `< 2^54`.
+            proptest::prop_assert!(fast.0.iter().all(|&l| l < (1u64 << 53)));
+        }
+    }
+
+    /// The limb bounds themselves, which a random search reaches only by
+    /// accident: the top of the documented bit excess and the degenerate
+    /// inputs.
+    #[test]
+    fn square_matches_reference_at_limb_bounds() {
         let edge = FieldElement51([(1u64 << 54) - 1; 5]);
         assert_eq!(edge.square().0, reference_pow2k(&edge, 1).0);
         assert_eq!(edge.square2().0, reference_square2(&edge).0);
 
-        // And the degenerate inputs.
         for limbs in [[0u64; 5], [1, 0, 0, 0, 0], [0, 0, 0, 0, 1]] {
             let x = FieldElement51(limbs);
             assert_eq!(x.square().0, reference_pow2k(&x, 1).0);
@@ -1029,81 +1116,11 @@ mod test {
         }
     }
 
-    /// `pow2k(k)` is now a loop over the same factored-out step, so it must
-    /// still agree with the old monolithic loop for every `k`.
+    /// Same, for `mul121666`.
     #[test]
-    fn pow2k_matches_reference_bit_for_bit() {
-        let mut rng = Rng(0xfeed_face_dead_beef);
-
-        for bits in [51u32, 54] {
-            for _ in 0..128 {
-                let x = rng.field_element(bits);
-                for k in 1..=8u32 {
-                    assert_eq!(x.pow2k(k).0, reference_pow2k(&x, k).0);
-                }
-                // The k values actually used on the X25519 inversion path.
-                for k in [10u32, 20, 50, 100] {
-                    assert_eq!(x.pow2k(k).0, reference_pow2k(&x, k).0);
-                }
-            }
-        }
-    }
-
-    /// `k` chained squarings must equal one `pow2k(k)`: this is the property
-    /// that lets the ladder use `square()` and the inversion use `pow2k`.
-    #[test]
-    fn chained_square_matches_pow2k() {
-        let mut rng = Rng(0x0bad_c0de_0bad_c0de);
-
-        for _ in 0..128 {
-            let x = rng.field_element(54);
-            let mut chained = x;
-            for k in 1..=16u32 {
-                chained = chained.square();
-                assert_eq!(chained.0, x.pow2k(k).0);
-            }
-        }
-    }
-
-    /// An independent cross-check that does not go through the reference copy:
-    /// squaring and multiplying a value by itself must give the same field
-    /// element, including at the top of the documented bit excess.
-    #[test]
-    fn square_agrees_with_mul_at_bit_excess_bound() {
-        let mut rng = Rng(0xa5a5_5a5a_a5a5_5a5a);
-
-        for bits in [51u32, 54] {
-            for _ in 0..512 {
-                let x = rng.field_element(bits);
-                assert_eq!(x.square().to_bytes(), (&x * &x).to_bytes());
-
-                let two_x_sq = {
-                    let sq = x.square();
-                    &sq + &sq
-                };
-                assert_eq!(x.square2().to_bytes(), two_x_sq.to_bytes());
-            }
-        }
-    }
-
-    /// `mul121666` must agree with the general multiplication by
-    /// `APLUS2_OVER_FOUR` limb for limb: it is a specialization of exactly that
-    /// product, and the ladder feeds its output straight into the next
-    /// operation's bit-excess accounting.
-    #[test]
-    fn mul121666_matches_general_mul() {
+    fn mul121666_matches_general_mul_at_limb_bounds() {
         use crate::backend::serial::u64::constants::APLUS2_OVER_FOUR;
 
-        let mut rng = Rng(0xc0ff_ee00_c0ff_ee00);
-
-        for bits in [51u32, 52, 53, 54] {
-            for _ in 0..512 {
-                let x = rng.field_element(bits);
-                assert_eq!(x.mul121666().0, (&x * &APLUS2_OVER_FOUR).0);
-            }
-        }
-
-        // Top of the documented bit excess, and the degenerate inputs.
         let edge = FieldElement51([(1u64 << 54) - 1; 5]);
         assert_eq!(edge.mul121666().0, (&edge * &APLUS2_OVER_FOUR).0);
 
@@ -1118,94 +1135,20 @@ mod test {
         }
     }
 
-    /// Independent of the limb comparison above: `mul121666` must equal
-    /// multiplying by 121666 built only out of `add`, which shares no code with
-    /// either `mul121666` or `mul`. This is what catches the two of them being
-    /// wrong in the same way.
+    /// The inputs `sub_unreduced`'s precondition admits that a random search
+    /// will not produce: the underflow edge, the ladder's first iteration —
+    /// whose operands are *not* products, the one case the "both operands are
+    /// mul/square outputs" phrasing does not literally cover — and `x - x`.
     #[test]
-    fn mul121666_is_multiplication_by_121666() {
-        let mut rng = Rng(0x1357_9bdf_1357_9bdf);
-
-        for _ in 0..64 {
-            let x = rng.field_element(51);
-
-            // Double-and-add over the bits of 121666, reducing after every step
-            // so the limbs never leave the documented bit excess. `reduce` is
-            // the same carry chain `add`'s callers rely on.
-            let mut acc = FieldElement51::ZERO;
-            for i in (0..17).rev() {
-                acc = FieldElement51::reduce((&acc + &acc).0);
-                if (121666u32 >> i) & 1 == 1 {
-                    acc = FieldElement51::reduce((&acc + &x).0);
-                }
-            }
-
-            assert_eq!(x.mul121666().to_bytes(), acc.to_bytes());
-        }
-    }
-
-    /// `mul` is unchanged by this refactor, but pin its output down anyway so
-    /// that a future change to the multiplication has a differential test
-    /// waiting for it: `(x + y)^2 == x^2 + 2xy + y^2` exercises `mul` and
-    /// `square` against each other on random inputs.
-    #[test]
-    fn mul_and_square_are_consistent() {
-        let mut rng = Rng(0x5eed_1234_5eed_1234);
-
-        for _ in 0..512 {
-            // Keep the sum inside the documented bit excess: two 53-bit limbs
-            // add to at most 2^54.
-            let x = rng.field_element(53);
-            let y = rng.field_element(53);
-
-            let sum = &x + &y;
-            let lhs = sum.square();
-
-            let xy = &x * &y;
-            let rhs = &(&x.square() + &y.square()) + &(&xy + &xy);
-
-            assert_eq!(lhs.to_bytes(), rhs.to_bytes());
-        }
-    }
-
-    /// `sub_unreduced` is not limb-for-limb equal to `Sub` — it returns a
-    /// different representative of the same field element — so it is checked on
-    /// the two properties the ladder actually depends on: the value is right,
-    /// and the limbs land inside the bit excess the next operation requires.
-    #[test]
-    fn sub_unreduced_agrees_with_sub() {
-        let mut rng = Rng(0x5eed_dead_beef_0051);
-
-        // The precondition is "both operands are `mul`/`square` outputs". Rather
-        // than assume what those look like, produce them: multiply random
-        // elements and subtract the actual results.
-        for _ in 0..1024 {
-            let x = &rng.field_element(51) * &rng.field_element(51);
-            let y = rng.field_element(51).square();
-
-            let fast = x.sub_unreduced(&y);
-
-            // Same field element as the general subtraction.
-            assert_eq!(fast.to_bytes(), (&x - &y).to_bytes());
-
-            // The documented postcondition is the tighter `< 2^53`, which is
-            // what is asserted; `b < 3` only requires `< 2^54`.
-            assert!(fast.0.iter().all(|&l| l < (1u64 << 53)));
-        }
-
-        // The worst case the precondition permits: both operands one below the
-        // smallest limb of 2p. This is the input that would underflow first if
-        // the offset were ever reduced.
+    fn sub_unreduced_edge_cases() {
+        // Both operands one below the smallest limb of 2p: the input that would
+        // underflow first if the offset were ever reduced.
         let hi = FieldElement51([4503599627370457; 5]);
         let lo = FieldElement51([0; 5]);
         assert_eq!(hi.sub_unreduced(&lo).to_bytes(), (&hi - &lo).to_bytes());
         assert_eq!(lo.sub_unreduced(&hi).to_bytes(), (&lo - &hi).to_bytes());
         assert!(hi.sub_unreduced(&lo).0.iter().all(|&l| l < (1u64 << 53)));
 
-        // The ladder's *first* iteration, whose operands are not products:
-        // `x0` is the identity `(1, 0)` and `x1` is `(from_bytes(u), 1)`. This
-        // is the one case the "both operands are mul/square outputs" phrasing
-        // does not literally cover, so it is checked on its own.
         let one = FieldElement51::ONE;
         let zero = FieldElement51::ZERO;
         let u = FieldElement51::from_bytes(&[0xff; 32]);
@@ -1214,7 +1157,6 @@ mod test {
             assert!(a.sub_unreduced(&b).0.iter().all(|&l| l < (1u64 << 53)));
         }
 
-        // Degenerate cases, including x - x == 0.
         for limbs in [[0u64; 5], [1, 0, 0, 0, 0], [0, 0, 0, 0, 1]] {
             let x = FieldElement51(limbs);
             assert_eq!(
