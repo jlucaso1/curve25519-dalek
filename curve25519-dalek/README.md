@@ -321,8 +321,17 @@ is which before reading a profile:
   `MontgomeryPoint::mul_base_clamped`) **does use AVX2**, when the `simd`
   backend is compiled in and the CPU supports it — worth about **24%**. This
   changed recently: the fixed-base ladder used to be serial in every backend
-  too. AVX-512 hosts keep the serial fixed-base ladder, so they see the AVX2
-  gain only if they fall back to the AVX2 backend.
+  too.
+
+  An `avx512` build reaches this as well, and the reason is worth stating
+  because it is not obvious from the backend name: `build.rs` emits
+  `curve25519_dalek_backend="simd"` *alongside* `"avx512"` — "enable SIMD as
+  fallback through stable backend", in its own words — so the runtime check
+  tries AVX-512-IFMA first, then AVX2, then serial. A machine with AVX2 but
+  without AVX-512-IFMA therefore takes the vector fixed-base ladder even in an
+  `avx512` build. A machine that does select the AVX-512 backend keeps the
+  serial one, because `ifma`'s cached-point layout differs and would need its
+  own table.
 
 Dispatch is on a runtime CPU check, so a machine without AVX2 keeps the serial
 path either way; nothing here requires the `-C target-feature` flags above.
