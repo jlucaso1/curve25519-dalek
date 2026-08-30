@@ -12,6 +12,8 @@
 //! Implementations of various multiplication algorithms for the SIMD backends.
 
 #[allow(missing_docs)]
+#[cfg(feature = "precomputed-tables")]
+pub mod fixed_base;
 pub mod variable_base;
 
 #[allow(missing_docs)]

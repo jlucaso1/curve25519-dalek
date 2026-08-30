@@ -94,6 +94,12 @@ pub(crate) mod backend;
 // Generic code for window lookups
 pub(crate) mod window;
 
+// Benchmark-only access to the internal field arithmetic. Not part of the
+// public API: only compiled with `--cfg curve25519_dalek_bench_internals`.
+#[cfg(curve25519_dalek_bench_internals)]
+#[doc(hidden)]
+pub mod bench_internals;
+
 #[cfg(feature = "lizard")]
 mod lizard;
 

@@ -54,16 +54,16 @@ use core::{
     ops::{Mul, MulAssign},
 };
 
-use crate::constants::APLUS2_OVER_FOUR;
 #[cfg(feature = "digest")]
 use crate::constants::{MONTGOMERY_A, MONTGOMERY_A_NEG, SQRT_M1};
-use crate::edwards::{CompressedEdwardsY, EdwardsPoint};
+use crate::edwards::EdwardsPoint;
 use crate::field::FieldElement;
 use crate::scalar::{Scalar, clamp_integer};
 
 use crate::traits::Identity;
 
 use subtle::Choice;
+use subtle::ConditionallyNegatable;
 use subtle::ConditionallySelectable;
 use subtle::ConstantTimeEq;
 
@@ -210,6 +210,49 @@ impl MontgomeryPoint {
         x0.as_affine()
     }
 
+    /// The ladder over a scalar held as little-endian bytes.
+    ///
+    /// Identical in every operation to
+    /// `mul_bits_be(scalar.bits_le().rev().skip(1))` — `bits_le` is defined as
+    /// `bytes[i >> 3] >> (i & 7) & 1` over `0..256`, so reversing and skipping
+    /// one yields exactly `i = 254 ..= 0` — but it indexes the bytes directly
+    /// instead of going through `Rev<Skip<Map<Range>>>`.
+    ///
+    /// That indirection is not free. LLVM cannot prove `i >> 3 < 32` through the
+    /// iterator adaptors, so the ladder carries a **slice bounds check with a
+    /// panic edge on every one of its 255 bits**, plus the `Skip` flag test and
+    /// the `Range` emptiness test. Indexing a fixed-size array with a loop-local
+    /// `i` makes the bound a compile-time fact and all three fold away.
+    fn mul_bits_be_bytes(&self, bytes: &[u8; 32]) -> MontgomeryPoint {
+        // Algorithm 8 of Costello-Smith 2017, as in `mul_bits_be`.
+        let affine_u = FieldElement::from_bytes(&self.0);
+        let mut x0 = ProjectivePoint::identity();
+        let mut x1 = ProjectivePoint {
+            U: affine_u,
+            W: FieldElement::ONE,
+        };
+
+        let mut prev_bit = 0u8;
+        for i in (0..255).rev() {
+            let cur_bit = (bytes[i >> 3] >> (i & 7)) & 1;
+            let choice = prev_bit ^ cur_bit;
+
+            debug_assert!(choice == 0 || choice == 1);
+
+            ProjectivePoint::conditional_swap(&mut x0, &mut x1, choice.into());
+            differential_add_and_double(&mut x0, &mut x1, &affine_u);
+
+            prev_bit = cur_bit;
+        }
+        // `prev_bit` is now bit 0 of the scalar, as in `mul_bits_be`.
+        ProjectivePoint::conditional_swap(&mut x0, &mut x1, Choice::from(prev_bit));
+        // Don't leave the bit on the stack
+        #[cfg(feature = "zeroize")]
+        prev_bit.zeroize();
+
+        x0.as_affine()
+    }
+
     /// View this `MontgomeryPoint` as an array of bytes.
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
@@ -259,12 +302,56 @@ impl MontgomeryPoint {
 
         let one = FieldElement::ONE;
 
-        let y = &(&u - &one) * &(&u + &one).invert();
+        // The Edwards `y` is the ratio `yn/yd`, and decompression only ever
+        // uses `y` through that ratio: it needs `x` with
+        // `x^2 = (y^2 - 1)/(d*y^2 + 1)`, and substituting `y = yn/yd` scales
+        // numerator and denominator alike by `yd^2`:
+        //
+        //     x^2 = (yn^2 - yd^2) / (d*yn^2 + yd^2)
+        //
+        // So the division is unnecessary. Forming `y` explicitly cost a full
+        // Fermat inversion — the same 250-squaring chain `sqrt_ratio_i` is
+        // about to run — plus a `to_bytes`/`from_bytes` round trip, to produce
+        // a value that is immediately taken apart again. Two squarings and
+        // three multiplications replace it, and `EdwardsPoint` is projective,
+        // so `yn` and `yd` can be its `Y` and `Z` directly.
+        //
+        // `d*yn^2 + yd^2` is never zero: it would need `(yn/yd)^2 = -1/d`, and
+        // `-1/d` is a nonsquare (`-1` is square mod p, `d` is not). `yd = 0`
+        // means `u = -1`, rejected above.
+        let yn = &u - &one;
+        let yd = &u + &one;
+        let yn2 = yn.square();
+        let yd2 = yd.square();
 
-        let mut y_bytes = y.to_bytes();
-        y_bytes[31] ^= sign << 7;
+        let (is_valid_y_coord, mut X) = FieldElement::sqrt_ratio_i(
+            &(&yn2 - &yd2),
+            &(&(&yn2 * &crate::constants::EDWARDS_D) + &yd2),
+        );
 
-        CompressedEdwardsY(y_bytes).decompress()
+        if !bool::from(is_valid_y_coord) {
+            return None;
+        }
+
+        // `sqrt_ratio_i` returns the nonnegative root, so apply the caller's
+        // sign — the same thing `decompress` does with bit 255 of the encoding,
+        // which is where this `sign` was being smuggled through.
+        // `sign & 1`, not `sign`: this is a public entry point, and the
+        // previous implementation reached the sign through `y_bytes[31] ^=
+        // sign << 7`, where the shift discards every bit but the lowest. So a
+        // caller passing 2 got the same answer as 0. `Choice::from` requires
+        // 0 or 1 — it debug-asserts, and in release a value of 2 would make
+        // `conditional_negate` compute a mask of `-2` and return a wrong
+        // point — so the mask has to be explicit rather than assumed.
+        X.conditional_negate(Choice::from(sign & 1));
+
+        // (x, yn/yd) in projective coordinates, with T satisfying T*Z = X*Y.
+        Some(EdwardsPoint {
+            X: &X * &yd,
+            Y: yn,
+            Z: yd,
+            T: &X * &yn,
+        })
     }
 }
 
@@ -397,6 +484,25 @@ impl ConditionallySelectable for ProjectivePoint {
             W: FieldElement::conditional_select(&a.W, &b.W, choice),
         }
     }
+
+    /// The ladder conditionally swaps its two working points once per bit, so
+    /// this runs 256 times per scalar multiplication.
+    ///
+    /// Every field backend implements `conditional_swap` as a masked exchange
+    /// of the limbs. Without this override, `ProjectivePoint` would inherit
+    /// `subtle`'s default, which copies `a` and then performs two
+    /// `conditional_assign`s — twice the per-limb work, plus the copy.
+    fn conditional_swap(a: &mut ProjectivePoint, b: &mut ProjectivePoint, choice: Choice) {
+        FieldElement::conditional_swap(&mut a.U, &mut b.U, choice);
+        FieldElement::conditional_swap(&mut a.W, &mut b.W, choice);
+    }
+
+    /// Likewise: forward to the field element's own implementation instead of
+    /// going through `conditional_select` and a whole-struct assignment.
+    fn conditional_assign(&mut self, other: &ProjectivePoint, choice: Choice) {
+        self.U.conditional_assign(&other.U, choice);
+        self.W.conditional_assign(&other.W, choice);
+    }
 }
 
 impl ProjectivePoint {
@@ -433,25 +539,25 @@ fn differential_add_and_double(
     affine_PmQ: &FieldElement,
 ) {
     let t0 = &P.U + &P.W;
-    let t1 = &P.U - &P.W;
+    let t1 = P.U.sub_unreduced(&P.W);
     let t2 = &Q.U + &Q.W;
-    let t3 = &Q.U - &Q.W;
+    let t3 = Q.U.sub_unreduced(&Q.W);
 
     let t4 = t0.square();   // (U_P + W_P)^2 = U_P^2 + 2 U_P W_P + W_P^2
     let t5 = t1.square();   // (U_P - W_P)^2 = U_P^2 - 2 U_P W_P + W_P^2
 
-    let t6 = &t4 - &t5;     // 4 U_P W_P
+    let t6 = t4.sub_unreduced(&t5); // 4 U_P W_P
 
     let t7 = &t0 * &t3;     // (U_P + W_P) (U_Q - W_Q) = U_P U_Q + W_P U_Q - U_P W_Q - W_P W_Q
     let t8 = &t1 * &t2;     // (U_P - W_P) (U_Q + W_Q) = U_P U_Q - W_P U_Q + U_P W_Q - W_P W_Q
 
     let t9  = &t7 + &t8;    // 2 (U_P U_Q - W_P W_Q)
-    let t10 = &t7 - &t8;    // 2 (W_P U_Q - U_P W_Q)
+    let t10 = t7.sub_unreduced(&t8); // 2 (W_P U_Q - U_P W_Q)
 
     let t11 =  t9.square(); // 4 (U_P U_Q - W_P W_Q)^2
     let t12 = t10.square(); // 4 (W_P U_Q - U_P W_Q)^2
 
-    let t13 = &APLUS2_OVER_FOUR * &t6; // (A + 2) U_P U_Q
+    let t13 = t6.mul121666();          // (A + 2) U_P W_P
 
     let t14 = &t4 * &t5;    // ((U_P + W_P)(U_P - W_P))^2 = (U_P^2 - W_P^2)^2
     let t15 = &t13 + &t5;   // (U_P - W_P)^2 + (A + 2) U_P W_P
@@ -488,7 +594,7 @@ impl Mul<&Scalar> for &MontgomeryPoint {
     fn mul(self, scalar: &Scalar) -> MontgomeryPoint {
         // We multiply by the integer representation of the given Scalar. By scalar invariant #1,
         // the MSB is 0, so we can skip it.
-        self.mul_bits_be(scalar.bits_le().rev().skip(1))
+        self.mul_bits_be_bytes(scalar.as_bytes())
     }
 }
 
@@ -512,6 +618,90 @@ impl Mul<&MontgomeryPoint> for &Scalar {
 
 #[cfg(test)]
 mod test {
+
+    /// The pre-change `to_edwards`, kept verbatim so the rewrite is checked
+    /// against the code it replaced rather than against a re-derivation.
+    fn reference_to_edwards(m: &MontgomeryPoint, sign: u8) -> Option<EdwardsPoint> {
+        let u = FieldElement::from_bytes(&m.0);
+        if u == FieldElement::MINUS_ONE {
+            return None;
+        }
+        let one = FieldElement::ONE;
+        let y = &(&u - &one) * &(&u + &one).invert();
+        let mut y_bytes = y.to_bytes();
+        y_bytes[31] ^= sign << 7;
+        crate::edwards::CompressedEdwardsY(y_bytes).decompress()
+    }
+
+    /// `to_edwards` no longer forms `y` explicitly, so it is congruent by
+    /// construction rather than by inspection. Compared on canonical bytes,
+    /// including the on-twist inputs that must still return `None`, over both
+    /// signs — the sign is the part the rewrite moves from bit 255 of an
+    /// encoding to an explicit `conditional_negate`.
+    #[test]
+    fn to_edwards_matches_reference() {
+        let mut n_some = 0u32;
+        let mut n_none = 0u32;
+        for i in 0..256u32 {
+            let mut bytes = [0u8; 32];
+            bytes[0..4].copy_from_slice(&i.to_le_bytes());
+            let m = MontgomeryPoint(bytes);
+            for sign in 0..2u8 {
+                match (m.to_edwards(sign), reference_to_edwards(&m, sign)) {
+                    (Some(a), Some(b)) => {
+                        assert_eq!(a.compress(), b.compress(), "u = {i}, sign = {sign}");
+                        n_some += 1;
+                    }
+                    (None, None) => n_none += 1,
+                    (a, b) => panic!(
+                        "disagree on validity: u = {i}, sign = {sign}, {} vs {}",
+                        a.is_some(),
+                        b.is_some()
+                    ),
+                }
+            }
+        }
+        // Both outcomes must actually occur, or the test proves nothing.
+        assert!(
+            n_some > 0 && n_none > 0,
+            "{n_some} valid, {n_none} rejected"
+        );
+    }
+
+    /// `sign` is a `u8` on a public entry point and only its low bit is
+    /// meaningful — the previous implementation reached it through a `<< 7`,
+    /// which discards the rest. A caller passing 2 must still get what 0 gives,
+    /// not a debug panic or a wrongly negated point.
+    #[test]
+    fn to_edwards_uses_only_the_low_bit_of_sign() {
+        let m = EdwardsPoint::mul_base(&Scalar::from_bytes_mod_order([3u8; 32])).to_montgomery();
+        let zero = m.to_edwards(0).unwrap().compress();
+        let one = m.to_edwards(1).unwrap().compress();
+        assert_ne!(
+            zero, one,
+            "the two signs must differ, or this proves nothing"
+        );
+        for s in [2u8, 4, 0x80, 0xfe] {
+            assert_eq!(m.to_edwards(s).unwrap().compress(), zero, "sign = {s}");
+        }
+        for s in [3u8, 5, 0x81, 0xff] {
+            assert_eq!(m.to_edwards(s).unwrap().compress(), one, "sign = {s}");
+        }
+    }
+
+    /// Round trip through the real basepoint-derived points, which is what the
+    /// XEdDSA path actually feeds it.
+    #[test]
+    fn to_edwards_round_trips_real_points() {
+        let mut s = Scalar::ONE;
+        for _ in 0..32 {
+            let ed = EdwardsPoint::mul_base(&s);
+            let mont = ed.to_montgomery();
+            let sign = ed.compress().as_bytes()[31] >> 7;
+            assert_eq!(mont.to_edwards(sign).unwrap().compress(), ed.compress());
+            s += Scalar::ONE;
+        }
+    }
     use super::*;
     use crate::constants;
     use getrandom::{
@@ -613,6 +803,32 @@ mod test {
 
     /// Given a bytestring that's little-endian at the byte level, return an iterator over all the
     /// bits, in little-endian order.
+    /// The byte-indexed ladder must agree with the iterator-driven one it
+    /// replaced, for every scalar — not just for clamped ones.
+    ///
+    /// This is the equivalence the refactor rests on, and asserting it here is
+    /// also what keeps `Scalar::bits_le` in use: the ladder was its only caller,
+    /// so the two spellings are now checked against each other rather than one
+    /// of them being deleted.
+    #[test]
+    fn mul_bits_be_bytes_matches_iterator() {
+        let mut bytes = [0u8; 32];
+        for case in 0..64u32 {
+            // A spread of shapes: small, dense, sparse, and with low bits set,
+            // which the clamped path never produces.
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = (case.wrapping_mul(0x9E37_79B9) >> (i % 24)) as u8 ^ (i as u8);
+            }
+            bytes[31] &= 0x7f; // scalar invariant #1: below 2^255
+            let s = Scalar { bytes };
+
+            let p = MontgomeryPoint::mul_base_clamped([case as u8; 32]);
+            let want = p.mul_bits_be(s.bits_le().rev().skip(1));
+            let got = p.mul_bits_be_bytes(s.as_bytes());
+            assert_eq!(want, got, "ladders disagree for case {case}");
+        }
+    }
+
     fn bytestring_bits_le(x: &[u8]) -> impl DoubleEndedIterator<Item = bool> + Clone + '_ {
         let bitlen = x.len() * 8;
         (0..bitlen).map(|i| {

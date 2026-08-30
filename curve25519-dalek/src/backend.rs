@@ -255,6 +255,29 @@ where
     }
 }
 
+/// Perform constant-time fixed-base scalar multiplication against the Ed25519
+/// basepoint.
+///
+/// The AVX2 arm runs the ladder over the vector point types (§13.12); every
+/// other arm uses the serial radix-16 table, including `avx512`, whose
+/// `CachedPoint` has a different limb layout and so would need a second
+/// generated constant.
+#[cfg(feature = "precomputed-tables")]
+pub fn mul_base(scalar: &Scalar) -> EdwardsPoint {
+    match get_selected_backend() {
+        #[cfg(curve25519_dalek_backend = "simd")]
+        BackendKind::Avx2 => vector::scalar_mul::fixed_base::spec_avx2::mul_base(scalar),
+        // `mul_base_serial`, not the `Mul` operator: the operator goes through
+        // `BasepointTable::mul_base`, which recognises this very table and
+        // hands it back here. That is an unbounded recursion on exactly the
+        // configuration this arm exists to serve — a `simd` build running on a
+        // CPU without AVX2.
+        #[cfg(curve25519_dalek_backend = "avx512")]
+        BackendKind::Avx512 => crate::constants::ED25519_BASEPOINT_TABLE.mul_base_serial(scalar),
+        BackendKind::Serial => crate::constants::ED25519_BASEPOINT_TABLE.mul_base_serial(scalar),
+    }
+}
+
 /// Perform constant-time, variable-base scalar multiplication.
 pub fn variable_base_mul(point: &EdwardsPoint, scalar: &Scalar) -> EdwardsPoint {
     match get_selected_backend() {

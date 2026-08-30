@@ -873,6 +873,13 @@ impl Scalar {
     }
 
     /// Get the bits of the scalar, in little-endian order
+    ///
+    /// The Montgomery ladder was this method's only caller and now indexes the
+    /// scalar's bytes directly (`montgomery.rs::mul_bits_be_bytes`), because
+    /// the iterator adaptors cost a bounds check per ladder bit. The two are
+    /// asserted equivalent in `montgomery::test::mul_bits_be_bytes_matches_iterator`,
+    /// which is what still uses this.
+    #[cfg(test)]
     pub(crate) fn bits_le(&self) -> impl DoubleEndedIterator<Item = bool> + '_ {
         (0..256).map(|i| {
             // As i runs from 0..256, the bottom 3 bits index the bit, while the upper bits index

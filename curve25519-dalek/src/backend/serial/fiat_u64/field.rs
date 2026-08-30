@@ -168,6 +168,22 @@ impl ConditionallySelectable for FieldElement51 {
 }
 
 impl FieldElement51 {
+    /// `self |= mask & other`, limb by limb.
+    ///
+    /// `mask` must be all-ones or all-zeros. Used by the constant-time window
+    /// scan in `window.rs`, which OR-accumulates masked table entries into a
+    /// zeroed accumulator rather than conditionally assigning into a live one.
+    #[cfg(feature = "precomputed-tables")]
+    #[inline(always)]
+    pub(crate) fn or_masked_assign(&mut self, other: &Self, mask: u64) {
+        let m = mask;
+        self.0.0[0] |= m & other.0.0[0];
+        self.0.0[1] |= m & other.0.0[1];
+        self.0.0[2] |= m & other.0.0[2];
+        self.0.0[3] |= m & other.0.0[3];
+        self.0.0[4] |= m & other.0.0[4];
+    }
+
     pub(crate) const fn from_limbs(limbs: [u64; 5]) -> FieldElement51 {
         FieldElement51(fiat_25519_tight_field_element(limbs))
     }
@@ -244,6 +260,31 @@ impl FieldElement51 {
         fiat_25519_relax(&mut self_loose, &self.0);
         let mut output = FieldElement51::ZERO;
         fiat_25519_carry_square(&mut output.0, &self_loose);
+        output
+    }
+
+    /// Compute `self - rhs`, matching `FieldElement51::sub_unreduced`'s
+    /// signature so `montgomery.rs` can stay backend-agnostic.
+    ///
+    /// This backend's arithmetic is fiat-crypto's verified output, so there is
+    /// nothing to hand-optimize here: it forwards to the ordinary subtraction.
+    /// The narrower precondition is therefore not required of callers on this
+    /// backend, and imposing it would be misleading.
+    pub(crate) fn sub_unreduced(&self, rhs: &FieldElement51) -> FieldElement51 {
+        self - rhs
+    }
+
+    /// Multiply this field element by \\((A+2)/4 = 121666\\), the constant the
+    /// Montgomery ladder needs once per step.
+    ///
+    /// fiat-crypto generates a dedicated, formally verified routine for exactly
+    /// this constant, so the ladder does not have to pay for a general
+    /// multiplication whose second operand is `[121666, 0, ...]`.
+    pub fn mul121666(&self) -> FieldElement51 {
+        let mut self_loose = fiat_25519_loose_field_element([0; 5]);
+        fiat_25519_relax(&mut self_loose, &self.0);
+        let mut output = FieldElement51::ZERO;
+        fiat_25519_carry_scmul_121666(&mut output.0, &self_loose);
         output
     }
 

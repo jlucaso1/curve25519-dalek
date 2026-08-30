@@ -234,14 +234,22 @@ impl FieldElement {
     ///
     /// When an input `FieldElement` is zero, its value is unchanged.
     ///
+    /// `pub(crate)` rather than private so that callers with a compile-time
+    /// known batch size can supply a fixed-size array as scratch and stay
+    /// `no_std`-friendly; `invert_batch_alloc` above is the `alloc` version.
+    ///
     /// # Panics
     /// Panics when `scratch.len() != inputs.len()`
-    fn internal_invert_batch(inputs: &mut [FieldElement], scratch: &mut [FieldElement]) {
+    pub(crate) fn internal_invert_batch(inputs: &mut [FieldElement], scratch: &mut [FieldElement]) {
         // Montgomery’s Trick and Fast Implementation of Masked AES
         // Genelle, Prouff and Quisquater
         // Section 3.2
 
-        debug_assert_eq!(inputs.len(), scratch.len());
+        // Not `debug_assert_eq!`: the doc comment promises a panic, and in
+        // release the `zip`s below would silently process only the shorter
+        // slice and leave the remaining inputs un-inverted. One length compare
+        // against an n-element batch is not a cost worth that.
+        assert_eq!(inputs.len(), scratch.len());
 
         // Keep an accumulator of all of the previous products
         let mut acc = FieldElement::ONE;

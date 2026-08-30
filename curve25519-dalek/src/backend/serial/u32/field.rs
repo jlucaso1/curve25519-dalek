@@ -284,6 +284,27 @@ impl ConditionallySelectable for FieldElement2625 {
 }
 
 impl FieldElement2625 {
+    /// `self |= mask & other`, limb by limb.
+    ///
+    /// `mask` must be all-ones or all-zeros. Used by the constant-time window
+    /// scan in `window.rs`, which OR-accumulates masked table entries into a
+    /// zeroed accumulator rather than conditionally assigning into a live one.
+    #[cfg(feature = "precomputed-tables")]
+    #[inline(always)]
+    pub(crate) fn or_masked_assign(&mut self, other: &Self, mask: u64) {
+        let m = mask as u32;
+        self.0[0] |= m & other.0[0];
+        self.0[1] |= m & other.0[1];
+        self.0[2] |= m & other.0[2];
+        self.0[3] |= m & other.0[3];
+        self.0[4] |= m & other.0[4];
+        self.0[5] |= m & other.0[5];
+        self.0[6] |= m & other.0[6];
+        self.0[7] |= m & other.0[7];
+        self.0[8] |= m & other.0[8];
+        self.0[9] |= m & other.0[9];
+    }
+
     pub(crate) const fn from_limbs(limbs: [u32; 10]) -> FieldElement2625 {
         FieldElement2625(limbs)
     }
@@ -596,6 +617,104 @@ impl FieldElement2625 {
         FieldElement2625::reduce(self.square_inner())
     }
 
+    /// Compute `self - rhs` without the trailing reduction.
+    ///
+    /// # Preconditions
+    ///
+    /// Every limb of `rhs` must be at most the corresponding limb of `2p`, so
+    /// the offset subtraction cannot underflow, and every limb of `self` must
+    /// be a `reduce` output — below `2^26.007` for even limbs and `2^25.007`
+    /// for odd ones. Both hold for the outputs of `mul`, `square` and
+    /// `mul121666`, which is all the Montgomery ladder feeds this.
+    ///
+    /// # Postcondition
+    ///
+    /// Each limb is below `2^26.007 + 2^27 = 3.005 * 2^26` (even) and
+    /// `2^25.007 + 2^26 = 3.005 * 2^25` (odd), i.e. bit excess `b = 1.5875`.
+    ///
+    /// # Why this is tight, and why it is checked rather than argued
+    ///
+    /// `Mul` precomputes `19 * y[i]` in a **`u32`** (see the comment at its
+    /// definition: it fits iff `26 + b + lg(19) < 32`, i.e. `b < 1.752`). At
+    /// `b = 1.5875` this passes **by 0.167 bits — about 12%** — where the
+    /// 64-bit backend has a factor of two.
+    ///
+    /// A margin that thin was previously judged not worth taking, because the
+    /// failure mode is not a panic but a silent `u32` wraparound producing a
+    /// wrong field element inside a constant-time primitive. The margin has not
+    /// changed; what has is that the bound is now **asserted** rather than
+    /// argued — `debug_assert!` checks the binding constraint itself, that
+    /// `19 * limb` still fits a `u32`, on every limb of every result. Any future
+    /// change that widens an input past what this can absorb fails loudly in
+    /// debug and test builds instead of silently returning the wrong answer.
+    pub(crate) fn sub_unreduced(&self, rhs: &FieldElement2625) -> FieldElement2625 {
+        // 2p, limb by limb.
+        const TWO_P: [u32; 10] = [
+            0x3ffffed << 1,
+            0x1ffffff << 1,
+            0x3ffffff << 1,
+            0x1ffffff << 1,
+            0x3ffffff << 1,
+            0x1ffffff << 1,
+            0x3ffffff << 1,
+            0x1ffffff << 1,
+            0x3ffffff << 1,
+            0x1ffffff << 1,
+        ];
+
+        let mut out = [0u32; 10];
+        for i in 0..10 {
+            debug_assert!(
+                rhs.0[i] <= TWO_P[i],
+                "sub_unreduced: rhs limb {i} exceeds 2p, subtraction would underflow",
+            );
+            out[i] = (self.0[i] + TWO_P[i]) - rhs.0[i];
+            // The binding constraint, checked directly rather than via `b`:
+            // `Mul` computes `19 * limb` in a `u32`.
+            debug_assert!(
+                out[i] <= u32::MAX / 19,
+                "sub_unreduced: limb {i} would overflow `19 * limb` in a u32",
+            );
+        }
+        FieldElement2625(out)
+    }
+
+    /// Multiply this field element by \\((A+2)/4 = 121666\\), the constant the
+    /// Montgomery ladder needs once per step.
+    ///
+    /// `&x * &constants::APLUS2_OVER_FOUR` gives the same answer, but that
+    /// constant is `[121666, 0, ..., 0]`, so all but ten of the hundred partial
+    /// products in the general multiplication are multiplications by zero. The
+    /// compiler cannot fold them away because `mul` is not inlined into the
+    /// ladder.
+    ///
+    /// Only the ten surviving products are computed here, and the shared
+    /// `reduce` handles the carry chain, so the result is bit-for-bit identical
+    /// to the general multiplication.
+    pub fn mul121666(&self) -> FieldElement2625 {
+        /// \\((A+2)/4\\), the only value this is ever called with.
+        const APLUS2_OVER_FOUR: u64 = 121666;
+
+        let x: &[u32; 10] = &self.0;
+
+        // x[i] < 2^(26 + b), and 121666 < 2^17, so each product is below
+        // 2^(43 + b): far inside the u64 that `reduce` carries from. Limb 0 of
+        // the constant is even-indexed, so none of the radix-2^25.5 doubling
+        // factors that apply to odd-by-odd products come into play.
+        FieldElement2625::reduce([
+            (x[0] as u64) * APLUS2_OVER_FOUR,
+            (x[1] as u64) * APLUS2_OVER_FOUR,
+            (x[2] as u64) * APLUS2_OVER_FOUR,
+            (x[3] as u64) * APLUS2_OVER_FOUR,
+            (x[4] as u64) * APLUS2_OVER_FOUR,
+            (x[5] as u64) * APLUS2_OVER_FOUR,
+            (x[6] as u64) * APLUS2_OVER_FOUR,
+            (x[7] as u64) * APLUS2_OVER_FOUR,
+            (x[8] as u64) * APLUS2_OVER_FOUR,
+            (x[9] as u64) * APLUS2_OVER_FOUR,
+        ])
+    }
+
     /// Compute `2*self^2`.
     pub fn square2(&self) -> FieldElement2625 {
         let mut coeffs = self.square_inner();
@@ -603,5 +722,131 @@ impl FieldElement2625 {
             *coeff += *coeff;
         }
         FieldElement2625::reduce(coeffs)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A field element whose limbs carry `excess` bits above the radix-2^25.5
+    /// widths. `mul` documents a precondition of `b < 1.75`, so `excess == 1`
+    /// stays inside the supported range.
+    fn fe(excess: u32) -> impl Strategy<Value = FieldElement2625> {
+        proptest::array::uniform10(any::<u32>()).prop_map(move |mut limbs| {
+            for (i, limb) in limbs.iter_mut().enumerate() {
+                let width = if i % 2 == 0 { 26 } else { 25 } + excess;
+                *limb &= (1u32 << width) - 1;
+            }
+            FieldElement2625(limbs)
+        })
+    }
+
+    /// Either bit excess the `mul` precondition admits.
+    fn fe_in_range() -> impl Strategy<Value = FieldElement2625> {
+        (0u32..=1).prop_flat_map(fe)
+    }
+
+    proptest! {
+        /// `mul121666` must agree with the general multiplication by
+        /// `APLUS2_OVER_FOUR` limb for limb: it is a specialization of exactly
+        /// that product, and the ladder feeds its output straight into the next
+        /// operation's bit-excess accounting.
+        #[test]
+        fn mul121666_matches_general_mul(x in fe_in_range()) {
+            use crate::backend::serial::u32::constants::APLUS2_OVER_FOUR;
+            prop_assert_eq!(x.mul121666().0, (&x * &APLUS2_OVER_FOUR).0);
+        }
+
+        /// Independent of the limb comparison above: `mul121666` must equal
+        /// multiplying by 121666 built only out of `add`, which shares no code
+        /// with either `mul121666` or `mul`.
+        #[test]
+        fn mul121666_is_multiplication_by_121666(x in fe(0)) {
+            // Double-and-add over the bits of 121666, reducing after every
+            // step so the limbs never leave the range `mul` documents: `add`
+            // itself does not carry.
+            let mut acc = FieldElement2625::ZERO;
+            for i in (0..17).rev() {
+                acc = FieldElement2625::reduce((&acc + &acc).0.map(u64::from));
+                if (121666u32 >> i) & 1 == 1 {
+                    acc = FieldElement2625::reduce((&acc + &x).0.map(u64::from));
+                }
+            }
+            prop_assert_eq!(x.mul121666().to_bytes(), acc.to_bytes());
+        }
+
+        /// `sub_unreduced` must be the same field element as the general
+        /// subtraction, and must leave every limb inside what `Mul`'s
+        /// `19 * y[i]` can hold in a `u32`.
+        ///
+        /// The precondition is "both operands are `mul`/`square` outputs", so
+        /// the inputs are produced that way rather than assumed to have that
+        /// shape.
+        #[test]
+        fn sub_unreduced_agrees_with_sub(a in fe(0), b in fe(0), c in fe(0)) {
+            let x = &a * &b;
+            let y = c.square();
+
+            let fast = x.sub_unreduced(&y);
+
+            prop_assert_eq!(fast.to_bytes(), (&x - &y).to_bytes());
+            prop_assert!(
+                fast.0.iter().all(|&l| l <= u32::MAX / 19),
+                "a limb would overflow `19 * limb` in a u32",
+            );
+        }
+    }
+
+    /// The limb bounds themselves, which a random search reaches only by
+    /// accident: the top of the range each limb may hold, and the degenerate
+    /// inputs.
+    #[test]
+    fn mul121666_matches_general_mul_at_limb_bounds() {
+        use crate::backend::serial::u32::constants::APLUS2_OVER_FOUR;
+
+        let mut edge = [0u32; 10];
+        for (i, limb) in edge.iter_mut().enumerate() {
+            *limb = if i % 2 == 0 {
+                (1u32 << 27) - 1
+            } else {
+                (1u32 << 26) - 1
+            };
+        }
+        let edge = FieldElement2625(edge);
+        assert_eq!(edge.mul121666().0, (&edge * &APLUS2_OVER_FOUR).0);
+
+        for limbs in [[0u32; 10], [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]] {
+            let x = FieldElement2625(limbs);
+            assert_eq!(x.mul121666().0, (&x * &APLUS2_OVER_FOUR).0);
+        }
+    }
+
+    /// The worst case `sub_unreduced`'s precondition admits: `self` at the top
+    /// of what `reduce` can return and `rhs` at zero, which maximises every
+    /// output limb. This is the input that decides whether the 0.167 bits of
+    /// margin are real, and no random search will find it.
+    #[test]
+    fn sub_unreduced_worst_permitted_input() {
+        // Even limbs `2^26.007`, odd `2^25.007`.
+        let hi = FieldElement2625([
+            67435296, 33717648, 67435296, 33717648, 67435296, 33717648, 67435296, 33717648,
+            67435296, 33717648,
+        ]);
+        let lo = FieldElement2625::ZERO;
+        let worst = hi.sub_unreduced(&lo);
+        assert_eq!(worst.to_bytes(), (&hi - &lo).to_bytes());
+        assert!(
+            worst.0.iter().all(|&l| l <= u32::MAX / 19),
+            "the worst permitted input overflows `19 * limb`",
+        );
+        // And the margin is what the doc comment claims: about 12%.
+        let peak = *worst.0.iter().max().unwrap() as u64;
+        assert!(
+            peak * 19 * 100 / (u32::MAX as u64) >= 85 && peak * 19 <= u32::MAX as u64,
+            "margin moved: 19 * peak is {} of u32::MAX",
+            peak * 19 * 100 / (u32::MAX as u64),
+        );
     }
 }

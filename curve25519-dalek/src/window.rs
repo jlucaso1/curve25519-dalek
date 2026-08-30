@@ -27,6 +27,7 @@ use crate::traits::Identity;
 use crate::backend::serial::curve_models::AffineNielsPoint;
 use crate::backend::serial::curve_models::ProjectiveNielsPoint;
 use crate::edwards::EdwardsPoint;
+use crate::field::FieldElement;
 
 #[cfg(feature = "zeroize")]
 use zeroize::Zeroize;
@@ -76,6 +77,77 @@ macro_rules! impl_lookup_table {
             }
         }
 
+        // Only the basepoint tables, which are `precomputed-tables`-gated, hold
+        // `AffineNielsPoint`s and call this.
+        #[cfg(feature = "precomputed-tables")]
+        impl $name<AffineNielsPoint> {
+            /// `select`, specialised for the type every basepoint table holds.
+            ///
+            /// The generic version keeps a live accumulator and conditionally
+            /// assigns into it once per entry, which is a read-modify-write per
+            /// limb (`t ^= mask & (t ^ v)`, three operations) carrying a
+            /// dependency through `t` across the whole scan. This version
+            /// OR-accumulates into a zeroed accumulator instead
+            /// (`acc |= mask & v`, two operations), so each limb is an
+            /// independent chain, and computes the comparison mask once per
+            /// entry as a plain `u64` rather than going through `Choice` for
+            /// every limb.
+            ///
+            /// Constant time: straight line, no branch and no data-dependent
+            /// index. Exactly one of the masks is all-ones — including the
+            /// `xabs == 0` case, which selects the identity — so the OR is a
+            /// selection, not a merge.
+            pub(crate) fn select_or(&self, x: i8) -> AffineNielsPoint {
+                debug_assert!(x >= $neg);
+                debug_assert!(x as i16 <= $size as i16);
+
+                let xmask = x as i16 >> 7;
+                let xabs = (x as i16 + xmask) ^ xmask;
+
+                // Cross `subtle`'s optimisation barrier for every entry *first*,
+                // while the accumulator is not yet live. `Choice::from` is
+                // `#[inline(never)]` around a volatile read, so each crossing is
+                // a real call, and any caller-saved register live across it has
+                // to be spilled. Interleaving the crossings with the
+                // accumulation, as the generic `select` does, means spilling the
+                // whole running point once per entry.
+                let mut masks = [0u64; $size + 1];
+                for j in 0..=$size {
+                    let c = (xabs as u16).ct_eq(&(j as u16));
+                    masks[j] = (c.unwrap_u8() as u64).wrapping_neg();
+                }
+
+                // Now accumulate with no barrier in the way: `acc |= mask & v`,
+                // one independent chain per limb, against the generic version's
+                // read-modify-write `t ^= mask & (t ^ v)`.
+                let mut acc = AffineNielsPoint {
+                    y_plus_x: FieldElement::ZERO,
+                    y_minus_x: FieldElement::ZERO,
+                    xy2d: FieldElement::ZERO,
+                };
+
+                // `masks[0]` selects the identity, which the generic version
+                // gets by initialising the accumulator to it.
+                let identity = AffineNielsPoint::identity();
+                acc.y_plus_x.or_masked_assign(&identity.y_plus_x, masks[0]);
+                acc.y_minus_x
+                    .or_masked_assign(&identity.y_minus_x, masks[0]);
+                acc.xy2d.or_masked_assign(&identity.xy2d, masks[0]);
+
+                for j in $range {
+                    let m = masks[j];
+                    let e = &self.0[j - 1];
+                    acc.y_plus_x.or_masked_assign(&e.y_plus_x, m);
+                    acc.y_minus_x.or_masked_assign(&e.y_minus_x, m);
+                    acc.xy2d.or_masked_assign(&e.xy2d, m);
+                }
+
+                let neg_mask = Choice::from((xmask & 1) as u8);
+                acc.conditional_negate(neg_mask);
+                acc
+            }
+        }
+
         impl<T: Copy + Default> Default for $name<T> {
             fn default() -> $name<T> {
                 $name([T::default(); $size])
@@ -106,10 +178,41 @@ macro_rules! impl_lookup_table {
 
         impl<'a> From<&'a EdwardsPoint> for $name<AffineNielsPoint> {
             fn from(P: &'a EdwardsPoint) -> Self {
-                let mut points = [P.as_affine_niels(); $size];
-                // XXX batch inversion would be good if perf mattered here
+                // Affine conversion needs `1/Z`, and the obvious loop — convert,
+                // add, convert, add — pays one full field inversion per entry.
+                // At radix 16 that is eight inversions per table and 256 per
+                // `EdwardsBasepointTable::create`, which measures as 91% of the
+                // cost of building one.
+                //
+                // The multiples do not actually depend on each other's *affine*
+                // form, only on their value, so the chain can be run in extended
+                // coordinates, where no inversion is needed, and the conversions
+                // done together at the end. Montgomery's trick then costs one
+                // inversion and 3(n-1) multiplications for the whole table.
+                //
+                // The batch is a fixed-size array rather than a `Vec` so this
+                // stays available without `alloc`.
+                let mut ext = [*P; $size];
                 for j in $conv_range {
-                    points[j + 1] = (P + &points[j]).as_extended().as_affine_niels()
+                    ext[j + 1] = (P + &ext[j].as_projective_niels()).as_extended();
+                }
+
+                let mut zs = [FieldElement::ONE; $size];
+                for (z, point) in zs.iter_mut().zip(ext.iter()) {
+                    *z = point.Z;
+                }
+                let mut scratch = [FieldElement::ONE; $size];
+                FieldElement::internal_invert_batch(&mut zs, &mut scratch);
+
+                let mut points = [AffineNielsPoint::identity(); $size];
+                for (out, (point, z_inv)) in points.iter_mut().zip(ext.iter().zip(zs.iter())) {
+                    let x = &point.X * z_inv;
+                    let y = &point.Y * z_inv;
+                    *out = AffineNielsPoint {
+                        y_plus_x: &y + &x,
+                        y_minus_x: &y - &x,
+                        xy2d: &(&x * &y) * &crate::constants::EDWARDS_D2,
+                    };
                 }
                 $name(points)
             }
@@ -272,5 +375,117 @@ impl<'a> From<&'a EdwardsPoint> for NafLookupTable8<AffineNielsPoint> {
         }
         // Now Ai = [A, 3A, 5A, 7A, 9A, 11A, 13A, 15A, ..., 127A]
         NafLookupTable8(Ai)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::scalar::Scalar;
+
+    /// `select_or` must agree with the generic `select` on every input in the
+    /// documented range, for every table radix a basepoint table uses. It is a
+    /// different formulation of the same selection, so agreement is exact.
+    // `select_or` exists only when the basepoint tables that call it do.
+    #[cfg(feature = "precomputed-tables")]
+    #[test]
+    fn select_or_matches_select() {
+        use crate::constants::ED25519_BASEPOINT_POINT;
+        let P = ED25519_BASEPOINT_POINT;
+
+        let table: LookupTable<AffineNielsPoint> = LookupTable::from(&P);
+        for x in -8i8..=8 {
+            let want = table.select(x);
+            let got = table.select_or(x);
+            assert_eq!(
+                want.y_plus_x.to_bytes(),
+                got.y_plus_x.to_bytes(),
+                "y+x at x={x}"
+            );
+            assert_eq!(
+                want.y_minus_x.to_bytes(),
+                got.y_minus_x.to_bytes(),
+                "y-x at x={x}"
+            );
+            assert_eq!(want.xy2d.to_bytes(), got.xy2d.to_bytes(), "xy2d at x={x}");
+        }
+    }
+
+    /// The pre-batch construction, kept verbatim so the batched one is checked
+    /// against the code it replaced rather than against a re-derivation.
+    fn reference_lookup_table(P: &EdwardsPoint) -> [AffineNielsPoint; 8] {
+        let mut points = [P.as_affine_niels(); 8];
+        for j in 0..7 {
+            points[j + 1] = (P + &points[j]).as_extended().as_affine_niels()
+        }
+        points
+    }
+
+    /// Montgomery's trick returns a different *representative* of each inverse
+    /// than `invert` does — both are weakly reduced, and weak reduction is not
+    /// unique — so the comparison is on canonical bytes, not on limbs. That is
+    /// the strongest statement available here, and it is the one the table's
+    /// users depend on.
+    #[test]
+    fn batched_lookup_table_matches_reference() {
+        let mut s = Scalar::ONE;
+        for _ in 0..32 {
+            let p = EdwardsPoint::mul_base(&s);
+            let reference = reference_lookup_table(&p);
+            let batched = LookupTable::<AffineNielsPoint>::from(&p).0;
+
+            for (i, (r, b)) in reference.iter().zip(batched.iter()).enumerate() {
+                assert_eq!(
+                    r.y_plus_x.to_bytes(),
+                    b.y_plus_x.to_bytes(),
+                    "y_plus_x[{i}]"
+                );
+                assert_eq!(
+                    r.y_minus_x.to_bytes(),
+                    b.y_minus_x.to_bytes(),
+                    "y_minus_x[{i}]"
+                );
+                assert_eq!(r.xy2d.to_bytes(), b.xy2d.to_bytes(), "xy2d[{i}]");
+            }
+            s += Scalar::ONE;
+        }
+    }
+
+    /// The identity is the one input whose `Z` the batch could plausibly mishandle
+    /// (`internal_invert_batch` special-cases zeros), and a table built from it
+    /// must still select the identity for every digit.
+    #[test]
+    fn batched_lookup_table_handles_identity() {
+        use crate::traits::Identity;
+
+        let id = EdwardsPoint::identity();
+        let reference = reference_lookup_table(&id);
+        let batched = LookupTable::<AffineNielsPoint>::from(&id).0;
+        for (r, b) in reference.iter().zip(batched.iter()) {
+            assert_eq!(r.y_plus_x.to_bytes(), b.y_plus_x.to_bytes());
+            assert_eq!(r.y_minus_x.to_bytes(), b.y_minus_x.to_bytes());
+            assert_eq!(r.xy2d.to_bytes(), b.xy2d.to_bytes());
+        }
+    }
+
+    /// End to end: a table built the new way must multiply exactly as the
+    /// crate's own precomputed table does.
+    #[test]
+    #[cfg(feature = "precomputed-tables")]
+    fn created_table_agrees_with_precomputed() {
+        use crate::traits::BasepointTable;
+
+        use crate::constants;
+
+        let created =
+            crate::edwards::EdwardsBasepointTable::create(&constants::ED25519_BASEPOINT_POINT);
+        let mut s = Scalar::from(1u64);
+        for _ in 0..16 {
+            assert_eq!(
+                created.mul_base(&s).compress(),
+                constants::ED25519_BASEPOINT_TABLE.mul_base(&s).compress(),
+            );
+            s += Scalar::from(7919u64);
+        }
     }
 }

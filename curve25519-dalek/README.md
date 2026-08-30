@@ -255,6 +255,114 @@ cargo +nightly bench --features "rand_core"
 Performance is a secondary goal behind correctness, safety, and
 clarity, but we aim to be competitive with other implementations.
 
+## Build settings for X25519-heavy workloads
+
+If your workload is dominated by X25519 — a Diffie-Hellman per message, say —
+two build settings are worth more than anything the source can do for you, and
+neither requires a code change:
+
+```toml
+# Cargo.toml
+[profile.release]
+lto = "fat"
+```
+
+```sh
+# and, on x86_64:
+RUSTFLAGS='-C target-feature=+avx2,+bmi2'
+```
+
+The two halves of that flag do different jobs: `+bmi2` lets LLVM emit `mulx` in
+the field multiplication, which is what moves the Montgomery ladder, while
+`+avx2` vectorizes the constant-time table lookup, which is what moves key
+generation — it halves the instruction count of that lookup. Neither substitutes
+for the other.
+
+`+adx` is deliberately **not** in that list. It is the flag people reach for
+first, but LLVM emits zero `adcx`/`adox` here with or without it — the 5x51
+unsaturated limbs give each output limb a single carry, so there is no second
+carry chain for ADX to interleave. Measured, the two flag sets produce an
+identical instruction mix (882 `mulx`, 0 `adcx`, 0 `adox` either way) and
+indistinguishable times. Since ADX arrived a generation after AVX2/BMI2 —
+Broadwell rather than Haswell on Intel, Zen rather than Excavator on AMD —
+including it costs you CPUs and buys nothing.
+
+**These flags raise the binary's CPU requirement.** Every `-C target-feature`
+here lets the compiler emit instructions unconditionally, with no runtime check:
+a binary built with `+avx2,+bmi2` needs a CPU that has both — Haswell (2013) or
+later on Intel, Excavator (2015) or later on AMD — and will fault with an
+illegal instruction on anything older. `-C target-cpu=native` is the sharper
+version of the same hazard, since it targets whatever machine happened to run
+the build, which for a redistributed artifact is rarely the machine that runs
+it; it also pulls in `+adx`, which as noted above buys nothing here.
+
+This is unlike the crate's own AVX2/AVX-512 backends, which detect the feature
+at runtime and fall back, and so need no promise about the deployment target.
+Use these flags when you control where the binary runs; otherwise keep
+`lto = "fat"`, which costs nothing in portability.
+
+Measured on an Intel Cascade Lake, `MontgomeryPoint::mul_clamped` goes from
+49.3 µs on a stock `cargo build --release` to 37.2 µs with both — **about a
+quarter faster** — and `mul_base_clamped` gains a further 6% on top. LTO is the
+larger half: the Montgomery ladder's squaring is worth inlining into the ladder
+step, and only fat LTO chooses to do it. The `+bmi2` half is what lets LLVM emit
+`mulx` instead of `mulq`; without it the baseline `x86-64` target has no BMI2
+and the field multiplication pays for it.
+
+The two halves of X25519 are served differently, and it is worth knowing which
+is which before reading a profile:
+
+* **Diffie-Hellman** (`x25519`, `MontgomeryPoint::mul_clamped`) is **serial in
+  every backend.** No branch of the `cfg_if!` in `src/field.rs` resolves
+  `FieldElement` to a vector type, so the Montgomery ladder cannot reach AVX2 or
+  AVX-512 by construction. A binary with the vector backend compiled in that
+  spends its DH time in `backend::serial` is behaving as expected.
+* **Key generation** (`EdwardsPoint::mul_base`, and so
+  `MontgomeryPoint::mul_base_clamped`) **does use AVX2**, when the `simd`
+  backend is compiled in and the CPU supports it — worth about **24%**. This
+  changed recently: the fixed-base ladder used to be serial in every backend
+  too.
+
+  An `avx512` build reaches this as well, and the reason is worth stating
+  because it is not obvious from the backend name: `build.rs` emits
+  `curve25519_dalek_backend="simd"` *alongside* `"avx512"` — "enable SIMD as
+  fallback through stable backend", in its own words — so the runtime check
+  tries AVX-512-IFMA first, then AVX2, then serial. A machine with AVX2 but
+  without AVX-512-IFMA therefore takes the vector fixed-base ladder even in an
+  `avx512` build. A machine that does select the AVX-512 backend keeps the
+  serial one, because `ifma`'s cached-point layout differs and would need its
+  own table.
+
+Dispatch is on a runtime CPU check, so a machine without AVX2 keeps the serial
+path either way; nothing here requires the `-C target-feature` flags above.
+
+**`+avx2` is also a binary-size win, which is worth knowing if you are counting
+bytes.** The AVX2 fixed-base ladder ships a 40 960-byte basepoint table, and the
+serial ladder ships a 30 720-byte one. In a runtime-dispatched build both are
+linked, because either may run. Under `-C target-feature=+avx2` the CPU check
+const-folds, the serial arm becomes dead code, and **the serial table is
+dropped entirely** — verified with `nm` on a release binary, which contains the
+vector table and no `ED25519_BASEPOINT_TABLE`. The net cost of the vector
+ladder is then about **+10 KB, not +40 KB**. That trade is only available if you
+are willing to require AVX2 of the machines you ship to.
+
+On **wasm32**, the equivalent free win is `simd128`, which is stable but not
+enabled by default:
+
+```sh
+RUSTFLAGS='-C target-feature=+simd128'
+```
+
+That is worth about 4.6% on `mul_clamped` and 15.7% on `mul_base_clamped`, and
+it makes the module smaller. Note that the field arithmetic itself does not
+vectorize — the entire gain is in the constant-time table lookups and
+conditional swaps, which is why key generation benefits most. `simd128` has
+shipped in Chrome 91, Firefox 89, Safari 16.4 and Node 16.
+
+`docs/perf-x25519-field-arithmetic.md` has the full measurements, the
+reproduction instructions, and the analysis behind these numbers, including
+wasm32.
+
 # FFI
 
 Unfortunately, we have no plans to add FFI to `curve25519-dalek` directly.  The

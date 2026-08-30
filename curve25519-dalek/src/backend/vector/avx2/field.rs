@@ -599,6 +599,7 @@ impl FieldElement2625x4 {
     ///
     /// The coefficients of the result are bounded with \\( b < 0.007 \\).
     #[rustfmt::skip] // keep alignment of z* calculations
+    #[inline]
     pub fn square_and_negate_D(&self) -> FieldElement2625x4 {
         #[inline(always)]
         fn m(x: u32x8, y: u32x8) -> u64x4 {
@@ -684,6 +685,241 @@ impl FieldElement2625x4 {
 
         FieldElement2625x4::reduce64([z0, z1, z2, z3, z4, z5, z6, z7, z8, z9])
     }
+
+    /// Multiply `self` by `rhs`, tagged with a distinct `N` per call site.
+    ///
+    /// `N` is deliberately unused. It exists so that each caller instantiates
+    /// its own copy of this function: without it LLVM shares one outlined body
+    /// across the three multiplies in `ExtendedPoint::double` and
+    /// `Add<&CachedPoint>`, and the shared copy cannot specialise on the
+    /// operand shapes each site actually has. Giving each site its own
+    /// instantiation is worth **-3.29% of the instructions** in a full
+    /// signature verification, for +784 bytes of `.text` (§10.5).
+    ///
+    /// This is a compiler-behaviour workaround, not an algorithmic one, so it
+    /// is load-bearing only for performance: `mul_tagged::<0>` through
+    /// `mul_tagged::<3>` all compute the same function, and the `Mul` operator
+    /// below is the untagged spelling. If a future LLVM stops sharing the body
+    /// the tags become inert rather than wrong.
+    ///
+    /// # Preconditions
+    ///
+    /// The coefficients of `self` must be bounded with \\( b < 2.5 \\).
+    ///
+    /// The coefficients of `rhs` must be bounded with \\( b < 1.75 \\).
+    ///
+    /// # Postconditions
+    ///
+    /// The coefficients of the result are bounded with \\( b < 0.007 \\).
+    #[rustfmt::skip] // keep alignment of z* calculations
+    #[inline]
+    pub fn mul_tagged<const N: u8>(&self, rhs: &FieldElement2625x4) -> FieldElement2625x4 {
+
+        #[inline(always)]
+        fn m(x: u32x8, y: u32x8) -> u64x4 {
+            x.mul32(y)
+        }
+
+        #[inline(always)]
+        fn m_lo(x: u32x8, y: u32x8) -> u32x8 {
+            x.mul32(y).into()
+        }
+
+        let (x0, x1) = unpack_pair(self.0[0]);
+        let (x2, x3) = unpack_pair(self.0[1]);
+        let (x4, x5) = unpack_pair(self.0[2]);
+        let (x6, x7) = unpack_pair(self.0[3]);
+        let (x8, x9) = unpack_pair(self.0[4]);
+
+        // Emitted **column-major over `rhs`**: column `j` contributes exactly one
+        // product to each of the ten accumulators, so `y_j` and `y_j_19` are born
+        // and die inside their column and only `rhs.0[j/2]` is unpacked when the
+        // column needs it. The row-major form needs all ten `y_j`, all nine
+        // `y_j_19`, all ten `x_i` and all five `x_odd_2` live at once — about 44
+        // values against 16 YMM registers, and the shipped code spent roughly a
+        // quarter of its instructions spilling and reloading them. Column-major
+        // peaks at about 27 live values, and the `x_i`, being invariant across
+        // all ten columns, fold into `vpmuludq mem, ymm, ymm` instead.
+        //
+        // These are the same 100 partial products in a different order. `u64`
+        // wrapping addition is associative and commutative, so the result is
+        // **bit-identical** to the row-major form for every input, including
+        // inputs outside the documented bounds; `mul_matches_row_major` checks
+        // that against a verbatim copy of the old code.
+        let v19 = u32x8::new(19, 0, 19, 0, 19, 0, 19, 0);
+
+        let x1_2 = x1 + x1; // This fits in a u32 iff 25 + b + 1 < 32
+        let x3_2 = x3 + x3; //                    iff b < 6
+        let x5_2 = x5 + x5;
+        let x7_2 = x7 + x7;
+        let x9_2 = x9 + x9;
+
+        let (y0, y1) = unpack_pair(rhs.0[0]);
+        let mut z0 = m(x0, y0);
+        let mut z1 = m(x1, y0);
+        let mut z2 = m(x2, y0);
+        let mut z3 = m(x3, y0);
+        let mut z4 = m(x4, y0);
+        let mut z5 = m(x5, y0);
+        let mut z6 = m(x6, y0);
+        let mut z7 = m(x7, y0);
+        let mut z8 = m(x8, y0);
+        let mut z9 = m(x9, y0);
+
+        // Each `y_j_19` fits in a u32 iff 26 + b + lg(19) < 32, i.e. b < 1.752,
+        // which is the documented precondition on `rhs`.
+        let y1_19 = m_lo(v19, y1);
+        z0 += m(x9_2, y1_19);
+        z1 += m(x0, y1);
+        z2 += m(x1_2, y1);
+        z3 += m(x2, y1);
+        z4 += m(x3_2, y1);
+        z5 += m(x4, y1);
+        z6 += m(x5_2, y1);
+        z7 += m(x6, y1);
+        z8 += m(x7_2, y1);
+        z9 += m(x8, y1);
+
+        let (y2, y3) = unpack_pair(rhs.0[1]);
+        let y2_19 = m_lo(v19, y2);
+        z0 += m(x8, y2_19);
+        z1 += m(x9, y2_19);
+        z2 += m(x0, y2);
+        z3 += m(x1, y2);
+        z4 += m(x2, y2);
+        z5 += m(x3, y2);
+        z6 += m(x4, y2);
+        z7 += m(x5, y2);
+        z8 += m(x6, y2);
+        z9 += m(x7, y2);
+
+        let y3_19 = m_lo(v19, y3);
+        z0 += m(x7_2, y3_19);
+        z1 += m(x8, y3_19);
+        z2 += m(x9_2, y3_19);
+        z3 += m(x0, y3);
+        z4 += m(x1_2, y3);
+        z5 += m(x2, y3);
+        z6 += m(x3_2, y3);
+        z7 += m(x4, y3);
+        z8 += m(x5_2, y3);
+        z9 += m(x6, y3);
+
+        let (y4, y5) = unpack_pair(rhs.0[2]);
+        let y4_19 = m_lo(v19, y4);
+        z0 += m(x6, y4_19);
+        z1 += m(x7, y4_19);
+        z2 += m(x8, y4_19);
+        z3 += m(x9, y4_19);
+        z4 += m(x0, y4);
+        z5 += m(x1, y4);
+        z6 += m(x2, y4);
+        z7 += m(x3, y4);
+        z8 += m(x4, y4);
+        z9 += m(x5, y4);
+
+        let y5_19 = m_lo(v19, y5);
+        z0 += m(x5_2, y5_19);
+        z1 += m(x6, y5_19);
+        z2 += m(x7_2, y5_19);
+        z3 += m(x8, y5_19);
+        z4 += m(x9_2, y5_19);
+        z5 += m(x0, y5);
+        z6 += m(x1_2, y5);
+        z7 += m(x2, y5);
+        z8 += m(x3_2, y5);
+        z9 += m(x4, y5);
+
+        let (y6, y7) = unpack_pair(rhs.0[3]);
+        let y6_19 = m_lo(v19, y6);
+        z0 += m(x4, y6_19);
+        z1 += m(x5, y6_19);
+        z2 += m(x6, y6_19);
+        z3 += m(x7, y6_19);
+        z4 += m(x8, y6_19);
+        z5 += m(x9, y6_19);
+        z6 += m(x0, y6);
+        z7 += m(x1, y6);
+        z8 += m(x2, y6);
+        z9 += m(x3, y6);
+
+        let y7_19 = m_lo(v19, y7);
+        z0 += m(x3_2, y7_19);
+        z1 += m(x4, y7_19);
+        z2 += m(x5_2, y7_19);
+        z3 += m(x6, y7_19);
+        z4 += m(x7_2, y7_19);
+        z5 += m(x8, y7_19);
+        z6 += m(x9_2, y7_19);
+        z7 += m(x0, y7);
+        z8 += m(x1_2, y7);
+        z9 += m(x2, y7);
+
+        let (y8, y9) = unpack_pair(rhs.0[4]);
+        let y8_19 = m_lo(v19, y8);
+        z0 += m(x2, y8_19);
+        z1 += m(x3, y8_19);
+        z2 += m(x4, y8_19);
+        z3 += m(x5, y8_19);
+        z4 += m(x6, y8_19);
+        z5 += m(x7, y8_19);
+        z6 += m(x8, y8_19);
+        z7 += m(x9, y8_19);
+        z8 += m(x0, y8);
+        z9 += m(x1, y8);
+
+        let y9_19 = m_lo(v19, y9);
+        z0 += m(x1_2, y9_19);
+        z1 += m(x2, y9_19);
+        z2 += m(x3_2, y9_19);
+        z3 += m(x4, y9_19);
+        z4 += m(x5_2, y9_19);
+        z5 += m(x6, y9_19);
+        z6 += m(x7_2, y9_19);
+        z7 += m(x8, y9_19);
+        z8 += m(x9_2, y9_19);
+        z9 += m(x0, y9);
+
+        // The bounds on z[i] are the same as in the serial 32-bit code
+        // and the comment below is copied from there:
+
+        // How big is the contribution to z[i+j] from x[i], y[j]?
+        //
+        // Using the bounds above, we get:
+        //
+        // i even, j even:   x[i]*y[j] <   2^(26+b)*2^(26+b) = 2*2^(51+2*b)
+        // i  odd, j even:   x[i]*y[j] <   2^(25+b)*2^(26+b) = 1*2^(51+2*b)
+        // i even, j  odd:   x[i]*y[j] <   2^(26+b)*2^(25+b) = 1*2^(51+2*b)
+        // i  odd, j  odd: 2*x[i]*y[j] < 2*2^(25+b)*2^(25+b) = 1*2^(51+2*b)
+        //
+        // We perform inline reduction mod p by replacing 2^255 by 19
+        // (since 2^255 - 19 = 0 mod p).  This adds a factor of 19, so
+        // we get the bounds (z0 is the biggest one, but calculated for
+        // posterity here in case finer estimation is needed later):
+        //
+        //  z0 < ( 2 + 1*19 + 2*19 + 1*19 + 2*19 + 1*19 + 2*19 + 1*19 + 2*19 + 1*19 )*2^(51 + 2b) = 249*2^(51 + 2*b)
+        //  z1 < ( 1 +  1   + 1*19 + 1*19 + 1*19 + 1*19 + 1*19 + 1*19 + 1*19 + 1*19 )*2^(51 + 2b) = 154*2^(51 + 2*b)
+        //  z2 < ( 2 +  1   +  2   + 1*19 + 2*19 + 1*19 + 2*19 + 1*19 + 2*19 + 1*19 )*2^(51 + 2b) = 195*2^(51 + 2*b)
+        //  z3 < ( 1 +  1   +  1   +  1   + 1*19 + 1*19 + 1*19 + 1*19 + 1*19 + 1*19 )*2^(51 + 2b) = 118*2^(51 + 2*b)
+        //  z4 < ( 2 +  1   +  2   +  1   +  2   + 1*19 + 2*19 + 1*19 + 2*19 + 1*19 )*2^(51 + 2b) = 141*2^(51 + 2*b)
+        //  z5 < ( 1 +  1   +  1   +  1   +  1   +  1   + 1*19 + 1*19 + 1*19 + 1*19 )*2^(51 + 2b) =  82*2^(51 + 2*b)
+        //  z6 < ( 2 +  1   +  2   +  1   +  2   +  1   +  2   + 1*19 + 2*19 + 1*19 )*2^(51 + 2b) =  87*2^(51 + 2*b)
+        //  z7 < ( 1 +  1   +  1   +  1   +  1   +  1   +  1   +  1   + 1*19 + 1*19 )*2^(51 + 2b) =  46*2^(51 + 2*b)
+        //  z8 < ( 2 +  1   +  2   +  1   +  2   +  1   +  2   +  1   +  2   + 1*19 )*2^(51 + 2b) =  33*2^(51 + 2*b)
+        //  z9 < ( 1 +  1   +  1   +  1   +  1   +  1   +  1   +  1   +  1   +  1   )*2^(51 + 2b) =  10*2^(51 + 2*b)
+        //
+        // So z[0] fits into a u64 if 51 + 2*b + lg(249) < 64
+        //                         if b < 2.5.
+
+        // In fact this bound is slightly sloppy, since it treats both
+        // inputs x and y as being bounded by the same parameter b,
+        // while they are in fact bounded by b_x and b_y, and we
+        // already require that b_y < 1.75 in order to fit the
+        // multiplications by 19 into a u32.  The tighter bound on b_y
+        // means we could get a tighter bound on the outputs, or a
+        // looser bound on b_x.
+        FieldElement2625x4::reduce64([z0, z1, z2, z3, z4, z5, z6, z7, z8, z9])
+    }
 }
 
 #[unsafe_target_feature("avx2")]
@@ -767,36 +1003,37 @@ impl Mul<(u32, u32, u32, u32)> for FieldElement2625x4 {
 #[unsafe_target_feature("avx2")]
 impl Mul<&FieldElement2625x4> for &FieldElement2625x4 {
     type Output = FieldElement2625x4;
-    /// Multiply `self` by `rhs`.
-    ///
-    /// # Preconditions
-    ///
-    /// The coefficients of `self` must be bounded with \\( b < 2.5 \\).
-    ///
-    /// The coefficients of `rhs` must be bounded with \\( b < 1.75 \\).
-    ///
-    /// # Postconditions
-    ///
-    /// The coefficients of the result are bounded with \\( b < 0.007 \\).
-    ///
-    #[rustfmt::skip] // keep alignment of z* calculations
+    /// Multiply `self` by `rhs`. The untagged spelling of `mul_tagged`, which
+    /// carries the preconditions and postconditions this shares.
     #[inline]
     fn mul(self, rhs: &FieldElement2625x4) -> FieldElement2625x4 {
-        #[inline(always)]
-        fn m(x: u32x8, y: u32x8) -> u64x4 {
-            x.mul32(y)
-        }
+        self.mul_tagged::<0>(rhs)
+    }
+}
 
-        #[inline(always)]
-        fn m_lo(x: u32x8, y: u32x8) -> u32x8 {
-            x.mul32(y).into()
-        }
+#[cfg(target_feature = "avx2")]
+#[cfg(test)]
+mod test {
+    use super::*;
 
-        let (x0, x1) = unpack_pair(self.0[0]);
-        let (x2, x3) = unpack_pair(self.0[1]);
-        let (x4, x5) = unpack_pair(self.0[2]);
-        let (x6, x7) = unpack_pair(self.0[3]);
-        let (x8, x9) = unpack_pair(self.0[4]);
+    /// The row-major multiply this file used before the column-major rewrite,
+    /// kept verbatim so the rewrite can be checked against it rather than
+    /// against a description of it.
+    #[rustfmt::skip]
+    fn reference_row_major_mul(
+        lhs: &FieldElement2625x4,
+        rhs: &FieldElement2625x4,
+    ) -> FieldElement2625x4 {
+        #[inline(always)]
+        fn m(x: u32x8, y: u32x8) -> u64x4 { x.mul32(y) }
+        #[inline(always)]
+        fn m_lo(x: u32x8, y: u32x8) -> u32x8 { x.mul32(y).into() }
+
+        let (x0, x1) = unpack_pair(lhs.0[0]);
+        let (x2, x3) = unpack_pair(lhs.0[1]);
+        let (x4, x5) = unpack_pair(lhs.0[2]);
+        let (x6, x7) = unpack_pair(lhs.0[3]);
+        let (x8, x9) = unpack_pair(lhs.0[4]);
 
         let (y0, y1) = unpack_pair(rhs.0[0]);
         let (y2, y3) = unpack_pair(rhs.0[1]);
@@ -806,9 +1043,9 @@ impl Mul<&FieldElement2625x4> for &FieldElement2625x4 {
 
         let v19 = u32x8::new(19, 0, 19, 0, 19, 0, 19, 0);
 
-        let y1_19 = m_lo(v19, y1); // This fits in a u32
-        let y2_19 = m_lo(v19, y2); // iff 26 + b + lg(19) < 32
-        let y3_19 = m_lo(v19, y3); // if  b < 32 - 26 - 4.248 = 1.752
+        let y1_19 = m_lo(v19, y1);
+        let y2_19 = m_lo(v19, y2);
+        let y3_19 = m_lo(v19, y3);
         let y4_19 = m_lo(v19, y4);
         let y5_19 = m_lo(v19, y5);
         let y6_19 = m_lo(v19, y6);
@@ -816,8 +1053,8 @@ impl Mul<&FieldElement2625x4> for &FieldElement2625x4 {
         let y8_19 = m_lo(v19, y8);
         let y9_19 = m_lo(v19, y9);
 
-        let x1_2 = x1 + x1; // This fits in a u32 iff 25 + b + 1 < 32
-        let x3_2 = x3 + x3; //                    iff b < 6
+        let x1_2 = x1 + x1;
+        let x3_2 = x3 + x3;
         let x5_2 = x5 + x5;
         let x7_2 = x7 + x7;
         let x9_2 = x9 + x9;
@@ -833,52 +1070,57 @@ impl Mul<&FieldElement2625x4> for &FieldElement2625x4 {
         let z8 = m(x0, y8) + m(x1_2,    y7) + m(x2,    y6) + m(x3_2,    y5) + m(x4,    y4) + m(x5_2,    y3) + m(x6,    y2) + m(x7_2,    y1) + m(x8,    y0) + m(x9_2, y9_19);
         let z9 = m(x0, y9) + m(x1,      y8) + m(x2,    y7) + m(x3,      y6) + m(x4,    y5) + m(x5,      y4) + m(x6,    y3) + m(x7,      y2) + m(x8,    y1) + m(x9,      y0);
 
-        // The bounds on z[i] are the same as in the serial 32-bit code
-        // and the comment below is copied from there:
-
-        // How big is the contribution to z[i+j] from x[i], y[j]?
-        //
-        // Using the bounds above, we get:
-        //
-        // i even, j even:   x[i]*y[j] <   2^(26+b)*2^(26+b) = 2*2^(51+2*b)
-        // i  odd, j even:   x[i]*y[j] <   2^(25+b)*2^(26+b) = 1*2^(51+2*b)
-        // i even, j  odd:   x[i]*y[j] <   2^(26+b)*2^(25+b) = 1*2^(51+2*b)
-        // i  odd, j  odd: 2*x[i]*y[j] < 2*2^(25+b)*2^(25+b) = 1*2^(51+2*b)
-        //
-        // We perform inline reduction mod p by replacing 2^255 by 19
-        // (since 2^255 - 19 = 0 mod p).  This adds a factor of 19, so
-        // we get the bounds (z0 is the biggest one, but calculated for
-        // posterity here in case finer estimation is needed later):
-        //
-        //  z0 < ( 2 + 1*19 + 2*19 + 1*19 + 2*19 + 1*19 + 2*19 + 1*19 + 2*19 + 1*19 )*2^(51 + 2b) = 249*2^(51 + 2*b)
-        //  z1 < ( 1 +  1   + 1*19 + 1*19 + 1*19 + 1*19 + 1*19 + 1*19 + 1*19 + 1*19 )*2^(51 + 2b) = 154*2^(51 + 2*b)
-        //  z2 < ( 2 +  1   +  2   + 1*19 + 2*19 + 1*19 + 2*19 + 1*19 + 2*19 + 1*19 )*2^(51 + 2b) = 195*2^(51 + 2*b)
-        //  z3 < ( 1 +  1   +  1   +  1   + 1*19 + 1*19 + 1*19 + 1*19 + 1*19 + 1*19 )*2^(51 + 2b) = 118*2^(51 + 2*b)
-        //  z4 < ( 2 +  1   +  2   +  1   +  2   + 1*19 + 2*19 + 1*19 + 2*19 + 1*19 )*2^(51 + 2b) = 141*2^(51 + 2*b)
-        //  z5 < ( 1 +  1   +  1   +  1   +  1   +  1   + 1*19 + 1*19 + 1*19 + 1*19 )*2^(51 + 2b) =  82*2^(51 + 2*b)
-        //  z6 < ( 2 +  1   +  2   +  1   +  2   +  1   +  2   + 1*19 + 2*19 + 1*19 )*2^(51 + 2b) =  87*2^(51 + 2*b)
-        //  z7 < ( 1 +  1   +  1   +  1   +  1   +  1   +  1   +  1   + 1*19 + 1*19 )*2^(51 + 2b) =  46*2^(51 + 2*b)
-        //  z8 < ( 2 +  1   +  2   +  1   +  2   +  1   +  2   +  1   +  2   + 1*19 )*2^(51 + 2b) =  33*2^(51 + 2*b)
-        //  z9 < ( 1 +  1   +  1   +  1   +  1   +  1   +  1   +  1   +  1   +  1   )*2^(51 + 2b) =  10*2^(51 + 2*b)
-        //
-        // So z[0] fits into a u64 if 51 + 2*b + lg(249) < 64
-        //                         if b < 2.5.
-
-        // In fact this bound is slightly sloppy, since it treats both
-        // inputs x and y as being bounded by the same parameter b,
-        // while they are in fact bounded by b_x and b_y, and we
-        // already require that b_y < 1.75 in order to fit the
-        // multiplications by 19 into a u32.  The tighter bound on b_y
-        // means we could get a tighter bound on the outputs, or a
-        // looser bound on b_x.
         FieldElement2625x4::reduce64([z0, z1, z2, z3, z4, z5, z6, z7, z8, z9])
     }
-}
 
-#[cfg(target_feature = "avx2")]
-#[cfg(test)]
-mod test {
-    use super::*;
+    /// The column-major rewrite sums the same 100 partial products in a
+    /// different order. `u64` addition wraps, so it is associative and
+    /// commutative, and the two must therefore agree **limb for limb** on every
+    /// input — not merely as field elements, and not merely on inputs that
+    /// respect the documented bounds. That is the strongest statement available
+    /// here, so it is the one asserted.
+    proptest::proptest! {
+        #[test]
+        fn mul_matches_row_major(
+            al in proptest::array::uniform5(proptest::array::uniform8(proptest::num::u32::ANY)),
+            bl in proptest::array::uniform5(proptest::array::uniform8(proptest::num::u32::ANY)),
+        ) {
+            // Inputs are built directly in the packed representation, at the
+            // top of the documented ranges (b < 2.5 for lhs, b < 1.75 for rhs),
+            // so the carry behaviour is exercised and not just small values.
+            let mk = |raw: [[u32; 8]; 5], bits: u32| {
+                let mask = (1u32 << bits) - 1;
+                let mut limbs = [u32x8::splat(0); 5];
+                for (i, limb) in limbs.iter_mut().enumerate() {
+                    let l = raw[i];
+                    *limb = u32x8::new(
+                        l[0] & mask, l[1] & mask, l[2] & mask, l[3] & mask,
+                        l[4] & mask, l[5] & mask, l[6] & mask, l[7] & mask,
+                    );
+                }
+                FieldElement2625x4(limbs)
+            };
+            let a = mk(al, 28);
+            let b = mk(bl, 27);
+
+            let got = &a * &b;
+            let want = reference_row_major_mul(&a, &b);
+
+            // Compare the packed representation lane by lane: this asserts
+            // limb equality, which is strictly stronger than field equality.
+            for i in 0..5 {
+                let (g, w) = (got.0[i], want.0[i]);
+                proptest::prop_assert_eq!(g.extract::<0>(), w.extract::<0>(), "limb {} lane 0", i);
+                proptest::prop_assert_eq!(g.extract::<1>(), w.extract::<1>(), "limb {} lane 1", i);
+                proptest::prop_assert_eq!(g.extract::<2>(), w.extract::<2>(), "limb {} lane 2", i);
+                proptest::prop_assert_eq!(g.extract::<3>(), w.extract::<3>(), "limb {} lane 3", i);
+                proptest::prop_assert_eq!(g.extract::<4>(), w.extract::<4>(), "limb {} lane 4", i);
+                proptest::prop_assert_eq!(g.extract::<5>(), w.extract::<5>(), "limb {} lane 5", i);
+                proptest::prop_assert_eq!(g.extract::<6>(), w.extract::<6>(), "limb {} lane 6", i);
+                proptest::prop_assert_eq!(g.extract::<7>(), w.extract::<7>(), "limb {} lane 7", i);
+            }
+        }
+    }
 
     #[test]
     fn scale_by_curve_constants() {

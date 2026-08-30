@@ -191,12 +191,51 @@ impl<'a> Mul<&'a FieldElement51> for &FieldElement51 {
         let b3_19 = b[3] * 19;
         let b4_19 = b[4] * 19;
 
-        // Multiply to get 128-bit coefficients of output
-        let     c0: u128 = m(a[0], b[0]) + m(a[4], b1_19) + m(a[3], b2_19) + m(a[2], b3_19) + m(a[1], b4_19);
-        let mut c1: u128 = m(a[1], b[0]) + m(a[0],  b[1]) + m(a[4], b2_19) + m(a[3], b3_19) + m(a[2], b4_19);
-        let mut c2: u128 = m(a[2], b[0]) + m(a[1],  b[1]) + m(a[0],  b[2]) + m(a[4], b3_19) + m(a[3], b4_19);
-        let mut c3: u128 = m(a[3], b[0]) + m(a[2],  b[1]) + m(a[1],  b[2]) + m(a[0],  b[3]) + m(a[4], b4_19);
-        let mut c4: u128 = m(a[4], b[0]) + m(a[3],  b[1]) + m(a[2],  b[2]) + m(a[1],  b[3]) + m(a[0] , b[4]);
+        // Multiply to get 128-bit coefficients of output.
+        //
+        // Emitted by **operand scanning**: grouped by the `a` limb rather than
+        // by the output coefficient. These are the same 25 partial products
+        // summed into the same five accumulators — `u128` addition is
+        // associative and cannot overflow here, since each coefficient stays
+        // under 2^108.27 as the comment below derives — but the issue order
+        // decides how many of them have to be in flight at once.
+        //
+        // Grouping by output coefficient asks for all 25 products before any
+        // accumulator can retire. `mul` on x86-64 without BMI2 writes
+        // `rdx:rax`, so the register allocator runs out and spills: the shipped
+        // form was 234 instructions with 89 touching `%rsp`. Streaming one
+        // `a[i]` across five long-lived accumulators instead gives 212 and 45.
+        let mut c0: u128 = m(a[0], b[0]);
+        let mut c1: u128 = m(a[0], b[1]);
+        let mut c2: u128 = m(a[0], b[2]);
+        let mut c3: u128 = m(a[0], b[3]);
+        let mut c4: u128 = m(a[0], b[4]);
+
+        c0 += m(a[1], b4_19);
+        c1 += m(a[1], b[0]);
+        c2 += m(a[1], b[1]);
+        c3 += m(a[1], b[2]);
+        c4 += m(a[1], b[3]);
+
+        c0 += m(a[2], b3_19);
+        c1 += m(a[2], b4_19);
+        c2 += m(a[2], b[0]);
+        c3 += m(a[2], b[1]);
+        c4 += m(a[2], b[2]);
+
+        c0 += m(a[3], b2_19);
+        c1 += m(a[3], b3_19);
+        c2 += m(a[3], b4_19);
+        c3 += m(a[3], b[0]);
+        c4 += m(a[3], b[1]);
+
+        c0 += m(a[4], b1_19);
+        c1 += m(a[4], b2_19);
+        c2 += m(a[4], b3_19);
+        c3 += m(a[4], b4_19);
+        c4 += m(a[4], b[0]);
+
+        let c0 = c0;
 
         // How big are the c[i]? We have
         //
@@ -314,6 +353,21 @@ impl ConditionallySelectable for FieldElement51 {
 }
 
 impl FieldElement51 {
+    /// `self |= mask & other`, limb by limb.
+    ///
+    /// `mask` must be all-ones or all-zeros. Used by the constant-time window
+    /// scan, which OR-accumulates masked table entries into a zeroed
+    /// accumulator instead of conditionally assigning into a live one.
+    #[cfg(feature = "precomputed-tables")]
+    #[inline(always)]
+    pub(crate) fn or_masked_assign(&mut self, other: &FieldElement51, mask: u64) {
+        self.0[0] |= mask & other.0[0];
+        self.0[1] |= mask & other.0[1];
+        self.0[2] |= mask & other.0[2];
+        self.0[3] |= mask & other.0[3];
+        self.0[4] |= mask & other.0[4];
+    }
+
     pub(crate) const fn from_limbs(limbs: [u64; 5]) -> FieldElement51 {
         FieldElement51(limbs)
     }
@@ -549,6 +603,124 @@ impl FieldElement51 {
         FieldElement51(square_limbs(self.0))
     }
 
+    /// Compute `self - rhs` for operands narrow enough not to need a reduction.
+    ///
+    /// The general [`Sub`] must accept any input satisfying the crate-wide bit
+    /// excess `b < 3`, so it adds `16p` to keep the difference positive — which
+    /// leaves limbs around `2^55` and forces a [`FieldElement51::reduce`] to get
+    /// back inside the contract. That reduction is about sixteen instructions,
+    /// and it is pure overhead whenever the operands are already narrow.
+    ///
+    /// This subtracts against `2p` instead, which is enough whenever both
+    /// operands are outputs of `mul`, `square` or `square2` — all of which
+    /// produce limbs below `2^51 + 2^13` — and so needs no reduction at all.
+    ///
+    /// # Preconditions
+    ///
+    /// Every limb of **both** operands must be `< 2^52 - 38`, which is the
+    /// smallest limb of `2p`. `mul`/`square` outputs satisfy this with eleven
+    /// bits to spare, and so do the ladder's *initial* values, which are not
+    /// products: `ProjectivePoint::identity()` is `(1, 0)` and the other point
+    /// is `(from_bytes(u), 1)`, all limbs `< 2^51`. The `debug_assert!`s below
+    /// enforce it in debug builds, so the whole test suite checks it.
+    ///
+    /// # Postcondition
+    ///
+    /// Limbs are `< 2^53`, so the result satisfies the documented `b < 3` and
+    /// may be fed to any operation in this module.
+    ///
+    /// The result is congruent to, but generally *not* limb-for-limb equal to,
+    /// `self - rhs`: it is a different representative of the same field
+    /// element. `sub_unreduced_agrees_with_sub` checks the field equality and
+    /// the limb bound; the ladder's callers are checked end to end against the
+    /// byte output of `mul_clamped`, which is canonical.
+    pub(crate) fn sub_unreduced(&self, rhs: &FieldElement51) -> FieldElement51 {
+        /// `2p`, limb by limb: `2 * (2^51 - 19)` then four times `2 * (2^51 - 1)`.
+        const TWO_P: [u64; 5] = [
+            4503599627370458,
+            4503599627370494,
+            4503599627370494,
+            4503599627370494,
+            4503599627370494,
+        ];
+
+        // The bound that makes the reduction unnecessary. It is stricter than
+        // the module-wide `b < 3`, which is why this is a separate operation
+        // rather than a change to `Sub`.
+        debug_assert!(self.0.iter().all(|&l| l < TWO_P[0]));
+        debug_assert!(rhs.0.iter().all(|&l| l < TWO_P[0]));
+
+        FieldElement51([
+            (self.0[0] + TWO_P[0]) - rhs.0[0],
+            (self.0[1] + TWO_P[1]) - rhs.0[1],
+            (self.0[2] + TWO_P[2]) - rhs.0[2],
+            (self.0[3] + TWO_P[3]) - rhs.0[3],
+            (self.0[4] + TWO_P[4]) - rhs.0[4],
+        ])
+    }
+
+    /// Multiply this field element by \\((A+2)/4 = 121666\\), the constant the
+    /// Montgomery ladder needs once per step.
+    ///
+    /// `&x * &constants::APLUS2_OVER_FOUR` gives the same answer, but that
+    /// constant is `[121666, 0, 0, 0, 0]`, so twenty of the twenty-five partial
+    /// products in the general multiplication are multiplications by zero, and
+    /// the four `b[i] * 19` precomputations are `0 * 19`. The compiler cannot
+    /// fold them away because `mul` is not inlined into the ladder.
+    ///
+    /// Only the five surviving products are computed here. The carry chain is
+    /// the same one `mul` uses, so the result is bit-for-bit identical to the
+    /// general multiplication; `mul121666_matches_general_mul` checks that.
+    #[rustfmt::skip] // keep alignment of c* calculations
+    pub fn mul121666(&self) -> FieldElement51 {
+        /// \\((A+2)/4\\), the only value this is ever called with.
+        const APLUS2_OVER_FOUR: u128 = 121666;
+
+        let a: &[u64; 5] = &self.0;
+
+        // Precondition, as for `mul`: a[i] < 2^(51 + b) with b < 3.
+        debug_assert!(a[0] < (1 << 54));
+        debug_assert!(a[1] < (1 << 54));
+        debug_assert!(a[2] < (1 << 54));
+        debug_assert!(a[3] < (1 << 54));
+        debug_assert!(a[4] < (1 << 54));
+
+        // c[i] = a[i] * 121666 < 2^54 * 2^16.9 = 2^70.9, so the carries
+        // c[i] >> 51 are below 2^20 and everything below stays far inside its
+        // type. This is the same shape as `mul`'s coefficients, just smaller.
+        let     c0: u128 = (a[0] as u128) * APLUS2_OVER_FOUR;
+        let mut c1: u128 = (a[1] as u128) * APLUS2_OVER_FOUR;
+        let mut c2: u128 = (a[2] as u128) * APLUS2_OVER_FOUR;
+        let mut c3: u128 = (a[3] as u128) * APLUS2_OVER_FOUR;
+        let mut c4: u128 = (a[4] as u128) * APLUS2_OVER_FOUR;
+
+        const LOW_51_BIT_MASK: u64 = (1u64 << 51) - 1;
+        let mut out = [0u64; 5];
+
+        c1 += ((c0 >> 51) as u64) as u128;
+        out[0] = (c0 as u64) & LOW_51_BIT_MASK;
+
+        c2 += ((c1 >> 51) as u64) as u128;
+        out[1] = (c1 as u64) & LOW_51_BIT_MASK;
+
+        c3 += ((c2 >> 51) as u64) as u128;
+        out[2] = (c2 as u64) & LOW_51_BIT_MASK;
+
+        c4 += ((c3 >> 51) as u64) as u128;
+        out[3] = (c3 as u64) & LOW_51_BIT_MASK;
+
+        let carry: u64 = (c4 >> 51) as u64;
+        out[4] = (c4 as u64) & LOW_51_BIT_MASK;
+
+        // carry < 2^20, so out[0] + carry * 19 < 2^51 + 2^24.3, no overflow.
+        out[0] += carry * 19;
+
+        out[1] += out[0] >> 51;
+        out[0] &= LOW_51_BIT_MASK;
+
+        FieldElement51(out)
+    }
+
     /// Returns 2 times the square of this field element.
     ///
     /// # Requires
@@ -600,16 +772,56 @@ fn square_limbs(mut a: [u64; 5]) -> [u64; 5] {
     let a3_19 = 19 * a[3];
     let a4_19 = 19 * a[4];
 
-    // Multiply to get 128-bit coefficients of output.
+    // Precomputation: the doublings.
     //
-    // The 128-bit multiplications by 2 turn into 1 slr + 1 slrd each,
-    // which doesn't seem any better or worse than doing them as precomputations
-    // on the 64-bit inputs.
-    let     c0: u128 = m(a[0],  a[0]) + 2*( m(a[1], a4_19) + m(a[2], a3_19) );
-    let mut c1: u128 = m(a[3], a3_19) + 2*( m(a[0],  a[1]) + m(a[2], a4_19) );
-    let mut c2: u128 = m(a[1],  a[1]) + 2*( m(a[0],  a[2]) + m(a[4], a3_19) );
-    let mut c3: u128 = m(a[4], a4_19) + 2*( m(a[0],  a[3]) + m(a[1],  a[2]) );
-    let mut c4: u128 = m(a[2],  a[2]) + 2*( m(a[0],  a[4]) + m(a[1],  a[3]) );
+    // Every product below other than the five squares a[i]^2 appears exactly
+    // twice in the full 5x5 product, so it is computed once and doubled. The
+    // doubling is done here, on one 64-bit operand, rather than on the 128-bit
+    // product: `2*(x*y) == (2*x)*y`, so the coefficients are unchanged, but a
+    // 64-bit shift is one instruction where a 128-bit one is two, and four
+    // shifts here cover ten doubled products.
+    //
+    // `2*a[i]` fits into a u64 whenever 51 + b + 1 < 64, i.e. b < 12, and
+    // `2*19*a[3]` whenever 51 + b + lg(19) + 1 < 64, i.e. b < 7.75. Both are
+    // slacker than the b < 3 this function already requires.
+    let a0_2 = 2 * a[0];
+    let a1_2 = 2 * a[1];
+    let a2_2 = 2 * a[2];
+    let a3_19_2 = 2 * a3_19;
+
+    // Multiply to get 128-bit coefficients of output, by operand scanning.
+    //
+    // Written as five sums of three products, the way this read before, every
+    // partial product has to exist before any accumulator can retire — the
+    // same shape `mul` was moved off in the operand-scanning change, and for
+    // the same cost: the products get parked on the stack and reloaded. Here
+    // each group streams one `a[i]` across the accumulators it contributes to,
+    // so a product is consumed as soon as it is formed. The `a0` group births
+    // all five accumulators; everything after is `+=`.
+    //
+    // Identical output: the same fifteen products land in the same five
+    // accumulators, and `u128` addition is associative and commutative. Only
+    // the summation order within each `c_i` changes, so this is bit-for-bit
+    // equal even outside the documented bounds.
+    let mut c0: u128 = m(a[0], a[0]);
+    let mut c1: u128 = m(a0_2, a[1]);
+    let mut c2: u128 = m(a0_2, a[2]);
+    let mut c3: u128 = m(a0_2, a[3]);
+    let mut c4: u128 = m(a0_2, a[4]);
+
+    c0 += m(a1_2, a4_19);
+    c2 += m(a[1], a[1]);
+    c3 += m(a1_2, a[2]);
+    c4 += m(a1_2, a[3]);
+
+    c0 += m(a2_2, a3_19);
+    c1 += m(a2_2, a4_19);
+    c4 += m(a[2], a[2]);
+
+    c1 += m(a[3], a3_19);
+
+    c2 += m(a[4], a3_19_2);
+    c3 += m(a[4], a4_19);
 
     // Same bound as in multiply:
     //    c[i] < 2^(102 + 2*b) * (1+i + (4-i)*19)
@@ -693,16 +905,265 @@ mod test {
         }
     }
 
-    /// `square` and `square2` must agree with `mul` at the edges of the valid input range:
-    /// zero, one, and the largest limbs `square` accepts
-    #[test]
-    fn square_agrees_with_mul_at_bounds() {
-        for limbs in [[0; 5], [1, 0, 0, 0, 0], [(1 << 54) - 1; 5]] {
-            let x = FieldElement51(limbs);
-            let sq = x.square();
+    /// Verbatim copy of `pow2k` as it was implemented before `square_limbs` was
+    /// factored out of it, kept here as the reference for the differential
+    /// tests below. If a future change to the squaring code is not a pure
+    /// refactor, these tests are what will say so.
+    #[rustfmt::skip]
+    fn reference_pow2k(fe: &FieldElement51, mut k: u32) -> FieldElement51 {
+        debug_assert!( k > 0 );
 
-            assert_eq!(sq.to_bytes(), (&x * &x).to_bytes());
-            assert_eq!(x.square2().to_bytes(), (&sq + &sq).to_bytes());
+        #[inline(always)]
+        fn m(x: u64, y: u64) -> u128 {
+            (x as u128) * (y as u128)
+        }
+
+        let mut a: [u64; 5] = fe.0;
+
+        loop {
+            let a3_19 = 19 * a[3];
+            let a4_19 = 19 * a[4];
+
+            let     c0: u128 = m(a[0],  a[0]) + 2*( m(a[1], a4_19) + m(a[2], a3_19) );
+            let mut c1: u128 = m(a[3], a3_19) + 2*( m(a[0],  a[1]) + m(a[2], a4_19) );
+            let mut c2: u128 = m(a[1],  a[1]) + 2*( m(a[0],  a[2]) + m(a[4], a3_19) );
+            let mut c3: u128 = m(a[4], a4_19) + 2*( m(a[0],  a[3]) + m(a[1],  a[2]) );
+            let mut c4: u128 = m(a[2],  a[2]) + 2*( m(a[0],  a[4]) + m(a[1],  a[3]) );
+
+            const LOW_51_BIT_MASK: u64 = (1u64 << 51) - 1;
+
+            c1 += ((c0 >> 51) as u64) as u128;
+            a[0] = (c0 as u64) & LOW_51_BIT_MASK;
+
+            c2 += ((c1 >> 51) as u64) as u128;
+            a[1] = (c1 as u64) & LOW_51_BIT_MASK;
+
+            c3 += ((c2 >> 51) as u64) as u128;
+            a[2] = (c2 as u64) & LOW_51_BIT_MASK;
+
+            c4 += ((c3 >> 51) as u64) as u128;
+            a[3] = (c3 as u64) & LOW_51_BIT_MASK;
+
+            let carry: u64 = (c4 >> 51) as u64;
+            a[4] = (c4 as u64) & LOW_51_BIT_MASK;
+
+            a[0] += carry * 19;
+
+            a[1] += a[0] >> 51;
+            a[0] &= LOW_51_BIT_MASK;
+
+            k -= 1;
+            if k == 0 {
+                break;
+            }
+        }
+
+        FieldElement51(a)
+    }
+
+    /// Pre-refactor `square2`, for the same reason.
+    fn reference_square2(fe: &FieldElement51) -> FieldElement51 {
+        let mut square = reference_pow2k(fe, 1);
+        for i in 0..5 {
+            square.0[i] *= 2;
+        }
+        square
+    }
+
+    proptest::proptest! {
+        /// The refactored `square` must agree with the old `pow2k(1)` **limb
+        /// for limb**, not merely as a field element: the limbs are an input to
+        /// the next operation's bit-excess accounting. This is what certifies
+        /// the change as a pure refactor; `proptest_square_agrees_with_mul`
+        /// above checks the weaker, independent property.
+        #[test]
+        fn square_matches_reference_bit_for_bit(
+            bits in 51u32..=54,
+            limbs in proptest::array::uniform5(proptest::num::u64::ANY),
+        ) {
+            let x = FieldElement51(limbs.map(|l| l & ((1u64 << bits) - 1)));
+            proptest::prop_assert_eq!(x.square().0, reference_pow2k(&x, 1).0);
+            proptest::prop_assert_eq!(x.square2().0, reference_square2(&x).0);
+        }
+
+        /// `pow2k(k)` is a loop over the same factored-out step, so it must
+        /// still agree with the old monolithic loop for every `k` — including
+        /// the values the X25519 inversion path actually uses.
+        #[test]
+        fn pow2k_matches_reference_bit_for_bit(
+            bits in 51u32..=54,
+            limbs in proptest::array::uniform5(proptest::num::u64::ANY),
+            k in proptest::prop_oneof![1u32..=8, proptest::strategy::Just(10),
+                                       proptest::strategy::Just(20),
+                                       proptest::strategy::Just(50),
+                                       proptest::strategy::Just(100)],
+        ) {
+            let x = FieldElement51(limbs.map(|l| l & ((1u64 << bits) - 1)));
+            proptest::prop_assert_eq!(x.pow2k(k).0, reference_pow2k(&x, k).0);
+        }
+
+        /// `k` chained squarings must equal one `pow2k(k)`: the property that
+        /// lets the ladder use `square()` and the inversion use `pow2k`.
+        #[test]
+        fn chained_square_matches_pow2k(
+            limbs in proptest::array::uniform5(proptest::num::u64::ANY),
+        ) {
+            let x = FieldElement51(limbs.map(|l| l & ((1u64 << 54) - 1)));
+            let mut chained = x;
+            for k in 1..=16u32 {
+                chained = chained.square();
+                proptest::prop_assert_eq!(chained.0, x.pow2k(k).0);
+            }
+        }
+
+        /// `mul121666` must agree with the general multiplication by
+        /// `APLUS2_OVER_FOUR` limb for limb: it is a specialization of exactly
+        /// that product, and the ladder feeds its output straight into the next
+        /// operation's bit-excess accounting.
+        #[test]
+        fn mul121666_matches_general_mul(
+            bits in 51u32..=54,
+            limbs in proptest::array::uniform5(proptest::num::u64::ANY),
+        ) {
+            use crate::backend::serial::u64::constants::APLUS2_OVER_FOUR;
+            let x = FieldElement51(limbs.map(|l| l & ((1u64 << bits) - 1)));
+            proptest::prop_assert_eq!(x.mul121666().0, (&x * &APLUS2_OVER_FOUR).0);
+        }
+
+        /// Independent of the limb comparison above: `mul121666` must equal
+        /// multiplying by 121666 built only out of `add`, which shares no code
+        /// with either `mul121666` or `mul`. This is what catches the two of
+        /// them being wrong in the same way.
+        #[test]
+        fn mul121666_is_multiplication_by_121666(
+            limbs in proptest::array::uniform5(proptest::num::u64::ANY),
+        ) {
+            let x = FieldElement51(limbs.map(|l| l & ((1u64 << 51) - 1)));
+
+            // Double-and-add over the bits of 121666, reducing after every step
+            // so the limbs never leave the documented bit excess.
+            let mut acc = FieldElement51::ZERO;
+            for i in (0..17).rev() {
+                acc = FieldElement51::reduce((&acc + &acc).0);
+                if (121666u32 >> i) & 1 == 1 {
+                    acc = FieldElement51::reduce((&acc + &x).0);
+                }
+            }
+            proptest::prop_assert_eq!(x.mul121666().to_bytes(), acc.to_bytes());
+        }
+
+        /// `(x + y)^2 == x^2 + 2xy + y^2` exercises `mul` and `square` against
+        /// each other, so a future change to either has a differential test
+        /// waiting for it.
+        #[test]
+        fn mul_and_square_are_consistent(
+            xl in proptest::array::uniform5(proptest::num::u64::ANY),
+            yl in proptest::array::uniform5(proptest::num::u64::ANY),
+        ) {
+            // Keep the sum inside the documented bit excess: two 53-bit limbs
+            // add to at most 2^54.
+            let mask = (1u64 << 53) - 1;
+            let x = FieldElement51(xl.map(|l| l & mask));
+            let y = FieldElement51(yl.map(|l| l & mask));
+
+            let lhs = (&x + &y).square();
+            let xy = &x * &y;
+            let rhs = &(&x.square() + &y.square()) + &(&xy + &xy);
+
+            proptest::prop_assert_eq!(lhs.to_bytes(), rhs.to_bytes());
+        }
+
+        /// `sub_unreduced` is not limb-for-limb equal to `Sub` — it returns a
+        /// different representative of the same field element — so it is checked
+        /// on the two properties the ladder depends on: the value is right, and
+        /// the limbs land inside the bit excess the next operation requires.
+        ///
+        /// The precondition is "both operands are `mul`/`square` outputs", so
+        /// the inputs are produced that way rather than assumed to have that
+        /// shape.
+        #[test]
+        fn sub_unreduced_agrees_with_sub(
+            al in proptest::array::uniform5(proptest::num::u64::ANY),
+            bl in proptest::array::uniform5(proptest::num::u64::ANY),
+            cl in proptest::array::uniform5(proptest::num::u64::ANY),
+        ) {
+            let mask = (1u64 << 51) - 1;
+            let x = &FieldElement51(al.map(|l| l & mask)) * &FieldElement51(bl.map(|l| l & mask));
+            let y = FieldElement51(cl.map(|l| l & mask)).square();
+
+            let fast = x.sub_unreduced(&y);
+
+            proptest::prop_assert_eq!(fast.to_bytes(), (&x - &y).to_bytes());
+            // The documented postcondition is the tighter `< 2^53`; `b < 3`
+            // would only require `< 2^54`.
+            proptest::prop_assert!(fast.0.iter().all(|&l| l < (1u64 << 53)));
+        }
+    }
+
+    /// The limb bounds themselves, which a random search reaches only by
+    /// accident: the top of the documented bit excess and the degenerate
+    /// inputs.
+    #[test]
+    fn square_matches_reference_at_limb_bounds() {
+        let edge = FieldElement51([(1u64 << 54) - 1; 5]);
+        assert_eq!(edge.square().0, reference_pow2k(&edge, 1).0);
+        assert_eq!(edge.square2().0, reference_square2(&edge).0);
+
+        for limbs in [[0u64; 5], [1, 0, 0, 0, 0], [0, 0, 0, 0, 1]] {
+            let x = FieldElement51(limbs);
+            assert_eq!(x.square().0, reference_pow2k(&x, 1).0);
+            assert_eq!(x.square2().0, reference_square2(&x).0);
+        }
+    }
+
+    /// Same, for `mul121666`.
+    #[test]
+    fn mul121666_matches_general_mul_at_limb_bounds() {
+        use crate::backend::serial::u64::constants::APLUS2_OVER_FOUR;
+
+        let edge = FieldElement51([(1u64 << 54) - 1; 5]);
+        assert_eq!(edge.mul121666().0, (&edge * &APLUS2_OVER_FOUR).0);
+
+        for limbs in [
+            [0u64; 5],
+            [1, 0, 0, 0, 0],
+            [0, 0, 0, 0, 1],
+            [(1 << 54) - 1, 0, 0, 0, 0],
+        ] {
+            let x = FieldElement51(limbs);
+            assert_eq!(x.mul121666().0, (&x * &APLUS2_OVER_FOUR).0);
+        }
+    }
+
+    /// The inputs `sub_unreduced`'s precondition admits that a random search
+    /// will not produce: the underflow edge, the ladder's first iteration —
+    /// whose operands are *not* products, the one case the "both operands are
+    /// mul/square outputs" phrasing does not literally cover — and `x - x`.
+    #[test]
+    fn sub_unreduced_edge_cases() {
+        // Both operands one below the smallest limb of 2p: the input that would
+        // underflow first if the offset were ever reduced.
+        let hi = FieldElement51([4503599627370457; 5]);
+        let lo = FieldElement51([0; 5]);
+        assert_eq!(hi.sub_unreduced(&lo).to_bytes(), (&hi - &lo).to_bytes());
+        assert_eq!(lo.sub_unreduced(&hi).to_bytes(), (&lo - &hi).to_bytes());
+        assert!(hi.sub_unreduced(&lo).0.iter().all(|&l| l < (1u64 << 53)));
+
+        let one = FieldElement51::ONE;
+        let zero = FieldElement51::ZERO;
+        let u = FieldElement51::from_bytes(&[0xff; 32]);
+        for (a, b) in [(one, zero), (u, one), (zero, one), (one, u)] {
+            assert_eq!(a.sub_unreduced(&b).to_bytes(), (&a - &b).to_bytes());
+            assert!(a.sub_unreduced(&b).0.iter().all(|&l| l < (1u64 << 53)));
+        }
+
+        for limbs in [[0u64; 5], [1, 0, 0, 0, 0], [0, 0, 0, 0, 1]] {
+            let x = FieldElement51(limbs);
+            assert_eq!(
+                x.sub_unreduced(&x).to_bytes(),
+                FieldElement51::ZERO.to_bytes()
+            );
+            assert_eq!(x.sub_unreduced(&x).to_bytes(), (&x - &x).to_bytes());
         }
     }
 }

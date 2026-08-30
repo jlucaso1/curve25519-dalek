@@ -1,0 +1,55 @@
+# Standalone (non-workspace) harness used to measure X25519 field arithmetic on
+# targets where Criterion cannot run, in particular wasm32-unknown-unknown, and
+# to cross-check Criterion on noisy virtualized x86_64 hosts.
+#
+# See ../../docs/perf-x25519-field-arithmetic.md for how it is driven.
+[package]
+name = "x25519-field-harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "BSD-3-Clause"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "native"
+path = "src/main.rs"
+
+[dependencies]
+curve25519-dalek = { path = "../..", default-features = false, features = [
+    "alloc",
+    "precomputed-tables",
+    "zeroize",
+] }
+# For the Ed25519 signature-verification kernel. `verify` is the operation the
+# group-messaging profile is dominated by, and it is the only hot path in this
+# workspace that reaches the vector backend, so it needs to be measurable here.
+# Bench-only: this crate is `publish = false` and is not a dependency of
+# `curve25519-dalek`.
+ed25519-dalek = { path = "../../../ed25519-dalek", default-features = false }
+
+[patch.crates-io]
+curve25519-dalek-derive = { path = "../../../curve25519-dalek-derive" }
+# `ed25519-dalek` depends on `curve25519-dalek` *by version*, not by path. This
+# harness is its own workspace, so without this patch Cargo resolves that to the
+# published 5.0.0 from crates.io and the binary links **two** copies of the
+# crate: the path one for the field/ladder kernels, the registry one underneath
+# `ed25519_verify`. The verification kernel would then be blind to every change
+# in this repository — reporting "unchanged" for a real regression exactly as
+# readily as for a real improvement, which is the worst failure mode a
+# measurement tool has. Keep this patch.
+curve25519-dalek = { path = "../.." }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ['cfg(curve25519_dalek_bench_internals)']

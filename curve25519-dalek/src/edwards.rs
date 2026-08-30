@@ -923,7 +923,7 @@ impl EdwardsPoint {
 
         #[cfg(feature = "precomputed-tables")]
         {
-            scalar * constants::ED25519_BASEPOINT_TABLE
+            crate::backend::mul_base(scalar)
         }
     }
 
@@ -1022,7 +1022,33 @@ impl VartimeMultiscalarMul for EdwardsPoint {
         // Use this as the hint to decide which algorithm to use.
         let size = s_lo;
 
-        if size < 190 {
+        // Straus is linear with a small intercept; Pippenger has a large fixed
+        // cost — 43 digit columns, each summing 62 buckets regardless of `size`
+        // — and a shallower slope. Fitting measured instruction counts on this
+        // host (AVX2, callgrind, setup differenced out) gives
+        //
+        //     straus    ~   156 132 + 54 624 * n
+        //     pippenger ~ 3 065 179 + 41 991 * n
+        //
+        // which cross at n ~ 230, not at 190. Below the true crossover the
+        // switch is a step *up*: adding one point at 190 measured +5.5%, and
+        // running Straus instead is -3.63% at n = 200 and -1.66% at n = 220,
+        // tapering to zero as the fits meet.
+        //
+        // The band matters for `ed25519_dalek::verify_batch`, which passes
+        // 2n + 1 points: batches of 95..115 signatures land in it.
+        //
+        // The cost of the higher threshold is peak memory. Straus builds one
+        // `NafLookupTable5` per point — 1280 bytes with the vector backend — so
+        // it holds ~294 KiB at n = 230 against Pippenger's ~80 KiB. A consumer
+        // that cares more about footprint than about a few percent should lower
+        // this; it is deliberately a single named constant for that reason.
+        //
+        // Only the variable-time entry point is affected. `MultiscalarMul`, the
+        // constant-time one, always uses Straus and does not reach here.
+        const PIPPENGER_CROSSOVER: usize = 230;
+
+        if size < PIPPENGER_CROSSOVER {
             crate::backend::straus_optional_multiscalar_mul(scalars, points)
         } else {
             crate::backend::pippenger_optional_multiscalar_mul(scalars, points)
@@ -1229,19 +1255,64 @@ macro_rules! impl_basepoint_table {
             ///
             /// The above algorithm is trivially generalised to other powers-of-2 radices.
             fn mul_base(&self, scalar: &Scalar) -> $point {
+                // `EdwardsPoint::mul_base` reaches the vector fixed-base
+                // ladder through `backend::mul_base` (§13.12). This is the
+                // *other* spelling of the same operation — `&scalar *
+                // ED25519_BASEPOINT_TABLE`, which the crate's own docs and
+                // README use — and it landed here, on the serial ladder:
+                // 153 910 instructions against 84 546 for the identical
+                // result.
+                //
+                // When `self` is the crate's own basepoint table the two
+                // compute the same point by construction, so hand it over. The
+                // comparison is on addresses, which is the only way to
+                // recognise it without changing a public signature: a table a
+                // caller built for some other point cannot alias a `static`,
+                // and falls through to the serial ladder as before. Both
+                // pointers are cast to `*const u8` because the other radices
+                // instantiate this macro with their own table types.
+                //
+                // `RistrettoBasepointTable` wraps this same static (see
+                // `constants.rs`), so it is caught here too, correctly — it is
+                // the same table over the same basepoint.
+                //
+                // `backend::mul_base`'s non-AVX2 arms must call
+                // `mul_base_serial` and **not** this function, or they arrive
+                // back here and recurse until the stack is gone. That is why
+                // the ladder below is a separate entry point.
+                #[cfg(curve25519_dalek_backend = "simd")]
+                {
+                    let this = self as *const $name as *const u8;
+                    let std = crate::constants::ED25519_BASEPOINT_TABLE
+                        as *const EdwardsBasepointTable as *const u8;
+                    if core::ptr::eq(this, std) {
+                        return crate::backend::mul_base(scalar);
+                    }
+                }
+
+                self.mul_base_serial(scalar)
+            }
+        }
+
+        impl $name {
+            /// The serial radix-16 ladder, with no dispatch in front of it.
+            ///
+            /// `backend::mul_base`'s serial and `avx512` arms call this rather
+            /// than `mul_base`, which would hand straight back to them.
+            pub(crate) fn mul_base_serial(&self, scalar: &Scalar) -> $point {
                 let a = scalar.as_radix_2w($radix);
 
                 let tables = &self.0;
                 let mut P = <$point>::identity();
 
                 for i in (0..$adds).filter(|x| x % 2 == 1) {
-                    P = (&P + &tables[i / 2].select(a[i])).as_extended();
+                    P = (&P + &tables[i / 2].select_or(a[i])).as_extended();
                 }
 
                 P = P.mul_by_pow_2($radix);
 
                 for i in (0..$adds).filter(|x| x % 2 == 0) {
-                    P = (&P + &tables[i / 2].select(a[i])).as_extended();
+                    P = (&P + &tables[i / 2].select_or(a[i])).as_extended();
                 }
 
                 P
@@ -1998,6 +2069,69 @@ mod test {
     }
 
     /// Test mul_base versus a known scalar multiple from ed25519.py
+    /// The two spellings of a fixed-base multiplication — `EdwardsPoint::mul_base`
+    /// and `&scalar * ED25519_BASEPOINT_TABLE` — reach different ladders when the
+    /// vector backend is live. They must still agree exactly.
+    #[test]
+    #[cfg(feature = "precomputed-tables")]
+    fn table_mul_agrees_with_mul_base() {
+        let mut s = Scalar::ONE;
+        for _ in 0..32 {
+            assert_eq!(
+                (&s * ED25519_BASEPOINT_TABLE).compress(),
+                EdwardsPoint::mul_base(&s).compress()
+            );
+            s += Scalar::ONE;
+        }
+        for s in [
+            Scalar::ZERO,
+            -Scalar::ONE,
+            Scalar::from_bytes_mod_order([0xff; 32]),
+        ] {
+            assert_eq!(
+                (&s * ED25519_BASEPOINT_TABLE).compress(),
+                EdwardsPoint::mul_base(&s).compress()
+            );
+        }
+    }
+
+    /// `backend::mul_base`'s non-AVX2 arms call `mul_base_serial`, not the `Mul`
+    /// operator: the operator recognises this very table and hands it back to
+    /// `backend::mul_base`, which on a `simd` build running without AVX2 is an
+    /// unbounded recursion. No CI job exercises that combination — every host
+    /// here has AVX2 — so the serial ladder is called directly.
+    #[test]
+    #[cfg(feature = "precomputed-tables")]
+    fn mul_base_serial_agrees_and_bypasses_dispatch() {
+        let mut s = Scalar::ONE;
+        for _ in 0..16 {
+            assert_eq!(
+                ED25519_BASEPOINT_TABLE.mul_base_serial(&s).compress(),
+                EdwardsPoint::mul_base(&s).compress()
+            );
+            s += Scalar::ONE;
+        }
+        for s in [Scalar::ZERO, -Scalar::ONE] {
+            assert_eq!(
+                ED25519_BASEPOINT_TABLE.mul_base_serial(&s).compress(),
+                EdwardsPoint::mul_base(&s).compress()
+            );
+        }
+    }
+
+    /// A table a caller builds for the *same* basepoint is a different object, so
+    /// it must fall through to the serial ladder and still be correct.
+    #[test]
+    #[cfg(feature = "precomputed-tables")]
+    fn caller_built_table_falls_through_and_agrees() {
+        let built = EdwardsBasepointTable::create(&constants::ED25519_BASEPOINT_POINT);
+        let s = Scalar::from_bytes_mod_order([7u8; 32]);
+        assert_eq!(
+            built.mul_base(&s).compress(),
+            EdwardsPoint::mul_base(&s).compress()
+        );
+    }
+
     #[test]
     fn basepoint_mult_vs_ed25519py() {
         let aB = EdwardsPoint::mul_base(&A_SCALAR);

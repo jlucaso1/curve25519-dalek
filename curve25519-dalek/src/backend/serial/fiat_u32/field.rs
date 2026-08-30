@@ -189,6 +189,27 @@ impl ConditionallySelectable for FieldElement2625 {
 }
 
 impl FieldElement2625 {
+    /// `self |= mask & other`, limb by limb.
+    ///
+    /// `mask` must be all-ones or all-zeros. Used by the constant-time window
+    /// scan in `window.rs`, which OR-accumulates masked table entries into a
+    /// zeroed accumulator rather than conditionally assigning into a live one.
+    #[cfg(feature = "precomputed-tables")]
+    #[inline(always)]
+    pub(crate) fn or_masked_assign(&mut self, other: &Self, mask: u64) {
+        let m = mask as u32;
+        self.0.0[0] |= m & other.0.0[0];
+        self.0.0[1] |= m & other.0.0[1];
+        self.0.0[2] |= m & other.0.0[2];
+        self.0.0[3] |= m & other.0.0[3];
+        self.0.0[4] |= m & other.0.0[4];
+        self.0.0[5] |= m & other.0.0[5];
+        self.0.0[6] |= m & other.0.0[6];
+        self.0.0[7] |= m & other.0.0[7];
+        self.0.0[8] |= m & other.0.0[8];
+        self.0.0[9] |= m & other.0.0[9];
+    }
+
     pub(crate) const fn from_limbs(limbs: [u32; 10]) -> FieldElement2625 {
         FieldElement2625(fiat_25519_tight_field_element(limbs))
     }
@@ -253,6 +274,31 @@ impl FieldElement2625 {
         fiat_25519_relax(&mut self_loose, &self.0);
         let mut output = FieldElement2625::ZERO;
         fiat_25519_carry_square(&mut output.0, &self_loose);
+        output
+    }
+
+    /// Compute `self - rhs`, matching `FieldElement51::sub_unreduced`'s
+    /// signature so `montgomery.rs` can stay backend-agnostic.
+    ///
+    /// This backend's arithmetic is fiat-crypto's verified output, so there is
+    /// nothing to hand-optimize here: it forwards to the ordinary subtraction.
+    /// The narrower precondition is therefore not required of callers on this
+    /// backend, and imposing it would be misleading.
+    pub(crate) fn sub_unreduced(&self, rhs: &FieldElement2625) -> FieldElement2625 {
+        self - rhs
+    }
+
+    /// Multiply this field element by \\((A+2)/4 = 121666\\), the constant the
+    /// Montgomery ladder needs once per step.
+    ///
+    /// fiat-crypto generates a dedicated, formally verified routine for exactly
+    /// this constant, so the ladder does not have to pay for a general
+    /// multiplication whose second operand is `[121666, 0, ...]`.
+    pub fn mul121666(&self) -> FieldElement2625 {
+        let mut self_loose = fiat_25519_loose_field_element([0; 10]);
+        fiat_25519_relax(&mut self_loose, &self.0);
+        let mut output = FieldElement2625::ZERO;
+        fiat_25519_carry_scmul_121666(&mut output.0, &self_loose);
         output
     }
 

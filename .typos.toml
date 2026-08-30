@@ -2,7 +2,14 @@
 extend-exclude = [
     ".git/",
     "*.svg",
-    "TESTVECTORS"
+    "TESTVECTORS",
+    # Task prompts, written in Portuguese. Every hit in them is a correct
+    # Portuguese word read as an English misspelling — "cliente", "itens",
+    # "ser", "limite", "commite". Excluding the directory keeps the exemption
+    # where it belongs; adding the words to `extend-words` would instead stop
+    # `ser`->`set` and `limite`->`limit` being caught in English prose and code
+    # anywhere in the repository.
+    "agent_prompts/"
 ]
 
 [default]

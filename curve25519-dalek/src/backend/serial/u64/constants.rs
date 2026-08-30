@@ -104,7 +104,16 @@ pub(crate) const SQRT_M1: FieldElement51 = FieldElement51::from_limbs([
     765476049583133,
 ]);
 
-/// `APLUS2_OVER_FOUR` is (A+2)/4. (This is used internally within the Montgomery ladder.)
+/// `APLUS2_OVER_FOUR` is (A+2)/4.
+///
+/// The Montgomery ladder used to multiply by this with the general field
+/// multiplication; it now calls `FieldElement51::mul121666` instead, which
+/// computes the same thing without the twenty zero-limb partial products the
+/// general 5x5 multiplication would perform. The value is kept because the
+/// differential test for `mul121666` checks the two against each other — and
+/// that test lives in this backend's `field.rs`, which the `fiat` build does
+/// not compile, so the constant is not built there either.
+#[cfg(all(test, not(curve25519_dalek_backend = "fiat")))]
 pub(crate) const APLUS2_OVER_FOUR: FieldElement51 =
     FieldElement51::from_limbs([121666, 0, 0, 0, 0]);
 
